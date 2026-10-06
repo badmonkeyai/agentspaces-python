@@ -1,0 +1,46 @@
+# AgentSpaces Python client.
+#
+# tests/golden.json is a vendored copy of agentspaces-spec/golden.json and IS committed.
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments (the runbook uses /tmp/aspace-venv, outside the tree)
+.venv/
+venv/
+env/
+
+# Coverage and tooling
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and local environment
+*.log
+.env
