@@ -261,8 +261,8 @@ def test_decoder_round_trips_every_golden_vector():
 
 
 def test_wire_version_matches_java():
-    assert wire.WIRE_VERSION == GOLDEN["wire_version"] == 2
-    assert wire.envelope("g", "PING", "p", "1:0:p", b"")["ver"] == 2
+    assert wire.WIRE_VERSION == GOLDEN["wire_version"] == 3
+    assert wire.envelope("g", "PING", "p", "1:0:p", b"")["ver"] == 3
 
 
 # ------------------------------------------------------- advertisements (§6.1)

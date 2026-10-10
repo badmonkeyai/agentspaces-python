@@ -48,6 +48,18 @@ class Peer:
         # (agent certificates) against a fixed instant, as Java's TestClock does.
         self.clock = clock or time.time
         self.on_state = None  # optional callback(dto)
+        self.on_claim = None  # optional callback(entry_id, signed_claim) after a claim folds
+        # Layer 4 (SPEC §6, §8): the members heard from, the advertisements
+        # the 'ads' stream carried, and the capability frames handlers.
+        self.members: dict[str, dict] = {}   # peer id -> its PeerAdvertisement (or {} when only heard)
+        # The members a frame of ours can reach: those that signed a frame that
+        # arrived on our connection. A dial-only peer has one socket, so a
+        # member learned only from the peers stream (another dial-only peer
+        # behind the same seed) is not among them, and an addressed frame to
+        # it would be dropped by the seed rather than relayed.
+        self.reachable: set[str] = set()
+        self.ads: dict[str, dict] = {}       # ad id -> {"type", "ad", "stored", "issuer"}
+        self.pipe_handlers: dict[str, object] = {}  # capability type -> fn(from_peer, payload bytes)
         # The group's revocations (SPEC §5.6, v0.1.13): peer revocations and
         # credential revocations, verified founder-rooted (when the founder is
         # known, from ``founder`` or the verified founding document) or, for an
@@ -138,18 +150,34 @@ class Peer:
 
     def write_entry(self, space: str, type_name: str, value: dict,
                     agent_name: str = "python", lease_millis: int = 600_000,
-                    agent=None) -> str:
+                    agent=None, tags: dict | None = None) -> str:
         """Writes one signed entry into a replicated space; returns its id.
         With ``agent`` (an ``AgentIdentity``, v0.1.13) the entry is the agent's
-        own: agent-signed record and state, stored AGENT_ATTESTED everywhere."""
+        own: agent-signed record and state, stored AGENT_ATTESTED everywhere.
+        ``tags`` travel inside the signed record (SPEC §7.1), where templates
+        and tag shards read them."""
         if agent is not None and self.revocations.refuses(agent.agent_id, agent.public_raw, None):
             raise ValueError(f"{agent.agent_id} is revoked in this group")
         payload = cbor.dumps(value)
         entry_id, body = wire.entry_delta(space, self.group, type_name, payload,
                                           self.identity, agent_name, lease_millis,
-                                          agent=agent, now_ms=self._now_ms())
+                                          agent=agent, now_ms=self._now_ms(), tags=tags)
         self._send("RUMOR", body)
+        # The writer holds its own entry too, so a local read sees it at once.
+        delta = cbor.loads(cbor.loads(body)["payload"])
+        if isinstance(delta.get("state"), dict):
+            self._fold(delta["state"])
         return entry_id
+
+    def publish_ad(self, ad_type: str, ad: dict) -> None:
+        """Publishes an advertisement this peer issued (an AgentCard, an
+        AssetCard) on the 'ads' stream, as DiscoveryService.publish does: the
+        stored form, under the advertisement's id and issue time."""
+        from .identity import parse_instant_millis
+        stored = wire.stored_ad(ad_type, ad, self.identity)
+        self.accept_ad(stored)  # our own cache holds it too, as DiscoveryService.publish does
+        item_id = f"{ad['id']}:{parse_instant_millis(ad['issued'])}"
+        self._send("RUMOR", wire.rumor_body("ads", item_id, 6, cbor.dumps(stored)))
 
     def pull_space(self, space: str) -> None:
         """Anti-entropy pull (spec §5.3): offer an empty digest, and the
@@ -164,6 +192,64 @@ class Peer:
         once on joining, so revocations issued before this peer arrived apply
         from its first merge."""
         self._send("DIGEST", wire.digest_body({stream: b"" for stream in revocations.STREAMS}))
+
+    def pull_ads(self) -> None:
+        """Anti-entropy pull of the 'ads' stream (SPEC §6.2): the cards and
+        capability advertisements the group holds."""
+        self._send("DIGEST", wire.digest_body({"ads": b""}))
+
+    def accept_ad(self, stored) -> dict | None:
+        """Admits a StoredAd as AdCache.accept does: the signature over the
+        canonical bytes under the carried key, the issuer derived from that
+        key, and the TTL not yet passed. Returns the cached entry, or None."""
+        from .identity import derive_id, parse_duration_millis, parse_instant_millis
+        if not isinstance(stored, dict):
+            return None
+        ad_bytes, key, signature = stored.get("adBytes"), stored.get("publicKey"), stored.get("signature")
+        if not (isinstance(ad_bytes, bytes) and isinstance(key, bytes) and isinstance(signature, bytes)):
+            return None
+        if not Identity.verify(key, ad_bytes, signature):
+            return None
+        try:
+            ad = cbor.loads(ad_bytes)
+            if not isinstance(ad, dict) or ad.get("issuer") != derive_id(key):
+                return None
+            expires = parse_instant_millis(ad["issued"]) + parse_duration_millis(ad["ttl"])
+        except (KeyError, ValueError, TypeError):
+            return None
+        if expires <= self._now_ms():
+            return None
+        entry = {"type": stored.get("adType"), "ad": ad, "stored": stored, "issuer": ad["issuer"],
+                 "expires": expires}
+        previous = self.ads.get(ad["id"])
+        if previous is None or parse_instant_millis(previous["ad"]["issued"]) <= parse_instant_millis(ad["issued"]):
+            self.ads[ad["id"]] = entry
+        return self.ads[ad["id"]]
+
+    def cards(self) -> list[dict]:
+        """The live AgentCards the ads stream carried."""
+        now = self._now_ms()
+        return [e["ad"] for e in self.ads.values() if e["type"] == "AgentCard" and e["expires"] > now]
+
+    def send_pipe(self, to: str, capability: str, payload: bytes) -> None:
+        """One capability frame to a member (CapabilityPipes.send): a
+        PIPE_DATA envelope addressed to it carrying {capability, payload}."""
+        self._send("PIPE_DATA", cbor.dumps({"capability": capability, "payload": payload}), to=to)
+
+    def _accept_peer_ad(self, payload: bytes) -> None:
+        """A 'peers' stream item: PeerNode.SignedPeerAd. The advertisement is
+        kept under its issuer when the signature and the derivation hold."""
+        from .identity import derive_id
+        try:
+            signed = cbor.loads(payload)
+            ad_bytes, key, signature = signed["adBytes"], signed["publicKey"], signed["signature"]
+            if not Identity.verify(key, ad_bytes, signature):
+                return
+            ad = cbor.loads(ad_bytes)
+            if isinstance(ad, dict) and ad.get("issuer") == derive_id(key) and ad["issuer"] != self.identity.peer_id:
+                self.members[ad["issuer"]] = ad
+        except (KeyError, TypeError, ValueError):
+            return
 
     def find(self, type_name: str):
         """Returns decoded values of known live entries of one schema type."""
@@ -181,14 +267,14 @@ class Peer:
         """Whether the seed connection is still up."""
         return self._running and self._socket is not None
 
-    def _send(self, kind: str, body: bytes) -> None:
+    def _send(self, kind: str, body: bytes, to: str | None = None) -> None:
         with self._lock:
             if self._socket is None:
                 return
             try:
                 self._socket.sendall(struct.pack(">i", len(frame := wire.encode_frame(
                     wire.envelope(self.group, kind, self.identity.peer_id,
-                                  wire.hlc_now(self.identity.peer_id, self._now_ms()), body),
+                                  wire.hlc_now(self.identity.peer_id, self._now_ms()), body, to),
                     self.identity))) + frame)
             except OSError:
                 # The remote closed; leases and gossip absorb our absence.
@@ -235,15 +321,30 @@ class Peer:
         wire.hlc_observe(self.identity.peer_id, env.get("stamp"), self._now_ms())
         kind = env.get("kind")
         body = env.get("body") or b""
+        sender = env.get("from")
+        if isinstance(sender, str) and sender != self.identity.peer_id:
+            # A verified frame is a member heard from (the frame's signer), and
+            # one our socket reaches.
+            self.members.setdefault(sender, {})
+            self.reachable.add(sender)
         if kind == "PING":
             ping = cbor.loads(body)
             self._send("ACK", wire.ack_body(ping.get("nonce", 0)))
+        elif kind == "PIPE_DATA":
+            frame = cbor.loads(body)
+            handler = self.pipe_handlers.get(frame.get("capability")) if isinstance(frame, dict) else None
+            if handler is not None:
+                handler(sender, frame.get("payload") or b"")
         elif kind == wire.KIND_GROUP_AD:
             self._on_group_ad(body)
         elif kind == "RUMOR":
             rumor = cbor.loads(body)
             if isinstance(rumor, dict) and rumor.get("streamId") in revocations.STREAMS:
                 self.revocations.accept(rumor["streamId"], rumor.get("payload"), self._now_ms())
+            elif isinstance(rumor, dict) and rumor.get("streamId") == "peers":
+                self._accept_peer_ad(rumor.get("payload") or b"")
+            elif isinstance(rumor, dict) and rumor.get("streamId") == "ads":
+                self.accept_ad(cbor.loads(rumor.get("payload") or b"\xf6"))
             elif isinstance(rumor, dict) and str(
                     rumor.get("streamId", "")).startswith("space:"):
                 delta = cbor.loads(rumor.get("payload") or b"\xf6")
@@ -260,6 +361,11 @@ class Peer:
                 if stream in revocations.STREAMS and delta_bytes:
                     for signed in cbor.loads(delta_bytes) or []:
                         self.revocations.accept_signed(stream, signed, self._now_ms())
+                    continue
+                if stream == "ads" and delta_bytes:
+                    delta = cbor.loads(delta_bytes)
+                    for stored in (delta.get("ads") or []) if isinstance(delta, dict) else []:
+                        self.accept_ad(stored)
                     continue
                 if str(stream).startswith("space:") and delta_bytes:
                     sync = cbor.loads(delta_bytes)
@@ -450,6 +556,8 @@ class Peer:
                 or expires > self._now_ms() + wire.MAX_CLAIM_HOLD_MILLIS):
             return
         self.claims[entry_id] = wire.merge_claims(self.claims.get(entry_id), signed)
+        if self.on_claim is not None:
+            self.on_claim(entry_id, self.claims[entry_id])
 
     # ----------------------------------------------------------- take/complete
 
@@ -472,11 +580,14 @@ class Peer:
 
     def take_entry(self, space: str, type_name: str, agent_name: str = "python",
                    lease_millis: int = 60_000, settle_seconds: float = 0.6,
-                   timeout_seconds: float = 15.0, agent=None):
+                   timeout_seconds: float = 15.0, agent=None, matches=None, bid=0.0):
         """Takes one entry under LEASE_RACE (spec §7.4): publish a signed
         claim, wait one settle window, and win when the lattice still says so.
         Returns the entry id, or None when out-arbitrated or nothing matched.
-        With ``agent`` the claim is the agent's, signed by its key (v0.1.13)."""
+        With ``agent`` the claim is the agent's, signed by its key (v0.1.13).
+        ``matches(payload_dict, tags_dict)`` narrows the candidates (a
+        template); ``bid`` is the AUCTION price, a float or a callable over the
+        payload, and 0.0 under LEASE_RACE."""
         from .identity import space_id_local
         holder = agent.agent_id if agent is not None else self.identity.agent(agent_name)
         if self.revocations.refuses(holder, agent.public_raw if agent else None, None):
@@ -487,12 +598,19 @@ class Peer:
             self.pull_space(space)
             time.sleep(0.3)
             now_ms = self._now_ms()
-            for entry_id, _dto in list(self._available(type_name, now_ms)):
+            for entry_id, dto in list(self._available(type_name, now_ms)):
+                record = dto.get("record") or {}
+                if record.get("spaceId") != space_id:
+                    continue  # the same type in another space is not this take's
+                payload = cbor.loads(record.get("payload") or b"\xf6")
+                if matches is not None and not matches(payload, record.get("tags") or {}):
+                    continue
+                price = float(bid(payload)) if callable(bid) else float(bid)
                 current = self._claim_of(entry_id)
                 epoch = int(current["epoch"]) + 1 if current else 1
                 claim = wire.take_claim(entry_id, space_id, epoch,
                                         wire.hlc_now(holder, now_ms), holder,
-                                        0.0, now_ms + lease_millis)
+                                        price, now_ms + lease_millis)
                 signed = wire.signed_claim(claim, self.identity, agent)
                 self.claims[entry_id] = wire.merge_claims(
                     self.claims.get(entry_id), signed)

@@ -112,13 +112,13 @@ def test_hostile_founding_documents_never_verify(name):
 
 
 def test_a_frame_of_another_wire_version_is_dropped():
-    # SPEC §9: ver != 2 is dropped before signature verification. Re-sign the
-    # golden PING envelope under ver 1 so the signature itself is valid.
+    # SPEC §9: ver != 3 is dropped before signature verification. Re-sign the
+    # golden PING envelope under ver 2 so the signature itself is valid.
     identity = Identity.from_pkcs8(_hex("private_key_pkcs8"))
     env = wire.decode_frame(_hex("ping_frame_cbor"))
-    assert env is not None and env["ver"] == GOLDEN["wire_version"] == 2
-    stale = wire.encode_frame({**env, "ver": 1}, identity)
-    assert cbor.loads(stale)["envelope"]["ver"] == 1
+    assert env is not None and env["ver"] == GOLDEN["wire_version"] == 3
+    stale = wire.encode_frame({**env, "ver": 2}, identity)
+    assert cbor.loads(stale)["envelope"]["ver"] == 2
     assert wire.decode_frame(stale) is None
     assert not _peer()._accepts(wire.decode_frame(stale))
 

@@ -1,7 +1,7 @@
 # agentspaces-client (Python)
 
 The non-JVM wire-compatible client (spec §13, M3): a Python peer that speaks
-the AgentSpaces wire protocol (wire version 2) directly. Nothing on the wire
+the AgentSpaces wire protocol (wire version 3) directly. Nothing on the wire
 is Java-specific, CBOR (RFC 8949) framing, Ed25519 (RFC 8032) signatures, and
 URI naming, and this client is the proof: it joins a running Java fleet over
 TCP, introduces its self-advertisement once and stays a live member by
@@ -23,7 +23,7 @@ to the issuer, signature over the canonical founding fields, founding document
 derives to `group`, `id` names that group). `wire.py` builds signed envelopes,
 membership advertisements, entry-write deltas, the `GROUP_AD_WANT`/`GROUP_AD`
 bootstrap frames, and the `aspace:cap/aggregate` and `aspace:cap/gossip-learn`
-pipe payloads; `decode_frame` drops any envelope whose `ver` is not 2 before
+pipe payloads; `decode_frame` drops any envelope whose `ver` is not 3 before
 verifying its signature (spec §9). `peer.py` is the TCP peer.
 
 ## Joining by GroupID
@@ -122,11 +122,103 @@ key (and the adversarial forger's key) from it, so signatures stay stable and
 only vectors whose inputs changed differ between regenerations. The Java
 `GoldenVectorsConformanceTest` and the TypeScript suite read the same file.
 
+## Layers 3 and 4, Python-shaped
+
+The same AgentSpace and the same capability services the Java annotations
+bind, as decorators, dataclasses, and plain functions
+(`L3L4-COVERAGE.md` §6.4). An `@entry` class names its wire schema; a
+`Space` holds the layer-3 verbs; a `Template` carries the Java matchers
+(`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in_`, `contains`, `is_null`,
+`not_null`, or any callable) over fields and tags; `watch` delivers
+`WRITTEN`, `TAKEN`, and `COMPLETED` once per entry; `TakeContext.current()`
+is the take a worker runs under.
+
+```python
+from agentspaces.space import Space, Template, entry, gte
+from agentspaces.agents import Binder, agent, ballot, bid_function, on_decision, on_estimate, space_notify, space_take
+
+@entry("ai.badmonkey.agentspaces.examples.fleet.ResearchFleet$ResearchTask#v1")
+@dataclass
+class ResearchTask:
+    topic: str
+    priority: int
+
+@agent("researcher", description="Researches topics", goals=["research"])
+class Researcher:
+    @space_take("tasks", lease="30s", where={"priority": gte(1)})     # take, call, complete with the result
+    def research(self, task: ResearchTask) -> Finding: ...
+
+    @space_notify("tasks")                                            # once per entry, never consuming it
+    def audit(self, finding: Finding) -> None: ...
+
+    @bid_function("tasks")                                            # the AUCTION price
+    def price(self, task: ResearchTask) -> float: ...
+
+    @ballot("votes", prefix="council:")                               # one ballot per proposal, None abstains
+    def judge(self, proposal: Proposal) -> str | None: ...
+
+    @on_decision("votes", prefix="council:")                          # once, when the quorum closes it
+    def record(self, decision: Decision) -> None: ...
+
+bound = Binder(peer, agent=identity.renewing_subordinate("py-worker", "PT24H")).bind(Researcher())
+```
+
+`Binder.bind` runs the loops the Java `AgentBinder` runs: one thread per
+take, reactions off the delivery thread, the ballot cast once per proposal,
+the decision once at quorum, and the AgentCard (name, description, goals,
+consumes, produces, space bindings, declared actions, the agent certificate)
+published on the `ads` stream on bind. `vote.propose`, `vote.cast`, and
+`vote.decision` are the procedural forms; the tally rule is Java's.
+
+The return conventions are the Java binder's (ISSUE-WorkflowVerbs,
+ISSUE-Motion): `None` writes nothing; `Tagged(value, {"region": "eu"})` is
+written with its tags; a list or tuple is the fork, each element written on
+its own after the take completes; a `Motion(proposal_id, question, options,
+quorum, space=None)` opens a vote once per proposal id in its space or the
+binder's `vote_space`. Two more cues: `@propose(space, vote=..., options=...,
+quorum=..., prefix=..., key=[...])` opens a vote from a cue once per key (the
+method returns the question, `None` to ask nothing, or a `Motion`), and
+`@space_join(space, key=..., parts=[Part(Fraud), Part(Coverage), Part(Claim,
+optional=True)])` is the LOCAL join: once per key, when every required part
+is readable, the method receives a `Joined` (`key`, `get`, `find`, `all`,
+`has`). The fleet-wide LEASED and ORDERED join modes, `@SpaceReduce`, and
+`@OrderedTake` need the ticket and the ordered log and are not here.
+`Space.entries(template)` is the metadata view (`Entry`: `entry_id`,
+`value`, `tags`, `issuer`, `expires_at_millis`, `taken`), and every event
+carries its entry's tags. A watch, and `@space_notify(on=[...])`, deliver
+five kinds: `WRITTEN`, `TAKEN`, `COMPLETED`, `EXPIRED` (the write lease
+lapsed while the entry was open: a leased entry as a timer), and
+`REAPPEARED` (a take claim lapsed), the last two judged by a sweep on the
+clock, once per entry and lapse. A `Contribution(epoch, value)` return
+starts the epoch on the binder's aggregate, and `produces=[...]` on a take or
+notify names the card's produced types when the return annotation does not. Maps a signature covers (`tags`, `costHints`,
+`spaceBindings`) are sorted by `cbor.canonical_map` (wire version 3).
+
+`agentspaces.capabilities` speaks the layer-4 pipes (`PIPE_DATA` frames
+addressed to a member): `Aggregate` (push-sum `avg`, roster `sum` and
+`count`, `min`, `max`, `estimate`, `Settle`, `await_settled`, `on_estimate`,
+and the `@on_estimate` decorator), `Semantic` (the hashing embedder with
+Java's `String.hashCode` so the vectors agree, `query`, `remote_query` over
+the query pipe, and answers to other members' queries), and `remote`
+(`actions` from the cards the `ads` stream carried, `invoke` through the
+task space with the shared-fields correlation). A dial-only peer sends
+frames to the members it can reach (the seed it dialed), never to a member
+it only heard of. Not here: the ordered log (the Raft client), so ordered
+takes, reduces, and the fleet-wide LEASED and ORDERED join modes; the
+gossip-learning exchange (its payload is encoded and golden-pinned); and
+MAJORITY_GOSSIP.
+
+`demo_council_worker.py` is the whole of it against the Java
+`CouncilFleet` coordinator: tasks taken, the council ballot cast, the epoch
+contributed to, the semantic query answered, the remote action served.
+`tests/test_layer34.py`, `tests/test_layer4.py`, and `tests/test_verbs.py`
+prove each piece without a socket.
+
 ## Run it
 
 ```
 pip install cryptography pytest
-python -m pytest tests/            # golden vectors, founding/join, adversarial, codec
+python -m pytest tests/            # golden vectors, founding/join, adversarial, codec, layers 3 and 4
 
 # live demo against a Java fleet:
 mvn -q -pl examples/example-02-research-fleet exec:java -Dexec.args="worker 7461 0"
@@ -145,8 +237,10 @@ GroupID, membership participation, space writes, anti-entropy reads, and
 exclusive takes under the LEASE_RACE claim lattice (signed claims, settle
 window, the same total order as `TakeClaim.merge`, monotone completion). `demo_python_worker.py` proves the whole loop: a Python
 worker drains the six tasks a Java coordinator publishes, and the coordinator
-receives all six findings. The aggregate and gossip-learn pipe payloads are
-encoded here and pinned by the golden vectors, but the capability protocols
-themselves (epochs, offer/accept exchange) and content-addressed payloads stay
-Java-side for now; each is the same pattern (a CBOR body on an existing kind)
-when a use case calls for it.
+receives all six findings. Above the wire, `agentspaces.space`,
+`agentspaces.agents`, and `agentspaces.capabilities` carry the layer 3 and 4
+programming model (the section above): the push-sum aggregate, semantic
+discovery, and remote actions speak their pipe protocols here, and
+`demo_council_worker.py` proves them against the Java council. The
+gossip-learn exchange and content-addressed payloads stay Java-side; each is
+the same pattern (a CBOR body on an existing kind) when a use case calls for it.

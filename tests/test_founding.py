@@ -184,7 +184,7 @@ def test_a_frame_of_another_wire_version_is_dropped_before_verification():
                                       GOLDEN["peer_id"], GOLDEN["hlc_encoded"],
                                       to=GOLDEN["peer_id"])
     assert wire.decode_frame(wire.encode_frame(env, identity)) is not None
-    for bad in (1, 3, "2", None, True):
+    for bad in (1, 2, 4, "3", None, True):
         stale = wire.encode_frame({**env, "ver": bad}, identity)  # validly signed
         assert wire.decode_frame(stale) is None, bad
 

@@ -38,6 +38,21 @@ def _head(major: int, value: int) -> bytes:
     return bytes([(major << 5) | 27]) + value.to_bytes(8, "big")
 
 
+def _key_order(key) -> tuple:
+    """RFC 8949 §4.2.1 for text keys: length of the UTF-8 encoding, then bytes."""
+    encoded = str(key).encode("utf-8")
+    return (len(encoded), encoded)
+
+
+def canonical_map(value: dict) -> dict:
+    """A copy of a map-valued field with its entries in canonical order
+    (shorter UTF-8 key first, then bytewise; RFC 8949 §4.2.1), the order the
+    Java codec writes every map in as of wire v3 (ISSUE-CanonicalMaps). Apply
+    it to maps a signature covers (tags, costHints, spaceBindings,
+    resourceHints, parameters, access); never to a dict standing for a record."""
+    return {k: value[k] for k in sorted(value, key=_key_order)}
+
+
 def dumps(value) -> bytes:
     """Encodes a Python value the way the Java codec encodes its equivalent."""
     out = bytearray()
@@ -75,6 +90,11 @@ def _encode(value, out: bytearray) -> None:
         for item in value:
             _encode(item, out)
     elif isinstance(value, dict):
+        # Indefinite-length map in the dict's own order: a dict stands for a
+        # Java record (declared component order) as often as for a map, so the
+        # encoder cannot sort. A map-valued field (tags, costHints, ...) is put
+        # in canonical order by ``canonical_map`` where it is built (wire v3,
+        # ISSUE-CanonicalMaps).
         out.append(0xBF)
         for key, item in value.items():
             _encode(key, out)

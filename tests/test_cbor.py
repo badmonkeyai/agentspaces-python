@@ -52,3 +52,14 @@ def test_canonical_form_uses_indefinite_maps_and_definite_arrays():
 def test_half_and_single_floats_decode():
     assert cbor.loads(bytes.fromhex("f90000")) == 0.0
     assert abs(cbor.loads(bytes.fromhex("fa40490fdb")) - 3.14159) < 1e-5
+
+
+def test_canonical_map_sorts_keys_by_utf8_length_then_bytes():
+    """SPEC v0.1.15 (wire version 3): a map a signature covers is sorted by
+    its keys' UTF-8 encoding, shorter first, bytewise between equal lengths."""
+    from agentspaces import wire
+    assert wire.WIRE_VERSION == 3
+    assert list(cbor.canonical_map({"region": "eu", "b": "1", "aa": "2", "a": "3", "é": "4"})) == \
+        ["a", "b", "aa", "é", "region"]
+    view = wire.sign_view("e", "s", "T#v1", b"", "i", "1-0-i", tags={"zz": "1", "a": "2"})
+    assert list(view["tags"]) == ["a", "zz"]

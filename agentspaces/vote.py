@@ -26,6 +26,7 @@ granularity exists to distrust."""
 from . import cbor
 
 BALLOT_TYPE = "ai.badmonkey.agentspaces.capabilities.vote.VoteCapability$Ballot#v1"
+PROPOSAL_TYPE = "ai.badmonkey.agentspaces.capabilities.vote.VoteCapability$Proposal#v1"
 PEER = "PEER"
 AGENT = "AGENT"
 
@@ -74,3 +75,62 @@ def tally(states: dict, proposal_id: str, options=None, granularity: str = PEER,
         counted.add(key)
         result[option] = result.get(option, 0) + 1
     return result
+
+
+# ------------------------------------------------------- proposals and casts
+
+def proposals(states: dict) -> dict:
+    """The open proposals by id: ``{id: {"proposalId", "question", "options",
+    "quorum"}}``, from the folded Proposal records."""
+    found = {}
+    for dto in states.values():
+        record = dto.get("record") or {}
+        if record.get("type") != PROPOSAL_TYPE or dto.get("completed"):
+            continue
+        try:
+            proposal = cbor.loads(record.get("payload") or b"")
+        except ValueError:
+            continue
+        if isinstance(proposal, dict) and isinstance(proposal.get("proposalId"), str):
+            found.setdefault(proposal["proposalId"], proposal)
+    return found
+
+
+def propose(peer, space: str, proposal_id: str, question: str, options: list, quorum: int,
+            lease_millis: int = 3_600_000, agent=None, agent_name: str = "python") -> str | None:
+    """Opens a proposal (SPEC §8.4): a Proposal entry in the vote space, in
+    Java field order; idempotent on the id (an open proposal is not rewritten).
+    Returns the entry id, or None when the proposal was already open."""
+    if proposal_id in proposals(peer.states):
+        return None
+    payload = {"proposalId": proposal_id, "question": question, "options": list(options), "quorum": int(quorum)}
+    return peer.write_entry(space, PROPOSAL_TYPE, payload, agent_name=agent_name,
+                            lease_millis=lease_millis, agent=agent)
+
+
+def cast(peer, space: str, proposal_id: str, option: str, lease_millis: int = 3_600_000,
+         agent=None, agent_name: str = "python") -> str:
+    """Casts this agent's ballot: a Ballot entry whose ``voter`` is the
+    authenticated writer (a tally skips any other). One ballot per voter per
+    proposal counts, the first observed."""
+    voter = agent.agent_id if agent is not None else peer.identity.agent(agent_name)
+    payload = {"proposalId": proposal_id, "option": option, "voter": voter}
+    return peer.write_entry(space, BALLOT_TYPE, payload, agent_name=agent_name,
+                            lease_millis=lease_millis, agent=agent)
+
+
+def decision(states: dict, proposal_id: str, granularity: str = PEER, permits=None) -> dict | None:
+    """The QUORUM decision as Java closes it (SPEC §8.4): once distinct
+    counted voters reach the proposal's quorum, the winner is the option with
+    the most votes, ties broken to the lexicographically first option, so every
+    replica decides identically. None while open or unknown."""
+    proposal = proposals(states).get(proposal_id)
+    if proposal is None:
+        return None
+    options = list(proposal.get("options") or [])
+    counts = tally(states, proposal_id, options, granularity, permits)
+    voters = sum(counts.values())
+    if voters < int(proposal.get("quorum", 0)) or voters == 0:
+        return None
+    winner = sorted(options, key=lambda o: (-counts.get(o, 0), o))[0]
+    return {"proposalId": proposal_id, "winner": winner, "tally": counts}

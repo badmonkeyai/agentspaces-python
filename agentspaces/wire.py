@@ -29,7 +29,8 @@ from .identity import (Identity, derive_id, verify_agent_certificate,
 # The wire version every envelope carries and the only one a receiver accepts
 # (SPEC §9, TECH-SPEC §3): a frame of any other version is dropped before its
 # signature is checked, so versions coexist at the cost of mutual silence.
-WIRE_VERSION = 2
+# 3 since ISSUE-CanonicalMaps: map entries sorted by key in every encoding.
+WIRE_VERSION = 3
 
 # The join-by-GroupID bootstrap kinds (SPEC §9, v0.1.10): a GROUP_AD_WANT names
 # the wanted group in the envelope and carries an empty body; a GROUP_AD
@@ -104,7 +105,7 @@ def envelope(group: str, kind: str, sender: str, stamp: str, body: bytes,
     """An Envelope in field order: ver, group, kind, from, to, stamp, body.
 
     ``to`` binds the frame to its recipient (ASF-010); None is an unaddressed
-    frame (the bootstrap self-introduction). ver is WIRE_VERSION (2)."""
+    frame (the bootstrap self-introduction). ver is WIRE_VERSION (3)."""
     return {"ver": WIRE_VERSION, "group": group, "kind": kind, "from": sender,
             "to": to, "stamp": stamp, "body": body}
 
@@ -239,6 +240,15 @@ def peer_advertisement(group: str, identity: Identity, issued_iso: str,
     }
 
 
+def stored_ad(ad_type: str, ad: dict, identity: Identity) -> dict:
+    """AdCache.StoredAd, the 'ads' stream payload (SPEC §6.2): the type tag
+    (``AgentCard``, ``AssetCard``, ...), the advertisement's canonical bytes,
+    the issuer's key, and the issuer's signature over those bytes."""
+    ad_bytes = cbor.dumps(ad)
+    return {"adType": ad_type, "adBytes": ad_bytes, "publicKey": identity.public_raw,
+            "signature": identity.sign(ad_bytes)}
+
+
 def signed_peer_ad(ad: dict, identity: Identity) -> bytes:
     """The 'peers' stream payload: PeerNode.SignedPeerAd."""
     ad_bytes = cbor.dumps(ad)
@@ -252,13 +262,16 @@ def signed_peer_ad(ad: dict, identity: Identity) -> bytes:
 # ------------------------------------------------------------- space writes
 
 def sign_view(entry_id: str, space_id: str, type_name: str, payload: bytes,
-              issuer: str, issued: str, key_epoch: int | None = None) -> dict:
-    """ReplicatedSpace's SignView: the record identity the signature covers.
-    ``keyEpoch`` (v0.1.13, SPEC §11a.1) is appended only for a record sealed
-    under a content-key epoch from 1, so other records sign the same bytes."""
+              issuer: str, issued: str, key_epoch: int | None = None,
+              tags: dict | None = None) -> dict:
+    """ReplicatedSpace's SignView: the record identity the signature covers,
+    tags included (SPEC §7.1: a tag is part of the signed record, sorted on
+    the wire by the canonical form). ``keyEpoch`` (v0.1.13, SPEC §11a.1) is
+    appended only for a record sealed under a content-key epoch from 1, so
+    other records sign the same bytes."""
     view = {"entryId": entry_id, "spaceId": space_id, "type": type_name,
             "payload": payload, "payloadRef": None, "issuer": issuer,
-            "issued": issued, "tags": {}}
+            "issued": issued, "tags": cbor.canonical_map(dict(tags or {}))}
     if key_epoch is not None:
         view["keyEpoch"] = key_epoch
     return view
@@ -367,7 +380,7 @@ def sign_state(dto: dict, identity: Identity, agent=None, now_ms: int | None = N
 
 def entry_delta(space_name: str, group: str, type_name: str, payload: bytes,
                 identity: Identity, agent_name: str, lease_millis: int,
-                agent=None, now_ms: int | None = None) -> tuple:
+                agent=None, now_ms: int | None = None, tags: dict | None = None) -> tuple:
     """Builds a full write delta; returns (entry_id, rumor_body_bytes). With
     ``agent`` (an ``AgentIdentity``, v0.1.13) the record is the agent's: signed
     by its key, the certificate covering the record's stamp attached, and the
@@ -377,7 +390,7 @@ def entry_delta(space_name: str, group: str, type_name: str, payload: bytes,
     space_id = space_id_local(f"{group}/{space_name}")
     issuer = agent.agent_id if agent is not None else identity.agent(agent_name)
     issued = hlc_now(issuer, now_ms)
-    view = sign_view(entry_id, space_id, type_name, payload, issuer, issued)
+    view = sign_view(entry_id, space_id, type_name, payload, issuer, issued, tags=tags)
     certificate = None
     if agent is not None:
         certificate = agent.certificate_covering(hlc_physical(issued))
@@ -390,7 +403,7 @@ def entry_delta(space_name: str, group: str, type_name: str, payload: bytes,
         "payload": payload, "payloadRef": None, "issuer": issuer,
         "issued": issued,
         "lease": {"holder": issuer, "expiresAtMillis": expires, "kind": "WRITE"},
-        "tags": {}, "sig": signature,
+        "tags": view["tags"], "sig": signature,
     }
     adds = [{"replica": identity.peer_id, "counter": 1}]
     lease_value = {"holder": issuer, "expiresAtMillis": expires, "kind": "WRITE"}
@@ -486,8 +499,8 @@ def agent_card(group: str, identity: Identity, local_name: str, issued_iso: str,
     card = {"id": f"aspace://{group}/agent/{agent}", "issuer": identity.peer_id,
             "group": group, "issued": issued_iso, "ttl": ttl_iso, "agent": agent,
             "description": description, "goals": goals, "consumes": consumes,
-            "produces": produces, "costHints": cost_hints,
-            "spaceBindings": space_bindings}
+            "produces": produces, "costHints": cbor.canonical_map(cost_hints),
+            "spaceBindings": cbor.canonical_map(space_bindings)}
     if agent_certificate is not None and (agent_public_raw is None
                                           or agent_certificate.get("agentPublicKey") != agent_public_raw
                                           or agent_certificate.get("agent") != agent):
