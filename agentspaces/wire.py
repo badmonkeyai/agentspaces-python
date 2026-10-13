@@ -54,6 +54,47 @@ MAX_CLAIM_HOLD_MILLIS = 24 * 60 * 60 * 1000
 # is ignored rather than merged (the HLC clamp, ASF-020/043).
 MAX_HLC_SKEW_MILLIS = 10 * 60 * 1000
 
+# How far in the past a frame's stamp may be before it is dropped as stale, and how many
+# (sender, stamp) pairs the replay filter remembers (ROBUSTNESS.md §3.3, §3.4; the Java
+# node's MAX_FRAME_AGE_MILLIS and its recent-frames cache).
+MAX_FRAME_AGE_MILLIS = 5 * 60 * 1000
+FRAME_FILTER_CAPACITY = 4096
+
+
+class FrameFilter:
+    """Admits each verified frame once, fresh: a stamp older than MAX_FRAME_AGE_MILLIS is
+    stale, one further ahead than MAX_HLC_SKEW_MILLIS is refused, and a (sender, stamp) pair
+    seen before is a replay. All three are dropped silently and counted: late, duplicated and
+    replayed frames are the normal case on a network, not evidence of anything."""
+
+    def __init__(self, capacity: int = FRAME_FILTER_CAPACITY):
+        self._seen = {}
+        self._capacity = capacity
+        self.stale = 0
+        self.ahead = 0
+        self.replayed = 0
+
+    def admit(self, env: dict, now_ms: int) -> bool:
+        stamp = env.get("stamp")
+        try:
+            physical = hlc_physical(stamp)
+        except (ValueError, TypeError):
+            return False
+        if now_ms - physical > MAX_FRAME_AGE_MILLIS:
+            self.stale += 1
+            return False
+        if physical - now_ms > MAX_HLC_SKEW_MILLIS:
+            self.ahead += 1
+            return False
+        key = f"{env.get('from')}|{stamp}"
+        if key in self._seen:
+            self.replayed += 1
+            return False
+        self._seen[key] = True
+        if len(self._seen) > self._capacity:
+            del self._seen[next(iter(self._seen))]
+        return True
+
 _hlc_lock = threading.Lock()
 _hlc_state: dict = {}  # node -> (physical_millis, logical)
 

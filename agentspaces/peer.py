@@ -71,11 +71,24 @@ class Peer:
         # GROUP_AD answer passed the four checks of spec §5.1 (join_by_group_id).
         self.founding = None
         self._founding_ready = threading.Event()
+        # ROBUSTNESS.md: late, replayed and unknown frames are the normal case; count, never fail.
+        self.frames = wire.FrameFilter()
+        self.ignored_kinds: dict[str, int] = {}
+        self.malformed_frames = 0
+        # A lost socket is reconnected to the seed and the peer re-introduced and re-pulled,
+        # every reconnect_interval_s for reconnect_window_s; a close() by the owner is final.
+        self._seed = None
+        self._pulled_spaces: set[str] = set()
+        self._pulled_ads = False
+        self.reconnect_interval_s = 5.0
+        self.reconnect_window_s = 600.0
+        self.reconnects = 0
 
     # ------------------------------------------------------------- lifecycle
 
     def connect(self, host: str, port: int) -> None:
         """Dials the seed and introduces this peer to the group."""
+        self._seed = (host, port)
         self._socket = socket.create_connection((host, port), timeout=10)
         self._socket.settimeout(None)
         self._running = True
@@ -83,6 +96,30 @@ class Peer:
         self._reader.start()
         self.introduce()
         self.pull_revocations()
+
+    def _reconnect(self) -> bool:
+        """After a lost socket: dials the seed again until the window runs out, then
+        introduces this peer again and pulls what it had pulled before, so a network hiccup
+        costs a few seconds rather than the membership (ROBUSTNESS.md §3.6)."""
+        deadline = time.monotonic() + self.reconnect_window_s
+        while self._running and time.monotonic() < deadline:
+            try:
+                fresh = socket.create_connection(self._seed, timeout=10)
+                fresh.settimeout(None)
+            except OSError:
+                time.sleep(self.reconnect_interval_s)
+                continue
+            with self._lock:
+                self._socket = fresh
+            self.reconnects += 1
+            self.introduce()
+            self.pull_revocations()
+            if self._pulled_ads:
+                self.pull_ads()
+            for space in list(self._pulled_spaces):
+                self.pull_space(space)
+            return True
+        return False
 
     def join_by_group_id(self, host: str, port: int, group_id: str,
                          timeout: float = 10.0) -> dict:
@@ -97,6 +134,7 @@ class Peer:
         self.group = group_id
         self.founding = None
         self._founding_ready.clear()
+        self._seed = (host, port)
         self._socket = socket.create_connection((host, port), timeout=10)
         self._socket.settimeout(None)
         self._running = True
@@ -184,6 +222,7 @@ class Peer:
         partner answers with every state this replica is missing. The
         revocation streams ride along: a partner answers only the streams a
         digest names, so a late joiner learns the group's revocations here."""
+        self._pulled_spaces.add(space)
         self._send("DIGEST", wire.digest_body(
             {f"space:{space}": b"", **{stream: b"" for stream in revocations.STREAMS}}))
 
@@ -196,6 +235,7 @@ class Peer:
     def pull_ads(self) -> None:
         """Anti-entropy pull of the 'ads' stream (SPEC §6.2): the cards and
         capability advertisements the group holds."""
+        self._pulled_ads = True
         self._send("DIGEST", wire.digest_body({"ads": b""}))
 
     def accept_ad(self, stored) -> dict | None:
@@ -277,13 +317,15 @@ class Peer:
                                   wire.hlc_now(self.identity.peer_id, self._now_ms()), body, to),
                     self.identity))) + frame)
             except OSError:
-                # The remote closed; leases and gossip absorb our absence.
-                self._running = False
-                self._socket = None
+                # The remote closed: the reader notices and reconnects.
+                try:
+                    self._socket.close()
+                finally:
+                    self._socket = None
 
     def _read_loop(self) -> None:
-        try:
-            while self._running:
+        while self._running:
+            try:
                 header = self._read_exact(4)
                 length = struct.unpack(">i", header)[0]
                 if length <= 0 or length > wire.MAX_FRAME_BYTES:
@@ -293,12 +335,24 @@ class Peer:
                 frame = self._read_exact(length)
                 try:
                     env = wire.decode_frame(frame)
-                    if self._accepts(env):
+                    if env is None:
+                        self.malformed_frames += 1
+                    elif self._accepts(env):
                         self._handle(env)
                 except Exception:  # noqa: BLE001 - one hostile frame must not
-                    pass  # kill the reader (ASF-015); the frame is dropped
-        except OSError:
-            pass  # the socket closed; the fleet's leases handle the rest
+                    self.malformed_frames += 1  # kill the reader (ASF-015); the frame is dropped
+            except OSError:
+                # The socket closed or failed. Closed by the owner: done. Otherwise reconnect
+                # to the seed and carry on; the fleet's leases cover the gap either way.
+                with self._lock:
+                    sock, self._socket = self._socket, None
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                if not self._running or self._seed is None or not self._reconnect():
+                    return
 
     def _accepts(self, env) -> bool:
         """The reader filter: a verified envelope for our group that is
@@ -311,13 +365,18 @@ class Peer:
     def _read_exact(self, count: int) -> bytes:
         data = b""
         while len(data) < count:
-            chunk = self._socket.recv(count - len(data))
+            sock = self._socket
+            if sock is None:
+                raise OSError("no socket")
+            chunk = sock.recv(count - len(data))
             if not chunk:
                 raise OSError("connection closed")
             data += chunk
         return data
 
     def _handle(self, env: dict) -> None:
+        if not self.frames.admit(env, self._now_ms()):
+            return  # stale, far ahead, or a replay: dropped and counted, nothing more
         wire.hlc_observe(self.identity.peer_id, env.get("stamp"), self._now_ms())
         kind = env.get("kind")
         body = env.get("body") or b""
@@ -376,6 +435,10 @@ class Peer:
                     for dto in (sync.get("states") or []):
                         if isinstance(dto, dict):
                             self._fold(dto)
+        else:
+            # A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are
+            # never sent to it, but a misconfigured peer could): ignored, counted, never fatal.
+            self.ignored_kinds[str(kind)] = self.ignored_kinds.get(str(kind), 0) + 1
 
     def _on_group_ad(self, body: bytes) -> None:
         """A GROUP_AD answer (spec §9): accepted only while a join-by-GroupID
@@ -594,7 +657,7 @@ class Peer:
             return None  # a revoked agent takes nothing, even locally
         space_id = space_id_local(f"{self.group}/{space}")
         deadline = time.time() + timeout_seconds
-        while time.time() < deadline and self.connected:
+        while time.time() < deadline and self._running:  # a reconnect in progress is not a reason to stop
             self.pull_space(space)
             time.sleep(0.3)
             now_ms = self._now_ms()

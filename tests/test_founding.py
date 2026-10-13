@@ -194,7 +194,11 @@ def test_a_frame_of_another_wire_version_is_dropped_before_verification():
 def _joiner() -> Peer:
     """A Peer mid join_by_group_id: it holds the wanted GroupID and nothing
     else, exactly the state in which GROUP_AD answers arrive."""
-    peer = Peer(_identity(), GOLDEN["founding_group_id"])
+    # The golden frames are stamped at the vectors' fixed instant; a peer drops frames
+    # older than wire.MAX_FRAME_AGE_MILLIS as stale (ROBUSTNESS.md §3.3), so the joiner's
+    # clock sits one second past that stamp, as a live joiner's would.
+    golden_seconds = int(GOLDEN["hlc_encoded"].split(":")[0]) / 1000
+    peer = Peer(_identity(), GOLDEN["founding_group_id"], clock=lambda: golden_seconds + 1)
     return peer
 
 
@@ -229,8 +233,12 @@ def test_group_ad_frames_reach_the_handler_before_membership():
 ])
 def test_the_join_path_ignores_hostile_group_ads(name):
     peer = _joiner()
+    # Stamped one logical tick before the genuine answer: a sender never reuses a stamp,
+    # and the second frame with one would be dropped as a replay (ROBUSTNESS.md §3.4).
+    physical, logical, node = GOLDEN["hlc_encoded"].split(":")
+    earlier = f"{physical}:{int(logical) - 1}:{node}"
     hostile = wire.envelope(GOLDEN["founding_group_id"], wire.KIND_GROUP_AD,
-                            GOLDEN["peer_id"], GOLDEN["hlc_encoded"], _hex(name),
+                            GOLDEN["peer_id"], earlier, _hex(name),
                             to=GOLDEN["peer_id"])
     _drive(peer, wire.encode_frame(hostile, _identity()))
     assert peer.founding is None

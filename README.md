@@ -229,6 +229,22 @@ The demo prints the Finding a Java worker produced from the Python-written
 task. The client keeps the dial-only posture (no listener, no advertised
 endpoints), which is exactly the NAT-restricted peer profile from spec §5.4.
 
+## On a network
+
+The client is generous in what it accepts and cautious in what it sends
+(ROBUSTNESS.md). Every verified frame passes a `FrameFilter` first: a stamp
+older than five minutes is stale, one further ahead than the HLC drift bound is
+refused, and a sender-and-stamp pair seen before is a replay; all three are
+dropped without a reply and counted (`peer.frames.stale`, `.ahead`,
+`.replayed`). A kind this client does not speak is counted in
+`peer.ignored_kinds`, a body that does not decode in `peer.malformed_frames`,
+and the reader goes on. A lost socket is a hiccup, not the end: the peer
+re-dials the seed every `reconnect_interval_s` (5 s) for `reconnect_window_s`
+(10 min), then introduces itself again and pulls again what it had pulled
+(revocations, advertisements, spaces), counting in `peer.reconnects`; a `take`
+in flight keeps polling across the gap. `close()` by the owner is final.
+`tests/test_robustness.py` pins each case against a fake seed over TCP.
+
 ## Scope
 
 This client implements what protocol validation needs, and enough of Layer 3
