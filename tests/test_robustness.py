@@ -103,6 +103,7 @@ class FakeSeed:
         self.port = self.server.getsockname()[1]
         self.connections = []
         self.frames = []  # (connection index, kind)
+        self.envelopes = []  # every verified envelope, in arrival order
         self.closed = threading.Event()
         threading.Thread(target=self._accept, daemon=True).start()
 
@@ -132,6 +133,7 @@ class FakeSeed:
                 env = wire.decode_frame(data)
                 if env is not None:
                     self.frames.append((index, env.get("kind")))
+                    self.envelopes.append(env)
         except OSError:
             return
 
@@ -205,7 +207,7 @@ def test_a_seed_that_is_down_is_retried_until_it_listens_again():
         again.server.bind(("127.0.0.1", port))
         again.server.listen(4)
         again.port = port
-        again.connections, again.frames, again.closed = [], [], threading.Event()
+        again.connections, again.frames, again.envelopes, again.closed = [], [], [], threading.Event()
         threading.Thread(target=again._accept, daemon=True).start()
         try:
             deadline = time.time() + 5

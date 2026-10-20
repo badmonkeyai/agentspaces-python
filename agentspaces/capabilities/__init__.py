@@ -18,13 +18,26 @@ over the peer's PIPE_DATA pipes, in the protocols the Java providers speak.
 - ``aggregate``: push-sum and rosters (``aspace:cap/aggregate``).
 - ``semantic``: the hashing embedder and the query pipe (``aspace:cap/semantic-discovery``).
 - ``remote``: the actions other agents' cards declare, invoked through spaces.
+- ``ordered``: the Raft client of the ordered log (``aspace:cap/ordered-log``,
+  JS-V-05): ``OrderedLog.take`` submits a claim command to the advertised
+  leader and observes the commit through the space.
+- ``connect``: the agent side of the connector protocol (``aspace:cap/data-query``
+  and ``aspace:cap/asset-invoke``, JS-C-14): ``DataQueryClient.fetch`` pull-once
+  by canonical hash, ``connect.invoke`` of one operation through an AssetCard.
 
-Ordered takes (the Raft client), joins, and reduces are the plan's phase G
-and are not here yet."""
+The Raft voter, the fleet-wide join modes, reduces, and the connector runtime
+stay in Java (and TypeScript)."""
 
+from . import connect, ordered
 from .pipes import Pipes
 from .aggregate import Aggregate, Settle
+from .connect import (AssetChange, AssetInvocation, AssetInvocationResult, DataQuery, DataQueryClient, DataResult,
+                      Fetched, asset_cards, canonical_hash, invoke_ops)
+from .ordered import LogMember, OrderedLog
 from .semantic import HashingEmbedder, Semantic
 from .remote import RemoteAction, actions, invoke
 
-__all__ = ["Pipes", "Aggregate", "Settle", "HashingEmbedder", "Semantic", "RemoteAction", "actions", "invoke"]
+__all__ = ["Pipes", "Aggregate", "Settle", "HashingEmbedder", "Semantic", "RemoteAction", "actions", "invoke",
+           "OrderedLog", "LogMember", "ordered", "connect", "DataQuery", "DataResult", "AssetChange",
+           "AssetInvocation", "AssetInvocationResult", "DataQueryClient", "Fetched", "asset_cards",
+           "canonical_hash", "invoke_ops"]

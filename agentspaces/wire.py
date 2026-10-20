@@ -267,8 +267,10 @@ def learn_exchange(model_id: str, token: int, kind: str, round_: int,
 
 
 def peer_advertisement(group: str, identity: Identity, issued_iso: str,
-                       ttl_iso: str = "PT10M") -> dict:
-    """A PeerAdvertisement with no endpoints: the dial-only NAT posture."""
+                       ttl_iso: str = "PT10M", resource_hints: dict | None = None) -> dict:
+    """A PeerAdvertisement with no endpoints: the dial-only NAT posture.
+    ``resource_hints`` (string to string) is where a join credential travels
+    (``aspace:join``, SPEC §5.1); a signed map, so it is canonically ordered."""
     return {
         "id": f"aspace://{group}/peer/{identity.peer_id}",
         "issuer": identity.peer_id,
@@ -277,7 +279,7 @@ def peer_advertisement(group: str, identity: Identity, issued_iso: str,
         "ttl": ttl_iso,
         "endpoints": [],
         "roles": [],
-        "resourceHints": {},
+        "resourceHints": cbor.canonical_map({str(k): str(v) for k, v in (resource_hints or {}).items()}),
     }
 
 

@@ -228,7 +228,9 @@ def test_a_decorated_agent_takes_notifies_bids_and_publishes_its_card():
         # The bid priced the claim: the signed claim carries 1.0 for priority 5.
         claims = [c for c in peer.claims.values()]
         assert claims and claims[0]["claim"]["bid"] == 1.0
-        # The take and the result are the agent's own attested records.
+        # The take and the result are the agent's own attested records (the result is
+        # written first, so the completion may land a moment after the audit fired).
+        assert _await(10, lambda: any(dto.get("completed") for dto in peer.states.values()))
         done = [dto for dto in peer.states.values() if dto.get("completed")]
         assert done and done[0].get("signer", "").endswith("/py-worker")
     finally:

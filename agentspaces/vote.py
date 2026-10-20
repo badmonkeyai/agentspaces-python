@@ -21,7 +21,11 @@ identity is the issuer's peer, so one peer is one counted ballot however many
 names it writes; under ``AGENT`` each permitted agent counts once, and only an
 ``AGENT_ATTESTED`` record (one whose state carried a certificate the two-key
 rule accepted) is eligible, because a peer-asserted name is exactly what that
-granularity exists to distrust."""
+granularity exists to distrust.
+
+MAJORITY_GOSSIP (JS-V-04) is at the end: ``cast_preference`` and ``leader``
+over the aggregate's push-sum shares, in the epochs Java's VoteCapability
+names, so a mixed fleet's estimates agree."""
 
 from . import cbor
 
@@ -134,3 +138,31 @@ def decision(states: dict, proposal_id: str, granularity: str = PEER, permits=No
         return None
     winner = sorted(options, key=lambda o: (-counts.get(o, 0), o))[0]
     return {"proposalId": proposal_id, "winner": winner, "tally": counts}
+
+
+# ------------------------------------------------------------ MAJORITY_GOSSIP
+
+def preference_epoch(vote_id: str, option: str) -> str:
+    """The push-sum epoch that carries one option's preference share
+    (VoteCapability.epoch): ``vote:<voteId>:<option>``."""
+    return f"vote:{vote_id}:{option}"
+
+
+def cast_preference(aggregate, vote_id: str, options: list, preference: str) -> None:
+    """VoteCapability.castPreference (JS-V-04): an approximate preference
+    through push-sum, 1 to the chosen option's average and 0 to the others;
+    every participant casts over the same aggregator and ticks it to
+    convergence, so each option's estimate is its share of the fleet."""
+    for option in options:
+        aggregate.start(preference_epoch(vote_id, option), 1.0 if option == preference else 0.0)
+
+
+def leader(aggregate, vote_id: str, options: list) -> str | None:
+    """VoteCapability.leader: the option with the highest estimated share, or
+    None before any estimate."""
+    best, best_share = None, -1.0
+    for option in options:
+        estimate = aggregate.estimate(preference_epoch(vote_id, option))
+        if estimate is not None and estimate > best_share:
+            best, best_share = option, estimate
+    return best

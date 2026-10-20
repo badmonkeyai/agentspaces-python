@@ -431,6 +431,15 @@ class Identity:
         return cls(Ed25519PrivateKey.generate())
 
     @classmethod
+    def from_seed(cls, seed: bytes) -> "Identity":
+        """An identity from a 32-byte Ed25519 seed (RFC 8032's private key),
+        as Java Ed25519.fromSeed builds one: how the invite signing key is
+        derived from a group secret."""
+        if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
+            raise ValueError("an Ed25519 seed is 32 bytes")
+        return cls(Ed25519PrivateKey.from_private_bytes(bytes(seed)))
+
+    @classmethod
     def from_pkcs8(cls, pkcs8: bytes) -> "Identity":
         key = serialization.load_der_private_key(pkcs8, password=None)
         if not isinstance(key, Ed25519PrivateKey):

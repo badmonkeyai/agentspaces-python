@@ -27,7 +27,7 @@ import struct
 import threading
 import time
 
-from . import cbor, wire
+from . import beacon, cbor, social, wire
 from .identity import (Identity, derive_id, instant_iso, verify_agent_certificate_at,
                        verify_signed_group_ad)
 from . import revocation as revocations
@@ -78,11 +78,29 @@ class Peer:
         # A lost socket is reconnected to the seed and the peer re-introduced and re-pulled,
         # every reconnect_interval_s for reconnect_window_s; a close() by the owner is final.
         self._seed = None
+        # The seeds connect_any was given, dialed in order and failed over across on a
+        # lost socket (SRAD DB-X-01); a bootstrap also sets _refresh_seeds, which
+        # re-fetches the beacon document when the window would expire with nothing
+        # reachable (SRAD §7.7).
+        self._seeds: list = []
+        self._refresh_seeds = None
+        # The resource hints this peer's self-advertisement carries (SPEC §5.1): a join
+        # credential under ``aspace:join`` for an INVITE group, set by join_invite.
+        self.resource_hints: dict[str, str] = {}
+        # After join_invite: the key pinned to the delegation this peer joined under
+        # (persist it and pass it to join_invite on the next start).
+        self.pinned_invite: str | None = None
         self._pulled_spaces: set[str] = set()
         self._pulled_ads = False
         self.reconnect_interval_s = 5.0
         self.reconnect_window_s = 600.0
         self.reconnects = 0
+        # Fold-driven waits (JS-V-02): a take, a read, or an ordered take waits on the
+        # next fold (a state or a claim) rather than polling, and pulls a space at most
+        # once per settle window.
+        self._fold_condition = threading.Condition()
+        self._fold_count = 0
+        self._last_pull: dict[str, float] = {}  # space name -> monotonic seconds of the last pull
 
     # ------------------------------------------------------------- lifecycle
 
@@ -97,29 +115,182 @@ class Peer:
         self.introduce()
         self.pull_revocations()
 
-    def _reconnect(self) -> bool:
-        """After a lost socket: dials the seed again until the window runs out, then
-        introduces this peer again and pulls what it had pulled before, so a network hiccup
-        costs a few seconds rather than the membership (ROBUSTNESS.md §3.6)."""
-        deadline = time.monotonic() + self.reconnect_window_s
-        while self._running and time.monotonic() < deadline:
+    def connect_any(self, seeds) -> tuple:
+        """Dials the seeds, (host, port) pairs, in order until one accepts, and
+        remembers them all: a lost socket fails over to the next seed inside the
+        reconnect window (SRAD DB-X-01). A hostname is resolved to every address
+        and each is a seed (DB-X-03). Returns the seed connected to; raises OSError
+        when none accepted. ``connect(host, port)`` is unchanged underneath."""
+        expanded = self._expand_seeds(seeds)
+        if not expanded:
+            raise OSError("no seeds to dial")
+        self._seeds = expanded
+        last = None
+        for host, port in expanded:
             try:
-                fresh = socket.create_connection(self._seed, timeout=10)
-                fresh.settimeout(None)
-            except OSError:
-                time.sleep(self.reconnect_interval_s)
-                continue
-            with self._lock:
-                self._socket = fresh
-            self.reconnects += 1
-            self.introduce()
-            self.pull_revocations()
-            if self._pulled_ads:
-                self.pull_ads()
-            for space in list(self._pulled_spaces):
-                self.pull_space(space)
-            return True
+                self.connect(host, port)
+                return (host, port)
+            except OSError as e:
+                last = e
+        raise OSError(f"no seed accepted: {expanded}") from last
+
+    @staticmethod
+    def _expand_seeds(seeds) -> list:
+        expanded = []
+        for host, port in seeds:
+            addresses = []
+            try:
+                for info in socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM):
+                    addresses.append((info[4][0], int(port)))
+            except (OSError, ValueError):
+                addresses = [(host, int(port))]
+            for address in addresses or [(host, int(port))]:
+                if address not in expanded:
+                    expanded.append(address)
+        return expanded
+
+    def _candidate_seeds(self) -> list:
+        """The seeds to try on a lost socket: the one after the current first, the
+        current one last, so the failover goes to the next seed."""
+        if not self._seeds:
+            return [self._seed] if self._seed else []
+        if self._seed in self._seeds:
+            i = self._seeds.index(self._seed)
+            return self._seeds[i + 1:] + self._seeds[:i + 1]
+        return list(self._seeds)
+
+    def _reconnect(self) -> bool:
+        """After a lost socket: dials the seed again (every seed of connect_any, the next
+        one first) until the window runs out, then introduces this peer again and pulls
+        what it had pulled before, so a network hiccup costs a few seconds rather than
+        the membership (ROBUSTNESS.md §3.6). A bootstrapped peer re-fetches the beacon
+        document once when the window would expire with nothing reachable."""
+        deadline = time.monotonic() + self.reconnect_window_s
+        refreshed = False
+        while self._running:
+            if time.monotonic() >= deadline:
+                if refreshed or self._refresh_seeds is None:
+                    return False
+                refreshed = True
+                try:
+                    seeds = self._expand_seeds(self._refresh_seeds())
+                except Exception:  # noqa: BLE001 - the beacon is unreachable too: give up
+                    return False
+                if not seeds:
+                    return False
+                self._seeds = seeds
+                deadline = time.monotonic() + self.reconnect_window_s
+            for seed in self._candidate_seeds():
+                if not self._running:
+                    return False
+                try:
+                    fresh = socket.create_connection(seed, timeout=10)
+                    fresh.settimeout(None)
+                except OSError:
+                    continue
+                with self._lock:
+                    self._socket = fresh
+                self._seed = seed
+                self.reconnects += 1
+                self.introduce()
+                self.pull_revocations()
+                if self._pulled_ads:
+                    self.pull_ads()
+                for space in list(self._pulled_spaces):
+                    self.pull_space(space)
+                return True
+            time.sleep(self.reconnect_interval_s)
         return False
+
+    def bootstrap(self, url: str, *, group_id: str | None = None, allow_plain: bool = False,
+                  beacon_peer: str | None = None, timeout: float = 3.0) -> dict:
+        """Joins through a beacon document (SRAD DB-X-01): fetches and verifies the
+        document at ``url`` (https unless ``allow_plain``; signed by ``beacon_peer`` when
+        pinned), selects the group (by ``group_id``, else the only one), verifies its
+        founding advertisement with the four checks of SPEC §5.1 against ``group_id``
+        when given, and dials its ``tcp`` seeds in priority order with ``connect_any``.
+        Returns the verified SignedGroupAdvertisement, kept on ``peer.founding``."""
+        doc = beacon.fetch_beacon_document(url, allow_plain=allow_plain, beacon_peer=beacon_peer,
+                                           timeout=timeout)
+        group = beacon.group_from_document(doc, group_id=group_id)
+        founding = self._adopt_founding(group, group_id)
+        seeds = beacon.seeds_of(group)
+        if not seeds:
+            raise ValueError(f"the beacon document names no tcp seed for {group.get('name')!r}")
+
+        def refresh():
+            fresh = beacon.fetch_beacon_document(url, allow_plain=allow_plain,
+                                                 beacon_peer=beacon_peer, timeout=timeout)
+            return beacon.seeds_of(beacon.group_from_document(fresh, group_id=self.group))
+        self._refresh_seeds = refresh
+        self.connect_any(seeds)
+        return founding
+
+    def join_invite(self, key_text: str, *, allow_plain: bool = False, timeout: float = 3.0) -> tuple:
+        """Joins a group for friends with an invite key (SRAD DB-X-07): parses the key,
+        fetches the social beacon's document at ``/j/<code>``, takes the delegation from
+        the key or the document's ``invite`` field, derives this peer's delegated
+        credential with the invite signing key and carries it in the self-advertisement
+        under ``aspace:join``, verifies the document's founding against the delegation's
+        group, and dials the seeds. Returns ``(content_key, group_id)``: the 32-byte
+        content key, epoch 0, and the verified GroupID."""
+        key = social.InviteKey.parse(key_text)
+        scheme = "http" if allow_plain else "https"
+        doc = beacon.fetch_beacon_document(key.document_url(scheme), allow_plain=allow_plain,
+                                           timeout=timeout)
+        groups = doc.get("groups") or []
+        group = None
+        if key.delegation is not None:
+            try:
+                group = beacon.group_from_document(doc, group_id=social.delegation_group(key.delegation))
+            except ValueError:
+                group = None
+        if group is None:
+            if len(groups) != 1:
+                raise ValueError(f"the beacon knows no group under {key.code}")
+            group = groups[0]  # a social beacon serves one group per code
+        delegation = key.delegation or group.get("invite")
+        if not delegation:
+            raise ValueError("the invite key carries no delegation and the beacon document has none")
+        group_id = social.delegation_group(delegation)
+        founding = self._adopt_founding(group, group_id)
+        credential = social.issue_delegated(delegation, key.secret.invite_private_seed(),
+                                            self.identity.peer_id)
+        issuer = founding["advertisement"]["issuer"]
+        verdict = social.judge_delegated_credential(credential, self.identity.peer_id, issuer,
+                                                    group_id, self._now_ms())
+        if verdict == "invalid":
+            raise ValueError("the invite key's delegation does not admit this peer to the group "
+                             "(not the founder's, or for another group)")
+        # An expired delegation still admits a peer the members admitted while it was valid
+        # (SPEC §5.1, v0.1.20); a newcomer is refused by the members, not here.
+        self.resource_hints[social.HINT_KEY] = credential
+        self.delegation = delegation
+        # Keep this key and join with it next time: it carries the delegation this peer was
+        # admitted under, so a restart presents the same credential even after the founder
+        # re-delegated at the beacon.
+        self.pinned_invite = key.with_delegation(delegation).compact()
+        seeds = beacon.seeds_of(group)
+        if not seeds:
+            raise ValueError(f"the beacon document names no tcp seed for {group.get('name')!r}")
+
+        def refresh():
+            fresh = beacon.fetch_beacon_document(key.document_url(scheme), allow_plain=allow_plain,
+                                                 timeout=timeout)
+            return beacon.seeds_of(beacon.group_from_document(fresh, group_id=self.group))
+        self._refresh_seeds = refresh
+        self.connect_any(seeds)
+        return key.secret.content_key(), group_id
+
+    def _adopt_founding(self, group: dict, expected_group_id: str | None) -> dict:
+        """Verifies a document group's founding exactly as join_by_group_id verifies a
+        GROUP_AD answer (the four checks, then the id this peer wants) and joins on it:
+        the group, the founding, and the founder are set before any socket is dialed."""
+        derived = beacon.verified_group_id(group, expected_group_id)
+        self.group = derived
+        self.founding = beacon.founding_of(group)
+        self._founding_ready.set()
+        return self.founding
 
     def join_by_group_id(self, host: str, port: int, group_id: str,
                          timeout: float = 10.0) -> dict:
@@ -181,7 +352,8 @@ class Peer:
         now_ms = self._now_ms()
         # Whole seconds, as the advertisement has always been stamped.
         ad = wire.peer_advertisement(self.group, self.identity,
-                                     instant_iso(now_ms - now_ms % 1000))
+                                     instant_iso(now_ms - now_ms % 1000),
+                                     resource_hints=self.resource_hints)
         payload = wire.signed_peer_ad(ad, self.identity)
         item_id = f"peer:{self.identity.peer_id}:{now_ms}"
         self._send("RUMOR", wire.rumor_body("peers", item_id, 6, payload))
@@ -225,6 +397,37 @@ class Peer:
         self._pulled_spaces.add(space)
         self._send("DIGEST", wire.digest_body(
             {f"space:{space}": b"", **{stream: b"" for stream in revocations.STREAMS}}))
+
+    def pull_space_paced(self, space: str, settle_seconds: float) -> bool:
+        """Pulls a space unless it was pulled within ``settle_seconds`` (JS-V-02): a
+        waiting take issues at most one DIGEST per settle window, and none while
+        folds keep arriving. Returns whether a pull went out."""
+        now = time.monotonic()
+        if now - self._last_pull.get(space, float("-inf")) < settle_seconds:
+            return False
+        self._last_pull[space] = now
+        self.pull_space(space)
+        return True
+
+    @property
+    def fold_count(self) -> int:
+        """How many states and claims have folded so far: a snapshot for ``await_fold``."""
+        return self._fold_count
+
+    def await_fold(self, max_seconds: float, since: int | None = None) -> bool:
+        """Blocks until the next fold (a state or a claim) or ``max_seconds``, whichever
+        comes first. With ``since`` (a ``fold_count`` snapshot taken before a scan) a
+        fold between the scan and the wait counts too, so nothing is missed. Returns
+        whether a fold woke the wait."""
+        with self._fold_condition:
+            seen = self._fold_count if since is None else since
+            return self._fold_condition.wait_for(lambda: self._fold_count != seen,
+                                                 timeout=max(0.0, max_seconds))
+
+    def _wake_fold_waiters(self) -> None:
+        with self._fold_condition:
+            self._fold_count += 1
+            self._fold_condition.notify_all()
 
     def pull_revocations(self) -> None:
         """Anti-entropy pull of the revocation streams alone (SPEC §5.6): sent
@@ -472,6 +675,7 @@ class Peer:
         self.states[entry_id] = merged
         if self.on_state is not None:
             self.on_state(merged)
+        self._wake_fold_waiters()
 
     @staticmethod
     def _join(previous: dict, incoming: dict) -> dict:
@@ -621,6 +825,7 @@ class Peer:
         self.claims[entry_id] = wire.merge_claims(self.claims.get(entry_id), signed)
         if self.on_claim is not None:
             self.on_claim(entry_id, self.claims[entry_id])
+        self._wake_fold_waiters()
 
     # ----------------------------------------------------------- take/complete
 
@@ -650,17 +855,23 @@ class Peer:
         With ``agent`` the claim is the agent's, signed by its key (v0.1.13).
         ``matches(payload_dict, tags_dict)`` narrows the candidates (a
         template); ``bid`` is the AUCTION price, a float or a callable over the
-        payload, and 0.0 under LEASE_RACE."""
+        payload, and 0.0 under LEASE_RACE.
+
+        Fold-driven (JS-V-02): while nothing matches, the take pulls the space
+        at most once per settle window and sleeps on the next fold, so an entry
+        that arrives wakes it at once; the settle window after a claim is waited
+        out in full, since a competing claim may fold at its end."""
         from .identity import space_id_local
         holder = agent.agent_id if agent is not None else self.identity.agent(agent_name)
         if self.revocations.refuses(holder, agent.public_raw if agent else None, None):
             return None  # a revoked agent takes nothing, even locally
         space_id = space_id_local(f"{self.group}/{space}")
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline and self._running:  # a reconnect in progress is not a reason to stop
-            self.pull_space(space)
-            time.sleep(0.3)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline and self._running:  # a reconnect in progress is not a reason to stop
+            self.pull_space_paced(space, settle_seconds)
+            seen = self.fold_count
             now_ms = self._now_ms()
+            claimed = False
             for entry_id, dto in list(self._available(type_name, now_ms)):
                 record = dto.get("record") or {}
                 if record.get("spaceId") != space_id:
@@ -680,13 +891,19 @@ class Peer:
                 self._send("RUMOR", wire.rumor_body(
                     f"space:{space}", f"c:{entry_id}:{claim['stamp']}", 6,
                     wire.claim_delta(entry_id, signed)))
-                time.sleep(settle_seconds)
-                self.pull_space(space)
-                time.sleep(0.3)
+                claimed = True
+                time.sleep(settle_seconds)  # the settle window: a competing claim folds within it
+                self.pull_space_paced(space, settle_seconds)
+                self.await_fold(min(settle_seconds, 0.3))
                 winner = self._claim_of(entry_id)
                 if winner and winner.get("holder") == holder \
-                        and int(winner.get("epoch")) == epoch:
+                        and int(winner.get("epoch")) == epoch \
+                        and not (self.states.get(entry_id) or {}).get("completed"):
                     return entry_id
+            if not claimed:
+                # Nothing to claim: sleep until a fold (an entry, a lapsed claim's
+                # successor) or the end of this settle window, not a fixed 300 ms.
+                self.await_fold(min(settle_seconds, deadline - time.monotonic()), since=seen)
         return None
 
     def complete_entry(self, space: str, entry_id: str, agent=None) -> None:

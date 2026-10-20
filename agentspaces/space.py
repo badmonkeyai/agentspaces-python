@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextvars
 import dataclasses
 import re
+from decimal import Decimal
 import threading
 import time
 from typing import Any, Callable
@@ -159,16 +160,74 @@ def _matcher(spec) -> Callable[[Any], bool]:
     return spec if callable(spec) else eq(spec)
 
 
+_FILTER_OPS = ("!=", "<=", ">=", "=", "<", ">", " in ")  # as they appear in a clause
+_NUMBER = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _filter_form(value) -> str:
+    """The string form a value compares under: Python's str, except that a whole float prints
+    as Java prints it, so ``3.0`` and ``3`` compare numerically either way."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def filter_compare(form: str, literal: str) -> int:
+    """Numeric when both sides are decimal numbers, else the strings' order (Java FieldFilter.compare)."""
+    f, l = form.strip(), literal.strip()
+    if _NUMBER.match(f) and _NUMBER.match(l):
+        a, b = Decimal(f), Decimal(l)
+        return -1 if a < b else 1 if a > b else 0
+    return -1 if form < literal else 1 if form > literal else 0
+
+
+def parse_filter(clause: str):
+    """One clause of the portable field filter grammar (SPEC §7.2; Java ``FieldFilter``, TypeScript
+    ``parseFilter``): ``field op literal`` with ``=``, ``!=``, ``<``, ``<=``, ``>``, ``>=``, or
+    ``field in a,b,c``. Returns ``(field, predicate)``. A None value matches ``!=`` alone."""
+    text = clause.strip()
+    # The earliest operator in the clause is the operator; at a tie the longest (so "<=" beats
+    # "<"), and "!=x" is malformed rather than the field "!".
+    best, best_op = -1, ""
+    for op in _FILTER_OPS:
+        at = text.find(op)
+        if at >= 0 and (best < 0 or at < best or (at == best and len(op) > len(best_op))):
+            best, best_op = at, op
+    if best <= 0:
+        raise ValueError(f"malformed field filter '{clause}'; use \"field=value\", \"field!=value\", "
+                         "\"field<value\", \"field<=value\", \"field>value\", \"field>=value\", or \"field in a,b,c\"")
+    field, literal, op = text[:best].strip(), text[best + len(best_op):].strip(), best_op.strip()
+    if op == "in":
+        elements = [e.strip() for e in literal.split(",")]
+        return field, (lambda value, elements=elements: value is not None
+                       and any(filter_compare(_filter_form(value), e) == 0 for e in elements))
+
+    def test(value, op=op, literal=literal):
+        if value is None:
+            return op == "!="
+        c = filter_compare(_filter_form(value), literal)
+        return {"=": c == 0, "!=": c != 0, "<": c < 0, "<=": c <= 0, ">": c > 0, ">=": c >= 0}[op]
+    return field, test
+
+
 class Template:
     """A query: the entry type (an ``@entry`` class or a schema string), field
     conditions, and tag conditions. A plain value means equality; a callable
     is a predicate; ``eq``, ``ne``, ``gt``, ``gte``, ``lt``, ``lte``, ``in_``,
-    ``contains``, ``is_null``, ``not_null`` are the Java matchers."""
+    ``contains``, ``is_null``, ``not_null`` are the Java matchers. ``filters``
+    are clauses of the portable grammar (``"priority>=3"``, ``"region in eu,us"``),
+    judged as Java and TypeScript judge them (JS-V-03)."""
 
-    def __init__(self, type, where: dict | None = None, tags: dict | None = None):
+    def __init__(self, type, where: dict | None = None, tags: dict | None = None,
+                 filters: list | tuple = ()):
         self.type = type
         self.schema = schema_of(type)
         self.where = {k: _matcher(v) for k, v in (where or {}).items()}
+        for clause in filters:
+            field, test = parse_filter(clause)
+            previous = self.where.get(field)
+            self.where[field] = (test if previous is None
+                                 else (lambda v, p=previous, t=test: p(v) and t(v)))
         self.tags = {k: _matcher(v) for k, v in (tags or {}).items()}
 
     def matches(self, payload: dict, tags: dict | None = None) -> bool:
@@ -221,14 +280,55 @@ REAPPEARED = "REAPPEARED"  # a take claim lapsed and the entry is available agai
 
 
 class Subscription:
-    """A watch handle; ``close()`` stops the deliveries."""
+    """A watch handle; ``close()`` stops the deliveries. A leased subscription
+    (``Space.notify``, JS-V-01) closes itself when its lease lapses on the
+    peer's clock unless ``renew`` extends it; the binder renews at half-lease
+    on the agent's behalf, the shape of the Java ``Subscription``. ``reason``
+    is ``"closed"`` or ``"lapsed"`` once closed."""
 
     def __init__(self, space: "Space", key: int):
         self._space = space
         self._key = key
+        self._lease_millis: int | None = None
+        self._expires_ms: int | None = None
+        self._closed = False
+        self.reason: str | None = None
+        self._on_close: list[Callable[[str], None]] = []
 
-    def close(self) -> None:
+    @property
+    def open(self) -> bool:
+        """Whether the subscription is still delivering."""
+        return not self._closed
+
+    def renew(self, lease=None) -> None:
+        """Extends the lease (the same length again when none is given); a lapsed
+        subscription stays closed, and a watch without a lease never lapses."""
+        if self._closed:
+            return
+        millis = self._lease_millis if lease is None else duration_millis(lease)
+        if millis is None:
+            return
+        self._lease_millis = millis
+        self._expires_ms = self._space.peer._now_ms() + millis
+
+    def lapsed(self, now_ms: int) -> bool:
+        return self._expires_ms is not None and self._expires_ms <= now_ms
+
+    def on_close(self, listener: Callable[[str], None]) -> None:
+        """Calls ``listener(reason)`` once, when the subscription closes."""
+        self._on_close.append(listener)
+
+    def close(self, reason: str = "closed") -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.reason = reason
         self._space._watchers.pop(self._key, None)
+        for listener in self._on_close:
+            try:
+                listener(reason)
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
@@ -338,7 +438,7 @@ class Space:
         self.agent = agent
         self.agent_name = agent_name
         self.bid_function: Callable[[dict], float] | None = None
-        self._watchers: dict[int, tuple[Template, Callable[[Event], None], set]] = {}
+        self._watchers: dict[int, tuple[Template, Callable[[Event], None], set, Subscription]] = {}
         self._next_key = 0
         self._lock = threading.Lock()
         self._seen: dict[str, str] = {}   # entry_id -> last delivered kind
@@ -420,28 +520,40 @@ class Space:
     def read_all(self, template: Template, limit: int = 100) -> list:
         return [e.value for e in self.entries(template, limit)]
 
-    def read(self, template: Template, timeout=None):
-        """The first match, waiting up to ``timeout`` (pulling the space) for one."""
-        deadline = time.time() + (duration_millis(timeout) / 1000 if timeout else 0)
+    def read(self, template: Template, timeout=None, settle="600ms"):
+        """The first match, waiting up to ``timeout`` for one: the space is pulled
+        at most once per ``settle`` window and the wait wakes on a fold (JS-V-02)."""
+        settle_seconds = duration_millis(settle) / 1000
+        deadline = time.monotonic() + (duration_millis(timeout) / 1000 if timeout else 0)
         while True:
+            seen = self.peer.fold_count
             found = self.entries(template, 1)
             if found:
                 return found[0].value
-            if time.time() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
-            self.peer.pull_space(self.name)
-            time.sleep(0.2)
+            self.peer.pull_space_paced(self.name, settle_seconds)
+            self.peer.await_fold(min(settle_seconds, remaining), since=seen)
 
-    def take(self, template: Template, lease="1m", timeout="15s") -> Taken | None:
+    def take(self, template: Template, lease="1m", timeout="15s", through=None) -> Taken | None:
         """An exclusive take of one matching entry under the space's strategy;
-        the configured bid function prices it under AUCTION."""
+        the configured bid function prices it under AUCTION. With ``through``
+        (an ``OrderedLog``, JS-V-05) the claim goes through the fleet's ordered
+        log instead, and the take is held once the log committed it."""
         millis = duration_millis(lease)
-        bid = self.bid_function or 0.0
-        entry_id = self.peer.take_entry(self.name, template.schema, agent_name=self.agent_name,
-                                        lease_millis=millis, timeout_seconds=duration_millis(timeout) / 1000,
-                                        agent=self.agent,
-                                        matches=lambda payload, tags: template.matches(payload, tags),
-                                        bid=bid)
+        timeout_seconds = duration_millis(timeout) / 1000
+        if through is not None:
+            entry_id = through.take(self.name, template.schema, agent_name=self.agent_name,
+                                    lease_millis=millis, timeout_seconds=timeout_seconds, agent=self.agent,
+                                    matches=lambda payload, tags: template.matches(payload, tags))
+        else:
+            bid = self.bid_function or 0.0
+            entry_id = self.peer.take_entry(self.name, template.schema, agent_name=self.agent_name,
+                                            lease_millis=millis, timeout_seconds=timeout_seconds,
+                                            agent=self.agent,
+                                            matches=lambda payload, tags: template.matches(payload, tags),
+                                            bid=bid)
         if entry_id is None:
             return None
         record = self.peer.states[entry_id]["record"]
@@ -458,8 +570,18 @@ class Space:
         with self._lock:
             key = self._next_key
             self._next_key += 1
-            self._watchers[key] = (template, callback, set())
-        return Subscription(self, key)
+            subscription = Subscription(self, key)
+            self._watchers[key] = (template, callback, set(), subscription)
+        return subscription
+
+    def notify(self, template: Template, callback: Callable[[Event], None], lease="1h") -> Subscription:
+        """The leased push subscription of the Java space (JS-V-01): events reach
+        ``callback`` as they fold, and the subscription lapses after ``lease``
+        on the peer's clock unless renewed. A watch that outlives its owner never
+        leaks: the lease ends it."""
+        subscription = self.watch(template, callback)
+        subscription.renew(lease)
+        return subscription
 
     # ---------------------------------------------------------------- events
 
@@ -468,7 +590,11 @@ class Space:
         entry_id = record.get("entryId")
         payload = cbor.loads(record.get("payload") or b"\xf6")
         tags = record.get("tags") or {}
-        for template, callback, delivered in list(self._watchers.values()):
+        now_ms = self.peer._now_ms()
+        for template, callback, delivered, subscription in list(self._watchers.values()):
+            if subscription.lapsed(now_ms):
+                subscription.close("lapsed")  # judged here as well as on the sweep: nothing after the lease
+                continue
             if record.get("type") != template.schema or not template.matches(payload, tags):
                 continue
             mark = (entry_id, mark or kind)
@@ -495,11 +621,17 @@ class Space:
         self._deliver(dto, TAKEN)
 
     def _sweep(self) -> None:
-        """Delivers EXPIRED once per entry whose write lease lapsed while open,
+        """Closes every leased subscription whose lease lapsed (JS-V-01), then
+        delivers EXPIRED once per entry whose write lease lapsed while open,
         and REAPPEARED once per lapsed claim epoch on an entry still open."""
         if not self._watchers:
             return
         now = self.peer._now_ms()
+        for _, _, _, subscription in list(self._watchers.values()):
+            if subscription.lapsed(now):
+                subscription.close("lapsed")
+        if not self._watchers:
+            return
         for entry_id, dto in list(self.peer.states.items()):
             if not self._mine(dto) or dto.get("completed"):
                 continue

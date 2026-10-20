@@ -49,8 +49,11 @@ once per key when every required part is present. A take completes in its
 space with the result, where a remote caller awaits it, or in ``result_space``;
 a notify fires once per entry; a ballot casts once per proposal; a decision
 fires once per proposal when the quorum closes; the AgentCard, with the
-declared actions, is published on bind. The verbs that need the ordered log
-(ordered takes, reduces, the fleet-wide join modes) are not here.
+declared actions, is published on bind. A notify, a propose, and a join part
+hold a leased push subscription the binder renews at half-lease (JS-V-01).
+An ordered take goes through ``Space.take(template, through=OrderedLog)``
+(JS-V-05); the decorated ordered verbs (``@OrderedTake``, reduces, the
+fleet-wide join modes) are not here.
 """
 
 from __future__ import annotations
@@ -108,28 +111,33 @@ def agent(name: str, description: str = "", goals: list | None = None):
 
 def space_take(space: str, lease="10m", poll_timeout="1s", result_space: str | None = None,
                result_lease="1h", tags: dict | None = None, where: dict | None = None, description: str = "",
-               produces=None):
+               produces=None, filters: list | tuple = ()):
     """The kill-tolerant worker: take one matching entry under a lease, call,
     complete with the result; a crash lets the lease lapse and the entry
     reappear. ``produces`` names the entry classes the card lists when the
-    return annotation does not say (the elements of a fork)."""
+    return annotation does not say (the elements of a fork). ``filters`` are
+    clauses of the portable grammar (``"priority>=3"``), as Java's ``where``
+    strings are (JS-V-03); ``where`` holds Python matchers."""
     return lambda fn: _mark(fn, "take", space=space, lease=lease, poll_timeout=poll_timeout,
                             result_space=result_space, result_lease=result_lease, tags=tags, where=where,
-                            description=description, produces=produces)
+                            description=description, produces=produces, filters=list(filters))
 
 
 def space_notify(space: str, result_space: str | None = None, result_lease="1h",
                  tags: dict | None = None, where: dict | None = None, on=WRITTEN, description: str = "",
-                 produces=None):
+                 produces=None, filters: list | tuple = (), lease="1h"):
     """Choreography: called once per matching entry and event kind, never
     consuming it. ``on`` is one kind or several of ``WRITTEN``, ``TAKEN``,
     ``COMPLETED``, ``EXPIRED`` (the write lease lapsed: a leased entry as a
-    timer), and ``REAPPEARED`` (a take claim lapsed)."""
+    timer), and ``REAPPEARED`` (a take claim lapsed). ``lease`` is the push
+    subscription's lease, renewed at half-lease while the agent stays bound
+    (JS-V-01), so a reactor that outlives its binder goes quiet."""
     kinds = [on] if isinstance(on, str) else list(on)
     if not kinds:
         raise ValueError("@space_notify needs at least one event kind")
     return lambda fn: _mark(fn, "notify", space=space, result_space=result_space, result_lease=result_lease,
-                            tags=tags, where=where, on=kinds, description=description, produces=produces)
+                            tags=tags, where=where, on=kinds, description=description, produces=produces,
+                            filters=list(filters), lease=lease)
 
 
 def bid_function(space: str):
@@ -161,6 +169,7 @@ class Part:
     at_least: int = 1
     where: dict | None = None
     tags: dict | None = None
+    filters: tuple = ()  # clauses of the portable grammar (JS-V-03)
 
 
 def space_join(space: str, key: str, parts: list, within="1h", result_space: str | None = None,
@@ -177,11 +186,12 @@ def space_join(space: str, key: str, parts: list, within="1h", result_space: str
 
 def propose(space: str, vote: str, options: list, quorum: int, prefix: str = "", key: list | str | None = None,
             key_tag: str | None = None, lease="1h", where: dict | None = None, tags: dict | None = None,
-            description: str = ""):
+            description: str = "", filters: list | tuple = ()):
     """Opens a vote from a cue (``@Propose``): the method receives the cue
     and returns the question (or None to ask nothing, or a ``Motion``); the
     proposal id is ``prefix`` plus the key fields joined by ``:`` (or the key
-    tag), opened once per id."""
+    tag), opened once per id. ``filters`` are clauses of the portable grammar
+    over the cue (JS-V-03)."""
     keys = [key] if isinstance(key, str) else list(key or [])
     if keys and key_tag:
         raise ValueError("@propose names both key and key_tag; choose one")
@@ -189,7 +199,7 @@ def propose(space: str, vote: str, options: list, quorum: int, prefix: str = "",
         raise ValueError("@propose needs at least two options and a positive quorum")
     return lambda fn: _mark(fn, "propose", space=space, vote=vote, options=list(options), quorum=int(quorum),
                             prefix=prefix, key=keys, key_tag=key_tag, lease=lease, where=where, tags=tags,
-                            description=description)
+                            description=description, filters=list(filters))
 
 
 def on_estimate(epochs: str = "", ticks: int = 0, tolerance: float = 0.0, result_space: str | None = None,
@@ -266,9 +276,11 @@ class Bound:
         self._threads: list[threading.Thread] = []
         self._subscriptions = []
         self._running = True
+        self._stopped = threading.Event()  # set on close: a renewal sleeping on it wakes at once
 
     def close(self) -> None:
         self._running = False
+        self._stopped.set()
         for s in self._subscriptions:
             s.close()
         for t in self._threads:
@@ -423,9 +435,37 @@ class Binder:
         votes.propose(self.peer, space, motion.proposal_id, motion.question, motion.options, motion.quorum,
                       lease_millis=duration_millis(motion.lease), agent=self.agent, agent_name=self.agent_name)
 
+    @staticmethod
+    def _template(cue, meta) -> Template:
+        """The binding's template (AgentBinder.templateFor): Python matchers in
+        ``where``, tag conditions, and the portable grammar's clauses in
+        ``filters`` (JS-V-03), judged as Java and TypeScript judge them."""
+        return Template(cue, where=meta.get("where"), tags=meta.get("tags"), filters=meta.get("filters") or ())
+
+    def _subscribe(self, bound: Bound, space: Space, template: Template, on_event, lease="1h") -> None:
+        """The leased subscription every reacting binding shares (AgentBinder.watch,
+        JS-V-01): ``space.notify`` under ``lease``, renewed at half-lease on a thread
+        while the agent stays bound, so a long-lived reactor never goes deaf and a
+        subscription whose binder is gone lapses on its own."""
+        lease_ms = duration_millis(lease)
+        subscription = space.notify(template, on_event, lease=lease_ms)
+        half_seconds = max(0.05, lease_ms / 2000)
+
+        def renew():
+            while bound._running and subscription.open:
+                if bound._stopped.wait(half_seconds):
+                    return
+                if bound._running and subscription.open:
+                    subscription.renew()
+
+        thread = threading.Thread(target=renew, name=f"{bound.name}.renew", daemon=True)
+        bound._subscriptions.append(subscription)
+        bound._threads.append(thread)
+        thread.start()
+
     def _start_take(self, bound: Bound, obj, method, meta, cue) -> None:
         space = self.space(meta["space"])
-        template = Template(cue, where=meta.get("where"), tags=meta.get("tags"))
+        template = self._template(cue, meta)
         lease, poll = meta["lease"], meta["poll_timeout"]
 
         def loop():
@@ -464,7 +504,7 @@ class Binder:
 
     def _start_notify(self, bound: Bound, obj, method, meta, cue) -> None:
         space = self.space(meta["space"])
-        template = Template(cue, where=meta.get("where"), tags=meta.get("tags"))
+        template = self._template(cue, meta)
         wanted = set(meta.get("on") or [WRITTEN])
 
         def on_event(event: Event):
@@ -478,7 +518,7 @@ class Binder:
                     pass
             threading.Thread(target=react, name=f"{bound.name}.{method.__name__}", daemon=True).start()
 
-        bound._subscriptions.append(space.watch(template, on_event))
+        self._subscribe(bound, space, template, on_event, lease=meta.get("lease", "1h"))
 
     def _start_ballot(self, bound: Bound, obj, method, meta) -> None:
         space = self.space(meta["space"])
@@ -563,7 +603,7 @@ class Binder:
 
     def _start_propose(self, bound: Bound, obj, method, meta, cue) -> None:
         cue_space = self.space(meta["space"])
-        template = Template(cue, where=meta.get("where"), tags=meta.get("tags"))
+        template = self._template(cue, meta)
         keys, key_tag, prefix = meta["key"], meta.get("key_tag"), meta.get("prefix") or ""
         opened: set[str] = set()
         lock = threading.Lock()
@@ -610,7 +650,7 @@ class Binder:
                         opened.discard(proposal_id)
             threading.Thread(target=react, name=f"{bound.name}.{method.__name__}", daemon=True).start()
 
-        bound._subscriptions.append(cue_space.watch(template, on_event))
+        self._subscribe(bound, cue_space, template, on_event)
 
     # ------------------------------------------------------------------ join
 
@@ -682,5 +722,5 @@ class Binder:
 
         for part in parts:
             space = self.space(part.space) if part.space else join_space
-            template = Template(part.type, where=part.where, tags=part.tags)
-            bound._subscriptions.append(space.watch(template, on_part(part)))
+            template = Template(part.type, where=part.where, tags=part.tags, filters=part.filters or ())
+            self._subscribe(bound, space, template, on_part(part))
