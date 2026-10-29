@@ -33,8 +33,11 @@ class Pipes:
         """Registers ``handler(from_peer_id, payload)`` for one capability's frames."""
         self.peer.pipe_handlers[capability_type] = handler
 
-    def send(self, to: str, capability_type: str, payload: bytes) -> None:
-        self.peer.send_pipe(to, capability_type, payload)
+    def send(self, to: str, capability_type: str, payload: bytes, via: list | None = None) -> None:
+        """One frame to a member; ``via`` names the relays the member declared
+        (its ``relay.via`` hint or a holding's ``via``), extending the path the
+        seed carries the frame along (SPEC §5.4, v0.1.23)."""
+        self.peer.send_pipe(to, capability_type, payload, via)
 
     def members(self) -> list[str]:
         """The members a frame can reach (those that signed a frame on our

@@ -92,6 +92,22 @@ class Peer:
         self.pinned_invite: str | None = None
         self._pulled_spaces: set[str] = set()
         self._pulled_ads = False
+        # SPEC v0.1.23 (srad/large-networks-bulk-data.md): the seed's PeerID, learned from
+        # the first frame it addresses to us. A dial-only peer reaches the seed directly
+        # and every other member through it (a RELAY_FRAME the seed forwards), and it
+        # declares the seed as its relay in the ``relay.via`` hint so members reach it
+        # the same way back. ``max_path_hops`` bounds a path through further relays.
+        self.seed_peer: str | None = None
+        self.max_path_hops = 4
+        self.relayed_frames = 0
+        self.relay_signals: list[dict] = []
+        # Block-stored payloads (SPEC §7.1, ``z`` references): blocks this peer put or
+        # fetched, by id, and the ids it asked for with when it asked.
+        self.blocks: dict[str, bytes] = {}
+        self._block_asked: dict[str, float] = {}
+        # The content swarm attached to this peer (``agentspaces.capabilities.content``):
+        # resolves ``b`` references and takes payloads above its escalation bound.
+        self.content = None
         self.reconnect_interval_s = 5.0
         self.reconnect_window_s = 600.0
         self.reconnects = 0
@@ -369,9 +385,20 @@ class Peer:
         if agent is not None and self.revocations.refuses(agent.agent_id, agent.public_raw, None):
             raise ValueError(f"{agent.agent_id} is revoked in this group")
         payload = cbor.dumps(value)
+        payload_ref = None
+        if self.content is not None and self.content.escalate_above > 0 \
+                and len(payload) > self.content.escalate_above:
+            # SPEC §7.1 group E: above the bound the payload becomes an artifact of the
+            # content swarm and the record carries its root.
+            payload_ref = self.content.publish_opaque(payload, lease_millis)
+            payload = None
+        elif len(payload) > wire.INLINE_PAYLOAD_LIMIT:
+            payload_ref = self.put_block(payload)
+            payload = None
         entry_id, body = wire.entry_delta(space, self.group, type_name, payload,
                                           self.identity, agent_name, lease_millis,
-                                          agent=agent, now_ms=self._now_ms(), tags=tags)
+                                          agent=agent, now_ms=self._now_ms(), tags=tags,
+                                          payload_ref=payload_ref)
         self._send("RUMOR", body)
         # The writer holds its own entry too, so a local read sees it at once.
         delta = cbor.loads(cbor.loads(body)["payload"])
@@ -474,10 +501,86 @@ class Peer:
         now = self._now_ms()
         return [e["ad"] for e in self.ads.values() if e["type"] == "AgentCard" and e["expires"] > now]
 
-    def send_pipe(self, to: str, capability: str, payload: bytes) -> None:
+    def send_pipe(self, to: str, capability: str, payload: bytes, via: list | None = None) -> None:
         """One capability frame to a member (CapabilityPipes.send): a
-        PIPE_DATA envelope addressed to it carrying {capability, payload}."""
-        self._send("PIPE_DATA", cbor.dumps({"capability": capability, "payload": payload}), to=to)
+        PIPE_DATA envelope addressed to it carrying {capability, payload}. Over a
+        socket the seed carries it when ``to`` is any other member (SPEC §5.4);
+        ``via`` (the relays the member declared) extends the path past the seed."""
+        self.send_addressed("PIPE_DATA", cbor.dumps({"capability": capability, "payload": payload}), to, via)
+
+    def relay_for(self, to: str) -> str | None:
+        """The relay an addressed frame to ``to`` goes through, or None for a
+        direct send: over a socket, the seed for everyone but the seed itself."""
+        if self._seed is None or self.seed_peer is None or to == self.seed_peer:
+            return None
+        return self.seed_peer
+
+    def send_addressed(self, kind: str, body: bytes, to: str, via: list | None = None) -> None:
+        """Sends an addressed frame directly or, when the seed must carry it, wrapped
+        in a RELAY_FRAME to the seed (the one-hop form), extended to a path
+        ``[seed, via...]`` when ``via`` names other relays (v0.1.23)."""
+        relay = self.relay_for(to)
+        if relay is None:
+            self._send(kind, body, to=to)
+            return
+        inner = wire.encode_frame(
+            wire.envelope(self.group, kind, self.identity.peer_id,
+                          wire.hlc_now(self.identity.peer_id, self._now_ms()), body, to), self.identity)
+        path = [relay] + [v for v in (via or []) if v != relay and v != to][:max(0, self.max_path_hops - 1)]
+        self.relayed_frames += 1
+        if len(path) > 1:
+            self._send("RELAY_FRAME", wire.relay_frame_body(to, inner, path, 0), to=relay)
+        else:
+            self._send("RELAY_FRAME", wire.relay_frame_body(to, inner), to=relay)
+
+    # ------------------------------------------------------------- payloads
+
+    def payload_of(self, dto: dict) -> bytes | None:
+        """The payload bytes of an entry's record: inline, or resolved from a block
+        (``z``) or a content root (``b``) held here. A reference not yet held starts
+        its transfer and returns None; reads never block on the network (SPEC §7.2).
+        A null payload with no reference is the CBOR null."""
+        record = dto.get("record") or {}
+        payload = record.get("payload")
+        if payload is not None:
+            return payload
+        ref = record.get("payloadRef")
+        if not isinstance(ref, str) or not ref:
+            return b"\xf6"
+        if ref[0] == "b":
+            if self.content is None:
+                return None
+            data = self.content.local(ref)
+            if data is None:
+                self.content.ensure(ref)
+            return data
+        data = self.blocks.get(ref)
+        if data is None:
+            self.want_block(ref, dto)
+        return data
+
+    def want_block(self, cid: str, dto: dict | None = None) -> None:
+        """Asks the entry's issuing peer (and the seed) for a block, at most once a second."""
+        now = time.monotonic()
+        if now - self._block_asked.get(cid, float("-inf")) < 1.0:
+            return
+        self._block_asked[cid] = now
+        targets = []
+        key = (dto or {}).get("issuerPublicKey")
+        if isinstance(key, bytes):
+            from .identity import derive_id
+            targets.append(derive_id(key))
+        if self.seed_peer and self.seed_peer not in targets:
+            targets.append(self.seed_peer)
+        for target in targets:
+            if target != self.identity.peer_id:
+                self.send_addressed("BLOCK_WANT", wire.block_want_body(cid), target)
+
+    def put_block(self, data: bytes) -> str:
+        """Stores a block here and returns its id; served to any member that asks."""
+        cid = wire.block_cid(data)
+        self.blocks[cid] = bytes(data)
+        return cid
 
     def _accept_peer_ad(self, payload: bytes) -> None:
         """A 'peers' stream item: PeerNode.SignedPeerAd. The advertisement is
@@ -500,7 +603,9 @@ class Peer:
         for dto in self.states.values():
             record = dto.get("record") or {}
             if record.get("type") == type_name and not dto.get("completed"):
-                results.append(cbor.loads(record.get("payload") or b"\xf6"))
+                payload = self.payload_of(dto)
+                if payload is not None:
+                    results.append(cbor.loads(payload))
         return results
 
     # ------------------------------------------------------------- internals
@@ -577,7 +682,7 @@ class Peer:
             data += chunk
         return data
 
-    def _handle(self, env: dict) -> None:
+    def _handle(self, env: dict, relayed: bool = False) -> None:
         if not self.frames.admit(env, self._now_ms()):
             return  # stale, far ahead, or a replay: dropped and counted, nothing more
         wire.hlc_observe(self.identity.peer_id, env.get("stamp"), self._now_ms())
@@ -586,17 +691,50 @@ class Peer:
         sender = env.get("from")
         if isinstance(sender, str) and sender != self.identity.peer_id:
             # A verified frame is a member heard from (the frame's signer), and
-            # one our socket reaches.
+            # one our socket reaches; a frame a relay carried for its origin
+            # says nothing about reaching that origin.
             self.members.setdefault(sender, {})
-            self.reachable.add(sender)
+            if not relayed:
+                self.reachable.add(sender)
+            if not relayed and self._seed is not None and env.get("to") == self.identity.peer_id \
+                    and self.seed_peer != sender:
+                # Over our one socket an addressed frame is the seed's own; it is the relay
+                # we declare, so members behind other seeds reach us through it (SPEC §5.4).
+                self.seed_peer = sender
+                self.resource_hints["relay.via"] = sender
+                self.introduce()
         if kind == "PING":
             ping = cbor.loads(body)
             self._send("ACK", wire.ack_body(ping.get("nonce", 0)))
         elif kind == "PIPE_DATA":
             frame = cbor.loads(body)
+            if isinstance(frame, dict) and frame.get("capability") == wire.RELAY_SIGNAL_CAPABILITY:
+                signal = cbor.loads(frame.get("payload") or b"\xf6")
+                if isinstance(signal, dict):
+                    self.relay_signals.append(signal)
+                    del self.relay_signals[:-64]
+                return
             handler = self.pipe_handlers.get(frame.get("capability")) if isinstance(frame, dict) else None
             if handler is not None:
                 handler(sender, frame.get("payload") or b"")
+        elif kind == "RELAY_FRAME":
+            relay = cbor.loads(body)
+            if not isinstance(relay, dict) or relay.get("target") != self.identity.peer_id:
+                return  # a dial-only peer forwards nothing: it holds no connection to forward on
+            inner = wire.decode_frame(relay.get("frame") or b"")
+            if inner is not None and inner.get("kind") != "RELAY_FRAME" and self._accepts(inner):
+                self._handle(inner, relayed=True)
+        elif kind == "BLOCK_WANT":
+            want = cbor.loads(body)
+            data = self.blocks.get(want.get("cid")) if isinstance(want, dict) else None
+            if data is not None:
+                self.send_addressed("BLOCK", wire.block_body(want["cid"], data), sender)
+        elif kind == "BLOCK":
+            block = cbor.loads(body)
+            if isinstance(block, dict) and isinstance(block.get("bytes"), bytes) \
+                    and block.get("cid") in self._block_asked and wire.block_cid(block["bytes"]) == block["cid"]:
+                self.blocks[block["cid"]] = block["bytes"]
+                self._wake_fold_waiters()
         elif kind == wire.KIND_GROUP_AD:
             self._on_group_ad(body)
         elif kind == "RUMOR":
@@ -876,7 +1014,10 @@ class Peer:
                 record = dto.get("record") or {}
                 if record.get("spaceId") != space_id:
                     continue  # the same type in another space is not this take's
-                payload = cbor.loads(record.get("payload") or b"\xf6")
+                raw = self.payload_of(dto)
+                if raw is None:
+                    continue  # its block or artifact is still on its way
+                payload = cbor.loads(raw)
                 if matches is not None and not matches(payload, record.get("tags") or {}):
                     continue
                 price = float(bid(payload)) if callable(bid) else float(bid)

@@ -401,8 +401,9 @@ card's issuer; readers drop fields they do not know, JS-F-06; the connector
 runtime itself stays in Java and TypeScript). MAJORITY_GOSSIP
 is `vote.cast_preference` and `vote.leader` over the aggregate's push-sum
 shares (JS-V-04), the epochs Java's `VoteCapability` names. A dial-only peer
-sends frames to the members it can reach (the seed it dialed), never to a
-member it only heard of. Not here: the Raft voter (JS-F-18), so reduces and
+sends frames to its seed directly and to every other member through it: the
+seed carries a `RELAY_FRAME` when it holds the `RELAY` role (SPEC §5.4), and
+the peer's `relay.via` hint tells members to reach it the same way back. Not here: the Raft voter (JS-F-18), so reduces and
 the fleet-wide LEASED and ORDERED join modes; the gossip-learning exchange
 (its payload is encoded and golden-pinned); and every transport but tcp (the
 client skips `ws`, `wss`, `http`, `https`, `webrtc`, and `dtls` endpoints,
@@ -419,9 +420,40 @@ bytes, a query answered and the identical one served from the space, a
 result accepted only from a trusted connector, an invocation answered only
 by the card's issuer, a retry that never runs the target again) prove each
 piece without a socket; `tests/workers/ordered_worker.py` is the worker the
-Java `PythonOrderedTakeTest` spawns against three Java voters, and
+Java `PythonOrderedTakeTest` spawns against three Java voters,
 `tests/workers/connect_worker.py` the one `PythonConnectorClientTest`
-(agentspaces-connect-core) spawns against a Java `ConnectorRuntime`.
+(agentspaces-connect-core) spawns against a Java `ConnectorRuntime`, and
+`tests/workers/content_worker.py` the one `PythonContentClientTest`
+(agentspaces-content) spawns against a Java relay and a Java mirror.
+
+### Large artifacts: the content swarm
+
+`agentspaces.capabilities.content` is `aspace:cap/content-swarm` (SPEC
+v0.1.23 §7.1, §8, annex G): an artifact of any size is hashed in fixed
+pieces, its signed `Manifest` (a CIDv1 root) and each holder's leased
+`Holding` live in the group's `content` space, and the pieces move from
+every holder at once, verified before they are stored or served.
+
+```python
+from agentspaces.capabilities import Content, FileStore, Pipes
+
+content = Content(Pipes(peer), Space(peer, "content"), FileStore("/var/lib/aspace/content"))
+content.run()                                   # ticks the scheduler on a thread
+manifest = content.publish("weights.bin", name="weights.bin")   # bytes or a path
+fetch = content.fetch(manifest["root"])         # from the seed and, through it, every other holder
+if fetch.wait(600):
+    data = fetch.read_bytes()                   # or content.store.read_all(root)
+print(fetch.progress(), fetch.trace[-3:], content.describe(manifest["root"]))
+```
+
+A `FileStore` resumes after a restart and republishes what it holds; a
+`MemoryStore` is for tests. With a `Content` attached, every `Space` over
+the peer escalates a payload above `escalate_above` (4 MiB) to an artifact
+and one above 64 KiB to a block, and a read of either kind of entry returns
+it once its bytes are here (`Peer.payload_of`: never a block on the
+network). A holding's `via` names the relay a holder sits behind; the
+scheduler orders sources by hops. `tests/test_content.py` pins the golden
+vectors and runs the swarm in process.
 
 ## Run it
 
@@ -467,5 +499,6 @@ receives all six findings. Above the wire, `agentspaces.space`,
 programming model (the section above): the push-sum aggregate, semantic
 discovery, and remote actions speak their pipe protocols here, and
 `demo_council_worker.py` proves them against the Java council. The
-gossip-learn exchange and content-addressed payloads stay Java-side; each is
-the same pattern (a CBOR body on an existing kind) when a use case calls for it.
+gossip-learn exchange stays Java-side; it is the same pattern (a CBOR body on
+an existing kind) when a use case calls for it. Content-addressed payloads
+(blocks and swarm artifacts) are read and written here since v0.1.23.

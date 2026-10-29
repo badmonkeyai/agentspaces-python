@@ -10,4 +10,4 @@ license = {text = "Apache-2.0"}
 test = ["pytest>=8"]
 
 [tool.setuptools]
-packages = ["agentspaces"]
+packages = ["agentspaces", "agentspaces.capabilities"]

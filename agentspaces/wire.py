@@ -42,6 +42,8 @@ KIND_GROUP_AD = "GROUP_AD"
 # Largest frame accepted or sent, mirroring the JVM transport cap: a length
 # prefix beyond it is hostile or corrupt, never legitimate (ASF-016).
 MAX_FRAME_BYTES = 8 * 1024 * 1024
+# Payloads above this travel as a block or an artifact and the record carries a reference (SPEC §7.1).
+INLINE_PAYLOAD_LIMIT = 64 * 1024
 
 # ASF-004 bounds, mirroring ReplicatedSpace: the largest epoch advance a remote
 # claim may assert over the locally observed epoch, and the longest TAKE hold
@@ -207,6 +209,45 @@ def digest_body(digests: dict) -> bytes:
     return cbor.dumps({"digests": digests})
 
 
+RELAY_SIGNAL_CAPABILITY = "aspace:cap/relay-signal"
+
+
+def relay_frame_body(target: str, frame: bytes, path: list | None = None, hop: int | None = None) -> bytes:
+    """A RELAY_FRAME body (SPEC §5.4): the origin's complete signed frame for
+    ``target``, carried by the relay the envelope is addressed to. With ``path``
+    (the relays to traverse, v0.1.23) and ``hop`` (the index of the relay this
+    envelope is addressed to) the frame crosses several relays; both are absent
+    in the one-hop form."""
+    body = {"target": target, "frame": frame}
+    if path is not None:
+        body["path"] = list(path)
+        body["hop"] = 0 if hop is None else int(hop)
+    return cbor.dumps(body)
+
+
+def relay_signal_body(target: str, failed_hop: str, reason: str = "unreachable") -> bytes:
+    """The PIPE_DATA body a relay sends back to an origin when the next hop of a
+    path could not carry its frame (``aspace:cap/relay-signal``, SPEC §5.4)."""
+    return cbor.dumps({"capability": RELAY_SIGNAL_CAPABILITY,
+                       "payload": cbor.dumps({"target": target, "failedHop": failed_hop, "reason": reason})})
+
+
+def block_cid(data: bytes) -> str:
+    """The id of a block (SPEC §7.1): multibase base58btc of sha-256 over the bytes."""
+    from .identity import multibase
+    return multibase(hashlib.sha256(data).digest())
+
+
+def block_want_body(cid: str) -> bytes:
+    """A BLOCK_WANT body: one block by id."""
+    return cbor.dumps({"cid": cid})
+
+
+def block_body(cid: str, data: bytes) -> bytes:
+    """A BLOCK body: the bytes under their id."""
+    return cbor.dumps({"cid": cid, "bytes": data})
+
+
 # --------------------------------------------------- join by GroupID (§9)
 
 def group_ad_want_envelope(group: str, sender: str, stamp: str,
@@ -304,16 +345,18 @@ def signed_peer_ad(ad: dict, identity: Identity) -> bytes:
 
 # ------------------------------------------------------------- space writes
 
-def sign_view(entry_id: str, space_id: str, type_name: str, payload: bytes,
+def sign_view(entry_id: str, space_id: str, type_name: str, payload: bytes | None,
               issuer: str, issued: str, key_epoch: int | None = None,
-              tags: dict | None = None) -> dict:
+              tags: dict | None = None, payload_ref: str | None = None) -> dict:
     """ReplicatedSpace's SignView: the record identity the signature covers,
     tags included (SPEC §7.1: a tag is part of the signed record, sorted on
     the wire by the canonical form). ``keyEpoch`` (v0.1.13, SPEC §11a.1) is
     appended only for a record sealed under a content-key epoch from 1, so
-    other records sign the same bytes."""
+    other records sign the same bytes. ``payload_ref`` (SPEC §7.1) names a
+    block (``z``) or a content root (``b``) when the payload travels outside the
+    record; the payload is then null."""
     view = {"entryId": entry_id, "spaceId": space_id, "type": type_name,
-            "payload": payload, "payloadRef": None, "issuer": issuer,
+            "payload": payload, "payloadRef": payload_ref, "issuer": issuer,
             "issued": issued, "tags": cbor.canonical_map(dict(tags or {}))}
     if key_epoch is not None:
         view["keyEpoch"] = key_epoch
@@ -421,9 +464,10 @@ def sign_state(dto: dict, identity: Identity, agent=None, now_ms: int | None = N
     return signed
 
 
-def entry_delta(space_name: str, group: str, type_name: str, payload: bytes,
+def entry_delta(space_name: str, group: str, type_name: str, payload: bytes | None,
                 identity: Identity, agent_name: str, lease_millis: int,
-                agent=None, now_ms: int | None = None, tags: dict | None = None) -> tuple:
+                agent=None, now_ms: int | None = None, tags: dict | None = None,
+                payload_ref: str | None = None) -> tuple:
     """Builds a full write delta; returns (entry_id, rumor_body_bytes). With
     ``agent`` (an ``AgentIdentity``, v0.1.13) the record is the agent's: signed
     by its key, the certificate covering the record's stamp attached, and the
@@ -433,7 +477,8 @@ def entry_delta(space_name: str, group: str, type_name: str, payload: bytes,
     space_id = space_id_local(f"{group}/{space_name}")
     issuer = agent.agent_id if agent is not None else identity.agent(agent_name)
     issued = hlc_now(issuer, now_ms)
-    view = sign_view(entry_id, space_id, type_name, payload, issuer, issued, tags=tags)
+    view = sign_view(entry_id, space_id, type_name, payload, issuer, issued, tags=tags,
+                     payload_ref=payload_ref)
     certificate = None
     if agent is not None:
         certificate = agent.certificate_covering(hlc_physical(issued))
@@ -443,7 +488,7 @@ def entry_delta(space_name: str, group: str, type_name: str, payload: bytes,
     expires = (int(time.time() * 1000) if now_ms is None else int(now_ms)) + lease_millis
     record = {
         "entryId": entry_id, "spaceId": space_id, "type": type_name,
-        "payload": payload, "payloadRef": None, "issuer": issuer,
+        "payload": payload, "payloadRef": payload_ref, "issuer": issuer,
         "issued": issued,
         "lease": {"holder": issuer, "expiresAtMillis": expires, "kind": "WRITE"},
         "tags": view["tags"], "sig": signature,

@@ -503,7 +503,10 @@ class Space:
             lease = record.get("lease") or {}
             if int(lease.get("expiresAtMillis", 0)) <= now_ms:
                 continue
-            payload = cbor.loads(record.get("payload") or b"\xf6")
+            raw = self.peer.payload_of(dto)
+            if raw is None:
+                continue  # a block or artifact still on its way: its transfer has started
+            payload = cbor.loads(raw)
             tags = record.get("tags") or {}
             if not template.matches(payload, tags):
                 continue
@@ -556,8 +559,8 @@ class Space:
                                             bid=bid)
         if entry_id is None:
             return None
-        record = self.peer.states[entry_id]["record"]
-        return Taken(self, entry_id, template.decode(cbor.loads(record.get("payload") or b"\xf6")), millis)
+        dto = self.peer.states[entry_id]
+        return Taken(self, entry_id, template.decode(cbor.loads(self.peer.payload_of(dto) or b"\xf6")), millis)
 
     def complete(self, taken: Taken, result=None, lease="1h", tags: dict | None = None) -> str | None:
         return taken.complete(result, lease=lease, tags=tags)
@@ -588,7 +591,10 @@ class Space:
     def _deliver(self, dto: dict, kind: str, mark: str | None = None) -> None:
         record = dto.get("record") or {}
         entry_id = record.get("entryId")
-        payload = cbor.loads(record.get("payload") or b"\xf6")
+        raw = self.peer.payload_of(dto)
+        if raw is None:
+            return  # a referenced payload not here yet: the event waits for a later fold or read
+        payload = cbor.loads(raw)
         tags = record.get("tags") or {}
         now_ms = self.peer._now_ms()
         for template, callback, delivered, subscription in list(self._watchers.values()):

@@ -36,8 +36,9 @@ from .connect import (AssetChange, AssetInvocation, AssetInvocationResult, DataQ
 from .ordered import LogMember, OrderedLog
 from .semantic import HashingEmbedder, Semantic
 from .remote import RemoteAction, actions, invoke
+from .content import Content, FileStore, MemoryStore
 
-__all__ = ["Pipes", "Aggregate", "Settle", "HashingEmbedder", "Semantic", "RemoteAction", "actions", "invoke",
+__all__ = ["Pipes", "Content", "FileStore", "MemoryStore", "Aggregate", "Settle", "HashingEmbedder", "Semantic", "RemoteAction", "actions", "invoke",
            "OrderedLog", "LogMember", "ordered", "connect", "DataQuery", "DataResult", "AssetChange",
            "AssetInvocation", "AssetInvocationResult", "DataQueryClient", "Fetched", "asset_cards",
            "canonical_hash", "invoke_ops"]
