@@ -77,7 +77,9 @@ class Councillor:
 
 
 def main() -> int:
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    # "127.0.0.1" dials tcp; "tls://127.0.0.1" dials TLS 1.3 with this peer's channel certificate.
+    scheme, _, host = (sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1").rpartition("://")
+    scheme = scheme or "tcp"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 7470
     value = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
     max_seconds = float(sys.argv[4]) if len(sys.argv) > 4 else 90.0
@@ -86,7 +88,7 @@ def main() -> int:
     print(f"python council worker {identity.peer_id}", flush=True)
     agent_identity = identity.renewing_subordinate("py-worker", "PT24H")
     peer = Peer(identity, group)
-    peer.connect(host, port)
+    peer.connect(host, port, scheme=scheme)
     time.sleep(1.0)
     peer.pull_ads()
     pipes = Pipes(peer)

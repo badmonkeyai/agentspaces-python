@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """A minimal wire-compatible AgentSpaces peer (spec M3's non-JVM client):
-joins a Java fleet over TCP in the dial-only posture, stays a live member by
+joins a Java fleet over TCP or TLS in the dial-only posture, stays a live member by
 answering PINGs and re-leasing its self-advertisement, writes signed entries
 into a replicated space, and reads the space back through anti-entropy by
 offering an empty digest and folding the returned states. A peer that holds
@@ -27,10 +27,30 @@ import struct
 import threading
 import time
 
-from . import beacon, cbor, social, wire
+from . import beacon, cbor, social, tls, wire
 from .identity import (Identity, derive_id, instant_iso, verify_agent_certificate_at,
                        verify_signed_group_ad)
 from . import revocation as revocations
+from .seed import Seed, parse_seed
+
+
+# The join through a document waits in slices of 1 s, 2 s, 4 s, then 5 s each
+# inside its budget (the schedule of the Java join by id, ISSUE-BootstrapRobustness §9.4).
+JOIN_SLICE_FIRST_S = 1.0
+JOIN_SLICE_MAX_S = 5.0
+
+
+class BootstrapTimeout(TimeoutError):
+    """``Peer.bootstrap`` spent its ``join_timeout``: the message and the attributes say
+    how many times the document was fetched, how many seeds were dialed and how many
+    of them connected. A TimeoutError is an OSError, so callers that caught the
+    OSError of a failed dial still do."""
+
+    def __init__(self, message: str, *, fetches: int, dialed: int, connected: int):
+        super().__init__(message)
+        self.fetches = fetches
+        self.dialed = dialed
+        self.connected = connected
 
 
 class Peer:
@@ -84,6 +104,14 @@ class Peer:
         # reachable (SRAD §7.7).
         self._seeds: list = []
         self._refresh_seeds = None
+        # The ``tls`` binding (SPEC §5.6): this peer's channel certificate, generated on
+        # the first tls dial; the PeerID the current connection's handshake attested (None
+        # on tcp); the socket a CHANNEL_HELLO was announced on; and how many frames
+        # arrived bare under that attestation.
+        self._credentials = tls.ChannelCredentials(identity)
+        self._attested: str | None = None
+        self._hello_sent_on = None
+        self.attested_frames = 0
         # The resource hints this peer's self-advertisement carries (SPEC §5.1): a join
         # credential under ``aspace:join`` for an INVITE group, set by join_invite.
         self.resource_hints: dict[str, str] = {}
@@ -120,11 +148,14 @@ class Peer:
 
     # ------------------------------------------------------------- lifecycle
 
-    def connect(self, host: str, port: int) -> None:
-        """Dials the seed and introduces this peer to the group."""
-        self._seed = (host, port)
-        self._socket = socket.create_connection((host, port), timeout=10)
-        self._socket.settimeout(None)
+    def connect(self, host, port: int | None = None, *, scheme: str = "tcp",
+                dial_timeout: float = 10.0) -> None:
+        """Dials the seed and introduces this peer to the group. ``host`` and ``port``
+        name a ``tcp`` seed unless ``scheme`` says ``tls``; ``host`` alone may be a seed
+        in text (``tls://host:port``, ``host:port``) or a ``Seed``."""
+        seed = parse_seed(host) if port is None else Seed(str(host), int(port), scheme.lower())
+        self._seed = seed
+        self._socket = self._dial(seed, dial_timeout)
         self._running = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -142,28 +173,48 @@ class Peer:
             raise OSError("no seeds to dial")
         self._seeds = expanded
         last = None
-        for host, port in expanded:
+        for seed in expanded:
             try:
-                self.connect(host, port)
-                return (host, port)
+                self.connect(seed.host, seed.port, scheme=seed.scheme)
+                return seed
             except OSError as e:
                 last = e
-        raise OSError(f"no seed accepted: {expanded}") from last
+        raise OSError(f"no seed accepted: {[str(s) for s in expanded]}") from last
 
     @staticmethod
     def _expand_seeds(seeds) -> list:
+        """Seeds (pairs, triples, text, or ``Seed``) as ``Seed`` tuples, a hostname
+        resolved to every address (DB-X-03), duplicates folded, order kept."""
         expanded = []
-        for host, port in seeds:
+        for given in seeds:
+            seed = parse_seed(given)
             addresses = []
             try:
-                for info in socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM):
-                    addresses.append((info[4][0], int(port)))
+                for info in socket.getaddrinfo(seed.host, seed.port, type=socket.SOCK_STREAM):
+                    addresses.append(Seed(info[4][0], seed.port, seed.scheme))
             except (OSError, ValueError):
-                addresses = [(host, int(port))]
-            for address in addresses or [(host, int(port))]:
+                addresses = [seed]
+            for address in addresses or [seed]:
                 if address not in expanded:
                     expanded.append(address)
         return expanded
+
+    def _dial(self, seed: Seed, timeout: float):
+        """One connected socket for ``seed`` by its scheme: ``tcp`` plain, ``tls`` with
+        this peer's channel certificate and the seed's attested (``agentspaces.tls``).
+        Records the attestation for the reader. Raises OSError for a scheme this
+        client does not dial, as for a refused connection."""
+        if seed.scheme == "tcp":
+            sock = socket.create_connection((seed.host, seed.port), timeout=timeout)
+            attested = None
+        elif seed.scheme == "tls":
+            sock, attested = tls.connect(seed.host, seed.port, self.identity, timeout=timeout,
+                                         credentials=self._credentials)
+        else:
+            raise OSError(f"no dialer for {seed}: this client dials tcp and tls")
+        sock.settimeout(None)
+        self._attested = attested
+        return sock
 
     def _candidate_seeds(self) -> list:
         """The seeds to try on a lost socket: the one after the current first, the
@@ -200,8 +251,7 @@ class Peer:
                 if not self._running:
                     return False
                 try:
-                    fresh = socket.create_connection(seed, timeout=10)
-                    fresh.settimeout(None)
+                    fresh = self._dial(seed, 10)
                 except OSError:
                     continue
                 with self._lock:
@@ -219,28 +269,85 @@ class Peer:
         return False
 
     def bootstrap(self, url: str, *, group_id: str | None = None, allow_plain: bool = False,
-                  beacon_peer: str | None = None, timeout: float = 3.0) -> dict:
+                  beacon_peer: str | None = None, timeout: float = 3.0,
+                  join_timeout: float = 10.0) -> dict:
         """Joins through a beacon document (SRAD DB-X-01): fetches and verifies the
         document at ``url`` (https unless ``allow_plain``; signed by ``beacon_peer`` when
         pinned), selects the group (by ``group_id``, else the only one), verifies its
         founding advertisement with the four checks of SPEC §5.1 against ``group_id``
-        when given, and dials its ``tcp`` seeds in priority order with ``connect_any``.
-        Returns the verified SignedGroupAdvertisement, kept on ``peer.founding``."""
-        doc = beacon.fetch_beacon_document(url, allow_plain=allow_plain, beacon_peer=beacon_peer,
-                                           timeout=timeout)
-        group = beacon.group_from_document(doc, group_id=group_id)
-        founding = self._adopt_founding(group, group_id)
-        seeds = beacon.seeds_of(group)
-        if not seeds:
-            raise ValueError(f"the beacon document names no tcp seed for {group.get('name')!r}")
+        when given, and dials its ``tcp`` seeds in priority order.
+        Returns the verified SignedGroupAdvertisement, kept on ``peer.founding``.
+
+        ``timeout`` bounds one attempt (one fetch, one dial of one seed) and
+        ``join_timeout`` bounds the whole call. A first attempt that succeeds asks once
+        and dials once. Otherwise the call keeps asking inside the budget, in slices of
+        1 s, 2 s, 4 s, then 5 s each (the shape of the Java join by id,
+        ISSUE-BootstrapRobustness FR-4): at the start of each slice it fetches the
+        document again when the previous fetch failed with an OSError or named no tcp
+        seed, and dials again, once per slice, every seed that refused. A beacon or a
+        seed that starts a few seconds after this peer is reached on a later slice.
+        A refusal (a bad scheme, a document or founding that does not verify, a
+        founding for another id, a group the document does not carry) raises ValueError
+        at once, as before. When the budget runs out the call raises
+        :class:`BootstrapTimeout` (an OSError) whose message and attributes carry the
+        number of fetches, the seeds dialed, how many connected, and the last error."""
+        deadline = time.monotonic() + join_timeout
+        fetches = 0
+        dialed: list = []
+        connected = 0
+        last_error: Exception | None = None
+        founding = None
+        seeds: list = []
+        slice_s = JOIN_SLICE_FIRST_S
 
         def refresh():
             fresh = beacon.fetch_beacon_document(url, allow_plain=allow_plain,
                                                  beacon_peer=beacon_peer, timeout=timeout)
             return beacon.seeds_of(beacon.group_from_document(fresh, group_id=self.group))
-        self._refresh_seeds = refresh
-        self.connect_any(seeds)
-        return founding
+
+        while True:
+            started = time.monotonic()
+            if not seeds:
+                fetches += 1
+                try:
+                    doc = beacon.fetch_beacon_document(
+                        url, allow_plain=allow_plain, beacon_peer=beacon_peer,
+                        timeout=min(timeout, max(deadline - started, 0.001)))
+                    group = beacon.group_from_document(doc, group_id=group_id)
+                    founding = self._adopt_founding(group, group_id)
+                    seeds = self._expand_seeds(beacon.seeds_of(group))
+                    if seeds:
+                        self._refresh_seeds = refresh
+                    else:
+                        last_error = ValueError(
+                            f"the beacon document names no tcp or tls seed for {group.get('name')!r}")
+                except OSError as e:  # the beacon is unreachable or answered an error: ask again
+                    last_error = e
+            for seed in seeds:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if seed not in dialed:
+                    dialed.append(seed)
+                self._seeds = seeds
+                try:
+                    self.connect(seed.host, seed.port, scheme=seed.scheme,
+                                 dial_timeout=min(timeout, remaining))
+                except OSError as e:
+                    last_error = e
+                    continue
+                connected += 1
+                return founding
+            now = time.monotonic()
+            wait = min(slice_s - (now - started), deadline - now)
+            if wait > 0:
+                time.sleep(wait)
+            if time.monotonic() >= deadline:
+                raise BootstrapTimeout(
+                    f"no join through {url} within {join_timeout:g}s: {fetches} fetch(es), "
+                    f"{connected} of {len(dialed)} seed(s) connected; last error: {last_error}",
+                    fetches=fetches, dialed=len(dialed), connected=connected) from last_error
+            slice_s = min(slice_s * 2, JOIN_SLICE_MAX_S)
 
     def join_invite(self, key_text: str, *, allow_plain: bool = False, timeout: float = 3.0) -> tuple:
         """Joins a group for friends with an invite key (SRAD DB-X-07): parses the key,
@@ -288,7 +395,7 @@ class Peer:
         self.pinned_invite = key.with_delegation(delegation).compact()
         seeds = beacon.seeds_of(group)
         if not seeds:
-            raise ValueError(f"the beacon document names no tcp seed for {group.get('name')!r}")
+            raise ValueError(f"the beacon document names no tcp or tls seed for {group.get('name')!r}")
 
         def refresh():
             fresh = beacon.fetch_beacon_document(key.document_url(scheme), allow_plain=allow_plain,
@@ -309,7 +416,7 @@ class Peer:
         return self.founding
 
     def join_by_group_id(self, host: str, port: int, group_id: str,
-                         timeout: float = 10.0) -> dict:
+                         timeout: float = 10.0, *, scheme: str = "tcp") -> dict:
         """Joins a self-certifying group knowing only its GroupID and one seed
         (spec §5.1, §10.1): dials the seed, sends an unaddressed GROUP_AD_WANT
         for the group (the seed's PeerID is unknown until it answers), waits
@@ -321,9 +428,8 @@ class Peer:
         self.group = group_id
         self.founding = None
         self._founding_ready.clear()
-        self._seed = (host, port)
-        self._socket = socket.create_connection((host, port), timeout=10)
-        self._socket.settimeout(None)
+        self._seed = Seed(host, int(port), scheme.lower())
+        self._socket = self._dial(self._seed, 10)
         self._running = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -373,6 +479,18 @@ class Peer:
         payload = wire.signed_peer_ad(ad, self.identity)
         item_id = f"peer:{self.identity.peer_id}:{now_ms}"
         self._send("RUMOR", wire.rumor_body("peers", item_id, 6, payload))
+        self._announce_channel()
+
+    def _announce_channel(self) -> None:
+        """On a connection the transport attested, announces once that this peer
+        accepts channel-attested frames there (CHANNEL_HELLO, SPEC §5.6), so a Java
+        node in ATTESTED or SESSION mode stops signing every frame toward it. The
+        announcement itself travels signed; this peer keeps signing what it sends."""
+        sock, attested = self._socket, self._attested
+        if sock is None or attested is None or self._hello_sent_on is sock:
+            return
+        self._hello_sent_on = sock
+        self._send("CHANNEL_HELLO", wire.channel_hello_body(True, attested), attested)
 
     def write_entry(self, space: str, type_name: str, value: dict,
                     agent_name: str = "python", lease_millis: int = 600_000,
@@ -642,10 +760,13 @@ class Peer:
                     raise OSError(f"bad frame length {length}")
                 frame = self._read_exact(length)
                 try:
-                    env = wire.decode_frame(frame)
+                    decoded = wire.decode_frame_detailed(frame, attested=self._attested)
+                    env = decoded[0] if decoded is not None else None
                     if env is None:
                         self.malformed_frames += 1
                     elif self._accepts(env):
+                        if decoded[1] == "attested":
+                            self.attested_frames += 1
                         self._handle(env)
                 except Exception:  # noqa: BLE001 - one hostile frame must not
                     self.malformed_frames += 1  # kill the reader (ASF-015); the frame is dropped
@@ -778,7 +899,9 @@ class Peer:
                             self._fold(dto)
         else:
             # A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are
-            # never sent to it, but a misconfigured peer could): ignored, counted, never fatal.
+            # never sent to it, but a misconfigured peer could), or one it does not act on (the
+            # seed's own CHANNEL_HELLO: this client signs every frame it sends, so the seed's
+            # acceptance of bare frames changes nothing here): ignored, counted, never fatal.
             self.ignored_kinds[str(kind)] = self.ignored_kinds.get(str(kind), 0) + 1
 
     def _on_group_ad(self, body: bytes) -> None:
@@ -1021,7 +1144,16 @@ class Peer:
                 if matches is not None and not matches(payload, record.get("tags") or {}):
                     continue
                 price = float(bid(payload)) if callable(bid) else float(bid)
+                # The list above is a snapshot, and each claim before this one waited out a
+                # settle window: judge this entry again against the claims folded since, as
+                # the TypeScript take does, so a lost race moves on to an entry nobody holds
+                # rather than claiming one after another that faster members already took.
+                now_ms = self._now_ms()
                 current = self._claim_of(entry_id)
+                if current and int(current.get("expiresAtMillis", 0)) > now_ms:
+                    continue
+                if (self.states.get(entry_id) or {}).get("completed"):
+                    continue
                 epoch = int(current["epoch"]) + 1 if current else 1
                 claim = wire.take_claim(entry_id, space_id, epoch,
                                         wire.hlc_now(holder, now_ms), holder,

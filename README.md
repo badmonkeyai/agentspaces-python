@@ -172,8 +172,22 @@ the group's `tcp` seeds in priority order. The verified founding is kept on
 ```python
 peer = Peer(Identity.generate(), None)
 peer.bootstrap("https://agentspaces.corp.example/.well-known/agentspaces/beacon.json",
-               group_id="aspace://z7f3a...", beacon_peer="z6Mk...")   # fetch, verify, connect_any(seeds)
+               group_id="aspace://z7f3a...", beacon_peer="z6Mk...")   # fetch, verify, dial the seeds
 ```
+
+`bootstrap` keeps asking inside a budget, as the Java join by id does.
+`timeout` (3 s) bounds one attempt, one fetch of the document or one dial of
+one seed, and `join_timeout` (10 s) bounds the whole call. A first attempt
+that succeeds fetches once and dials once. Otherwise the call works in slices
+of 1 s, 2 s, 4 s, then 5 s each: at the start of each slice it fetches the
+document again when the previous fetch failed or named no `tcp` seed, and it
+dials again, once per slice, every seed that refused, so a beacon or a seed
+that starts a few seconds after the peer (the usual case in Compose and
+Kubernetes) is reached on a later slice. A refusal (a document or a founding
+that does not verify, a founding for another id) raises `ValueError` at once.
+When the budget runs out the call raises `BootstrapTimeout`, a `TimeoutError`
+(so an `OSError`), whose message carries the number of fetches, the seeds
+dialed and how many connected, and the last error.
 
 `connect_any(seeds)` dials `(host, port)` pairs in order until one accepts
 (a hostname is resolved to every address, each a seed) and remembers them
@@ -405,9 +419,29 @@ sends frames to its seed directly and to every other member through it: the
 seed carries a `RELAY_FRAME` when it holds the `RELAY` role (SPEC §5.4), and
 the peer's `relay.via` hint tells members to reach it the same way back. Not here: the Raft voter (JS-F-18), so reduces and
 the fleet-wide LEASED and ORDERED join modes; the gossip-learning exchange
-(its payload is encoded and golden-pinned); and every transport but tcp (the
-client skips `ws`, `wss`, `http`, `https`, `webrtc`, and `dtls` endpoints,
-JS-N-05).
+(its payload is encoded and golden-pinned); and every transport but tcp and
+tls (the client skips `ws`, `wss`, `http`, `https`, `webrtc`, and `dtls`
+endpoints, JS-N-05 as amended on 2026-11-03).
+
+**TLS.** A `tls://host:port` seed, or `peer.connect(host, port, scheme="tls")`,
+dials TLS 1.3 and presents a channel certificate: a fresh P-256 key in a
+certificate the peer's Ed25519 identity key signs, with the identity key in
+the CN (SPEC §5.6, `agentspaces/tls.py`, mirroring Java's
+`ChannelCertificate`). The peer attests the seed the same way from the
+certificate it presents and refuses one that attests nobody, so a Java node
+built with `requireAttestation(true)` admits it. On an attested connection it
+announces `CHANNEL_HELLO` once, so a Java node in ATTESTED or SESSION mode
+stops signing every frame toward it, and it accepts the bare frames that
+follow from exactly the attested sender (`peer.attested_frames`); it keeps
+signing what it sends. Seeds are `Seed(host, port, scheme)` tuples
+(`agentspaces/seed.py`), and `connect_any`, `bootstrap`, and `join_invite`
+dial `tcp` and `tls` seeds in priority order. `tests/test_tls.py` pins the
+binding against a Python TLS seed, and `CouncilCrossLanguageTest` runs this
+worker over `tls://` against a Java council that requires attestation. No
+session resumption and no early data, so every attestation rests on a full
+handshake; the standard library reads a certificate chain from files only, so
+the key and certificate pass through an owner-only temporary directory at
+each dial.
 
 `demo_council_worker.py` is the whole of it against the Java
 `CouncilFleet` coordinator: tasks taken, the council ballot cast, the epoch
@@ -459,7 +493,7 @@ vectors and runs the swarm in process.
 
 ```
 pip install cryptography pytest
-python -m pytest tests/            # golden vectors, founding/join, adversarial, codec, layers 3 and 4
+python -m pytest tests/            # golden vectors, founding/join, adversarial, codec, layers 3 and 4, tls
 
 # live demo against a Java fleet:
 mvn -q -pl examples/example-02-research-fleet exec:java -Dexec.args="worker 7461 0"
@@ -484,7 +518,8 @@ re-dials the seed every `reconnect_interval_s` (5 s) for `reconnect_window_s`
 (10 min), then introduces itself again and pulls again what it had pulled
 (revocations, advertisements, spaces), counting in `peer.reconnects`; a `take`
 in flight keeps polling across the gap. `close()` by the owner is final.
-`tests/test_robustness.py` pins each case against a fake seed over TCP.
+`tests/test_robustness.py` pins each case against a fake seed over TCP, and
+`tests/test_tls.py` the tls binding against one over TLS.
 
 ## Scope
 

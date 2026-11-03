@@ -164,9 +164,21 @@ def encode_frame(env: dict, identity: Identity) -> bytes:
 
 
 def decode_frame(frame: bytes):
-    """Decodes and verifies a frame; returns the envelope dict or None. The
-    version check runs first (SPEC §9): an envelope whose ``ver`` is not
-    WIRE_VERSION is dropped before any signature work."""
+    """Decodes and verifies a fully signed frame; returns the envelope dict or
+    None. The version check runs first (SPEC §9): an envelope whose ``ver`` is
+    not WIRE_VERSION is dropped before any signature work."""
+    decoded = decode_frame_detailed(frame)
+    return decoded[0] if decoded is not None else None
+
+
+HELLO_KINDS = ("SESSION_HELLO", "CHANNEL_HELLO")
+
+
+def decode_frame_detailed(frame: bytes, attested: str | None = None):
+    """``(envelope, auth)`` with auth ``"signed"`` or ``"attested"``, or None. A bare
+    frame (no key, no signature) is accepted only on a connection whose transport
+    attested exactly its sender (``attested``, SPEC §5.6), and a hello never travels
+    bare. Mirrors Java ``WireCodec`` as the Ruby and TypeScript clients do."""
     try:
         signed = cbor.loads(frame)
     except (ValueError, IndexError, UnicodeDecodeError):
@@ -181,13 +193,24 @@ def decode_frame(frame: bytes):
         return None
     key = signed.get("senderPublicKey")
     signature = signed.get("signature")
+    if key is None and signature is None:
+        if env.get("kind") in HELLO_KINDS or attested is None or attested != env.get("from"):
+            return None
+        return env, "attested"
     if not isinstance(key, bytes) or len(key) != 32:
         return None
     if derive_id(key) != env.get("from"):
         return None
     if not Identity.verify(key, cbor.dumps(env), signature or b""):
         return None
-    return env
+    return env, "signed"
+
+
+def encode_bare_frame(env: dict) -> bytes:
+    """An envelope with no signature (WireCodec.encodeBare): what a node sends on a
+    connection whose transport attested it, toward a peer that announced it accepts
+    bare frames there. This client never sends one; tests and stand-in seeds do."""
+    return cbor.dumps({"envelope": env})
 
 
 # ------------------------------------------------------------------ bodies
@@ -207,6 +230,12 @@ def rumor_body(stream_id: str, item_id: str, hops: int, payload: bytes) -> bytes
 
 def digest_body(digests: dict) -> bytes:
     return cbor.dumps({"digests": digests})
+
+
+def channel_hello_body(accepts_bare: bool, attested_remote: str) -> bytes:
+    """Bodies.ChannelHello (SPEC §5.6): this peer accepts channel-attested frames on
+    the connection whose remote end it attested as ``attested_remote``."""
+    return cbor.dumps({"acceptsBare": accepts_bare, "attestedRemote": attested_remote})
 
 
 RELAY_SIGNAL_CAPABILITY = "aspace:cap/relay-signal"

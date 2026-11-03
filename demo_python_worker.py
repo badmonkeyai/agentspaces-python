@@ -27,6 +27,7 @@ takes each task under the LEASE_RACE claim lattice (signed claims, settle
 window, deterministic arbitration), completes it, and writes the finding the
 Java side is waiting for."""
 
+import os
 import sys
 import time
 
@@ -39,7 +40,9 @@ FINDING_TYPE = "ai.badmonkey.agentspaces.examples.fleet.ResearchFleet$Finding#v1
 
 
 def main() -> int:
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    # "127.0.0.1" dials tcp; "tls://127.0.0.1" dials TLS 1.3 with this peer's channel certificate.
+    scheme, _, host = (sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1").rpartition("://")
+    scheme = scheme or "tcp"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 7467
     identity = Identity.generate()
     group = group_id_from_founding(b"research-fleet-demo-v1")
@@ -49,13 +52,17 @@ def main() -> int:
     # certifies and renews, so the fleet stores its work AGENT_ATTESTED.
     agent = identity.renewing_subordinate("py-worker", "PT24H")
     peer = Peer(identity, group)
-    peer.connect(host, port)
+    peer.connect(host, port, scheme=scheme)
+    if peer._attested:
+        print(f"python worker on tls, seed attested as {peer._attested}", flush=True)
     time.sleep(1.0)
 
     race = len(sys.argv) > 3 and sys.argv[3] == "race"
     completed = 0
     idle_strikes = 0
-    deadline = time.time() + (90 if race else 60)
+    # AGENTSPACES_DEMO_DEADLINE (seconds) lets a larger fleet wait for its peers to
+    # join before the race starts (run-polyglot-test.sh).
+    deadline = time.time() + float(os.environ.get("AGENTSPACES_DEMO_DEADLINE", 90 if race else 60))
     while time.time() < deadline and peer.connected:
         if race:
             if idle_strikes >= 2:

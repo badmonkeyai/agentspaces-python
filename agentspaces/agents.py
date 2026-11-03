@@ -101,6 +101,24 @@ def _mark(fn, verb: str, **attrs):
     return fn
 
 
+DATA_USE_TYPE = "https://badmonkey.ai/console#DataUse"
+CATALOG_SPACE = "catalog"
+
+
+def data_use(reads=(), writes=(), source: str = "", sensitivity: str = "", freshness: str = ""):
+    """Declares what the agent reads from a source that is not a space (the console's
+    data catalog, SRAD bma-spiral1-console §3.4): on bind the binder writes one
+    ``DataUse`` entry into the group's ``catalog`` space under the card's TTL and
+    renews it at half-TTL while the agent stays bound. Stack it for several sources."""
+    def bind(cls):
+        declared = list(getattr(cls, "__agentspaces_data_use__", []))
+        declared.append({"reads": list(reads), "writes": list(writes), "source": source,
+                         "sensitivity": sensitivity, "freshness": freshness})
+        cls.__agentspaces_data_use__ = declared
+        return cls
+    return bind
+
+
 def agent(name: str, description: str = "", goals: list | None = None):
     """Names the agent, as ``@AgentSpec`` does: the card's name, description, and goals."""
     def bind(cls):
@@ -273,6 +291,7 @@ class Bound:
         self.binder = binder
         self.name = name
         self.card = card
+        self.data_use: list[str] = []  # the DataUse entry ids the binder declared and renews
         self._threads: list[threading.Thread] = []
         self._subscriptions = []
         self._running = True
@@ -378,7 +397,40 @@ class Binder:
                 self._start_decision(bound, obj, method, meta)
         if self.publish_card and hasattr(self.peer, "publish_ad"):
             bound.card = self._publish_card(name, spec, consumes, produces, bindings, actions)
+        self._declare_data_use(bound, obj, name)
         return bound
+
+    # ------------------------------------------------------------- data use
+
+    def _declare_data_use(self, bound: Bound, obj, name: str) -> None:
+        """The ``@data_use`` carrier (S1-G-09): one leased ``DataUse`` entry per
+        declaration in the ``catalog`` space, renewed at half the card TTL."""
+        declared = getattr(type(obj), "__agentspaces_data_use__", None)
+        if not declared or not hasattr(self.peer, "write_entry"):
+            return
+        ttl_ms = duration_millis(self.card_ttl)
+        peer_id = self.peer.identity.peer_id
+        ids = []
+        for use in declared:
+            payload = {"schemaVersion": 1, "agent": name, "peer": peer_id, "reads": list(use["reads"]),
+                       "writes": list(use["writes"]), "source": use["source"], "sensitivity": use["sensitivity"],
+                       "freshness": use["freshness"], "declaredBy": "decorator"}
+            ids.append(self.peer.write_entry(CATALOG_SPACE, DATA_USE_TYPE, payload, agent_name=self.agent_name,
+                                             lease_millis=ttl_ms, agent=self.agent))
+        bound.data_use = ids
+        half_seconds = max(0.25, ttl_ms / 2000)
+
+        def renew():
+            while bound._running:
+                if bound._stopped.wait(half_seconds):
+                    return
+                for entry_id in ids:
+                    if bound._running:
+                        self.peer.renew_entry(CATALOG_SPACE, entry_id, lease_millis=ttl_ms, agent=self.agent)
+
+        thread = threading.Thread(target=renew, name=f"{bound.name}.data-use", daemon=True)
+        bound._threads.append(thread)
+        thread.start()
 
     # ----------------------------------------------------------------- card
 

@@ -217,12 +217,13 @@ def test_preference_shares_agree_across_a_fleet_and_travel_as_the_java_share_fra
 
 # ----------------------------------------------- JS-N-05: the mixed fleet
 
-SCHEMES = ["wss", "webrtc", "https", "dtls", "ws", "http", "tcp"]
+SCHEMES = ["wss", "webrtc", "https", "dtls", "ws", "http", "tcp", "tls"]
 
 
 def test_a_fleet_advertising_every_scheme_still_works_with_the_tcp_only_client():
-    """JS-N-05: members whose advertisements list ws, wss, http, https, webrtc, and dtls endpoints
-    beside tcp are ordinary members to this client; it dials tcp alone and skips the rest."""
+    """JS-N-05, amended for the tls binding: members whose advertisements list ws, wss, http,
+    https, webrtc, and dtls endpoints beside tcp and tls are ordinary members to this client; it
+    dials tcp and tls and skips the rest."""
     python, *others = fleet(GROUP, 3)
     for i, member in enumerate(others):
         now_ms = member._now_ms()
@@ -234,8 +235,8 @@ def test_a_fleet_advertising_every_scheme_still_works_with_the_tcp_only_client()
         endpoints = python.members[member.identity.peer_id]["endpoints"]
         assert [e["transport"] for e in endpoints] == SCHEMES
         dialable = beacon.seeds_of({"seeds": endpoints})
-        assert len(dialable) == 1 and dialable[0][1] == 7506, "tcp alone is dialed"
-    assert beacon.CLIENT_TRANSPORTS == ("tcp",)
+        assert [(s.port, s.scheme) for s in dialable] == [(7506, "tcp"), (7507, "tls")], "tcp and tls are dialed"
+    assert beacon.CLIENT_TRANSPORTS == ("tcp", "tls")
     # The verbs run over whatever those members dial among themselves: a job a wss member
     # wrote is taken and completed here, and every member sees the completion.
     writer = others[0]

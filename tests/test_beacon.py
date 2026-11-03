@@ -122,9 +122,9 @@ def test_a_served_signed_document_verifies_and_selects(tmp_path):
             beacon.verified_group_id(by_id, "zOther")
         with pytest.raises(ValueError):
             beacon.verified_group_id(beacon.group_from_document(fetched, name="other"))
-        # The tls seed is not this client's; the tcp one is, in priority order.
-        assert beacon.seeds_of(by_id) == [("127.0.0.1", 7500)]
-        assert beacon.seeds_of(by_id, ("tls", "tcp")) == [("seed-a.corp.example", 7500), ("127.0.0.1", 7500)]
+        # Both seeds are this client's since the tls binding landed, in priority order.
+        assert beacon.seeds_of(by_id) == [("seed-a.corp.example", 7500, "tls"), ("127.0.0.1", 7500, "tcp")]
+        assert beacon.seeds_of(by_id, ("tcp",)) == [("127.0.0.1", 7500, "tcp")]
     finally:
         served.close()
 
@@ -218,12 +218,13 @@ def test_seeds_skip_datagram_schemes_this_client_cannot_dial():
         {"transport": "udp", "address": "10.0.0.5:7503", "priority": 1},
         {"transport": "tcp", "address": "10.0.0.5:7500", "priority": 2},
     ]}
-    assert beacon.seeds_of(group) == [("10.0.0.5", 7500)]
+    assert beacon.seeds_of(group) == [("10.0.0.5", 7500, "tcp")]
 
 
 def test_the_client_skips_the_schemes_it_cannot_dial():
-    """JS-N-05 (srad/agentspaces-js.md): the Python client dials tcp alone and skips every other
-    scheme a beacon document may list, in priority order, so a mixed fleet still reaches it."""
+    """JS-N-05 (srad/agentspaces-js.md), amended for the tls binding: the Python client dials
+    tcp and tls and skips every other scheme a beacon document may list, in priority order, so
+    a mixed fleet still reaches it."""
     group = {"seeds": [
         {"transport": "wss", "address": "fleet.example.com:443/aspace", "priority": 0},
         {"transport": "webrtc", "address": "sig", "priority": 1},
@@ -232,6 +233,7 @@ def test_the_client_skips_the_schemes_it_cannot_dial():
         {"transport": "ws", "address": "10.0.0.5:7503", "priority": 4},
         {"transport": "http", "address": "10.0.0.5:7503/aspace/h", "priority": 5},
         {"transport": "tcp", "address": "10.0.0.5:7500", "priority": 6},
+        {"transport": "tls", "address": "10.0.0.5:7501", "priority": 7},
     ]}
-    assert beacon.seeds_of(group) == [("10.0.0.5", 7500)]
-    assert beacon.CLIENT_TRANSPORTS == ("tcp",)
+    assert beacon.seeds_of(group) == [("10.0.0.5", 7500, "tcp"), ("10.0.0.5", 7501, "tls")]
+    assert beacon.CLIENT_TRANSPORTS == ("tcp", "tls")

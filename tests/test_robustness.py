@@ -96,9 +96,10 @@ def test_a_malformed_body_under_a_good_signature_never_stops_the_reader():
 class FakeSeed:
     """Accepts connections, decodes what the peer sends, and can close a connection on demand."""
 
-    def __init__(self):
+    def __init__(self, port: int = 0):
         self.server = socket.socket()
-        self.server.bind(("127.0.0.1", 0))
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", port))
         self.server.listen(4)
         self.port = self.server.getsockname()[1]
         self.connections = []

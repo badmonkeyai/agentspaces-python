@@ -33,6 +33,8 @@ from urllib.parse import urlsplit
 
 from . import cbor
 from .identity import Identity, derive_id, verify_signed_group_ad
+from . import seed as seed_module
+from .seed import Seed
 
 VERSION = 1
 WELL_KNOWN = "/.well-known/agentspaces/beacon.json"
@@ -41,8 +43,8 @@ MAX_DOCUMENT_BYTES = 64 * 1024
 FORBIDDEN_PARAMETERS = ("content-key", "contentkey", "credential", "membership", "hints",
                         "secret", "invite-secret", "join-credential")
 URI_PREFIX = "aspace://"
-# The transports this client dials: plain TCP only.
-CLIENT_TRANSPORTS = ("tcp",)
+# The transports this client dials (``agentspaces.seed``): tcp and tls.
+CLIENT_TRANSPORTS = seed_module.CLIENT_TRANSPORTS
 
 
 # ------------------------------------------------------------ the document
@@ -278,30 +280,22 @@ def verified_group_id(group: dict, expected: str | None = None) -> str:
     return derived
 
 
-def seed_address(address: str) -> tuple:
-    """``host:port`` (``[v6]:port``) as (host, port)."""
-    text = str(address).strip()
-    if text.startswith("["):
-        host, _, port = text[1:].partition("]")
-        port = port.lstrip(":")
-    else:
-        host, _, port = text.rpartition(":")
-    if not host or not port.isdigit():
-        raise ValueError(f"not a seed address: {address!r}")
-    return host, int(port)
+seed_address = seed_module.seed_address
 
 
 def seeds_of(group: dict, transports: tuple = CLIENT_TRANSPORTS) -> list:
-    """The group's seeds this client can dial, by priority, as (host, port)."""
+    """The group's seeds this client can dial, by priority, as ``Seed(host, port,
+    scheme)`` tuples; a seed of a scheme outside ``transports`` is skipped."""
     seeds = sorted((s for s in (group.get("seeds") or []) if isinstance(s, dict)),
                    key=lambda s: int(s.get("priority") or 0))
     out = []
     for seed in seeds:
-        transport = seed.get("transport") or "tcp"
-        if str(transport).lower() not in transports or not seed.get("address"):
+        transport = str(seed.get("transport") or "tcp").lower()
+        if transport not in transports or not seed.get("address"):
             continue
         try:
-            out.append(seed_address(seed["address"]))
+            host, port = seed_address(seed["address"])
         except ValueError:
             continue
+        out.append(Seed(host, port, transport))
     return out
