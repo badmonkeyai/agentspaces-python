@@ -94,11 +94,14 @@ def schema_of(type_or_obj) -> str:
 
 
 def to_payload(value) -> dict:
-    """The wire payload of an entry value: a dataclass's fields, or a dict."""
+    """The wire payload of an entry value: a dataclass's fields, or a dict. A
+    dataclass may carry ``__agentspaces_wire_names__ = {"from_": "from"}`` for
+    a wire key Python cannot spell as a field name."""
     if isinstance(value, dict):
         return value
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return dataclasses.asdict(value)
+        renames = getattr(type(value), "__agentspaces_wire_names__", {})
+        return {renames.get(k, k): v for k, v in dataclasses.asdict(value).items()}
     raise TypeError(f"cannot encode {type(value).__name__} as an entry payload")
 
 
@@ -110,7 +113,8 @@ def from_payload(cls, payload: dict):
         return payload
     if dataclasses.is_dataclass(cls):
         names = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in payload.items() if k in names})
+        back = {wire: name for name, wire in getattr(cls, "__agentspaces_wire_names__", {}).items()}
+        return cls(**{back.get(k, k): v for k, v in payload.items() if back.get(k, k) in names})
     return cls(**payload)
 
 

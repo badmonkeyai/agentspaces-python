@@ -83,6 +83,11 @@ def text_of(ad_type: str, ad: dict) -> str:
         return text
     if ad_type == "AssetCard":
         return f"{ad.get('description', '')} {ad.get('asset', '')} {ad.get('uri', '')} {ad.get('shape', '')}"
+    if ad_type == "ModelCard":
+        return f"{ad.get('name', '')} {ad.get('version', '')} {' '.join(ad.get('tasks') or [])} " \
+               f"{ad.get('modality', '')} {ad.get('engine', '')} {ad.get('licence', '')}"
+    if ad_type == "AppCard":
+        return f"{ad.get('name', '')} {ad.get('kind', '')} {ad.get('shape', '')} {ad.get('owner', '')} {ad.get('url', '')}"
     if ad_type == "CapabilityAdvertisement":
         return f"{ad.get('capabilityType', '')} {ad.get('binding', '')} {ad.get('parameters', {})}"
     if ad_type == "SpaceAdvertisement":

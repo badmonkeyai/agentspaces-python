@@ -13,6 +13,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from agentspaces.agents import Binder, agent, data_use, space_notify  # noqa: E402
+from agentspaces.console import rules  # noqa: E402
 from agentspaces.identity import Identity, group_id_from_founding  # noqa: E402
 from agentspaces.peer import Peer  # noqa: E402
 from agentspaces.space import entry  # noqa: E402
@@ -44,8 +45,16 @@ def main() -> int:
     print(json.dumps({"ok": bool(bound.data_use), "peerId": peer.identity.peer_id, "entries": bound.data_use}),
           flush=True)
     deadline = time.monotonic() + max_seconds
+    reported = False
     while time.monotonic() < deadline:
-        time.sleep(0.5)
+        time.sleep(1.0)
+        if not reported:
+            # S3-H-06: the console's rule entries read as data, once the group has settled
+            read = rules(peer)
+            if all(read.values()):
+                print(json.dumps({"rules": {k: len(v) for k, v in read.items()},
+                                  "sample": read["Constraint"][0].template}), flush=True)
+                reported = True
     bound.close()
     peer.close()
     return 0

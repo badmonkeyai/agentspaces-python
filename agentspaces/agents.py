@@ -119,6 +119,51 @@ def data_use(reads=(), writes=(), source: str = "", sensitivity: str = "", fresh
     return bind
 
 
+_UI = "__agentspaces_ui__"
+
+
+def ui_component(catalog: str, component: str, id: str = "", entry: str = "", controls=(), role: str = "panel",
+                 reads: bool = True, writes: bool = False):
+    """Declares an A2UI component this agent serves (SPEC §6.1a.3, v0.1.26; the
+    Python form of ``@UiComponent``): on a class or a bound method. The binder
+    derives the card's ``ui`` group from every such declaration: the component,
+    its catalog, the standard entry behind it (``entry`` is its type IRI), the
+    controls a person may trigger (each an action of the card), and the role
+    (``panel``, ``control``, or ``row``). Stack it for several components."""
+    def bind(target):
+        declared = list(getattr(target, _UI, []))
+        declared.append({"id": id or component, "catalogId": catalog, "component": component, "entry": entry,
+                         "controls": list(controls), "role": role, "reads": reads, "writes": writes})
+        try:
+            setattr(target, _UI, declared)
+        except AttributeError:
+            raise TypeError("ui_component decorates a class or a method") from None
+        return target
+    return bind
+
+
+def _ui_declaration(obj, methods, actions) -> dict | None:
+    """The card's ``ui`` from the class's and the methods' declarations; None when there is none."""
+    found = list(getattr(type(obj), _UI, []))
+    for _, method in methods:
+        found.extend(getattr(method, _UI, []))
+    if not found:
+        return None
+    names = {a["name"] for a in actions}
+    components, reads, writes = [], [], []
+    for u in found:
+        for control in u["controls"]:
+            if control not in names:
+                raise ValueError(f"ui component {u['id']} names the control '{control}', which is not an action of the card")
+        components.append(wire.ui_component(u["id"], u["catalogId"], u["component"], u["entry"], u["controls"], u["role"]))
+        if u["entry"]:
+            if u["reads"] and u["entry"] not in reads:
+                reads.append(u["entry"])
+            if u["writes"] and u["entry"] not in writes:
+                writes.append(u["entry"])
+    return wire.ui_declaration(components, reads, writes)
+
+
 def agent(name: str, description: str = "", goals: list | None = None):
     """Names the agent, as ``@AgentSpec`` does: the card's name, description, and goals."""
     def bind(cls):
@@ -395,8 +440,9 @@ class Binder:
                 self._start_ballot(bound, obj, method, meta)
             elif verb == "decision":
                 self._start_decision(bound, obj, method, meta)
+        ui = _ui_declaration(obj, methods, actions)   # v0.1.26: what the agent can show
         if self.publish_card and hasattr(self.peer, "publish_ad"):
-            bound.card = self._publish_card(name, spec, consumes, produces, bindings, actions)
+            bound.card = self._publish_card(name, spec, consumes, produces, bindings, actions, ui)
         self._declare_data_use(bound, obj, name)
         return bound
 
@@ -434,7 +480,7 @@ class Binder:
 
     # ----------------------------------------------------------------- card
 
-    def _publish_card(self, name, spec, consumes, produces, bindings, actions) -> dict:
+    def _publish_card(self, name, spec, consumes, produces, bindings, actions, ui=None) -> dict:
         now_ms = self.peer._now_ms()
         issued = instant_iso(now_ms - now_ms % 1000)
         certificate = None
@@ -448,7 +494,7 @@ class Binder:
         card = wire.agent_card(self.peer.group, self.peer.identity, local_name, issued, self.card_ttl,
                                spec.get("description") or "", list(spec.get("goals") or []),
                                list(dict.fromkeys(consumes)), list(dict.fromkeys(produces)), {}, bindings,
-                               agent_public_raw=agent_key, actions=actions or None, agent_certificate=certificate)
+                               agent_public_raw=agent_key, actions=actions or None, agent_certificate=certificate, ui=ui)
         self.peer.publish_ad("AgentCard", card)
         return card
 

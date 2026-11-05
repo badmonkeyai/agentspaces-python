@@ -489,6 +489,27 @@ network). A holding's `via` names the relay a holder sits behind; the
 scheduler orders sources by hops. `tests/test_content.py` pins the golden
 vectors and runs the swarm in process.
 
+## Reading the console's rules (enterprise platform)
+
+A fleet governed by the Bad Monkey enterprise console carries its rules as plain entries: `Vocabulary` and
+`Constraint` in the `constraints` space, `AgentConfiguration` in `policy`, `JuryDecision` in `decisions`,
+`Finding` in `findings`, all named by the console namespace `https://badmonkey.ai/console#<Record>`.
+`agentspaces.console` declares them as `@entry` dataclasses so a Python peer reads them as data, with the same
+`Template` it uses for its own entries. A late joiner holds nothing of a space until it pulls it, which the helper
+does once per space before reading:
+
+```python
+from agentspaces.console import Constraint, rules
+from agentspaces.space import Space, Template
+
+for c in Space(peer, "constraints").entries(Template(Constraint)):
+    print(c.value.template, c.value.a, "->", c.value.b, c.value.enforcement)
+counts = {name: len(values) for name, values in rules(peer).items()}   # pulls, then reads the four
+```
+
+The cross-language console test runs this worker beside the TypeScript and Clojure ones and asserts each read
+the four kinds the console wrote.
+
 ## Run it
 
 ```

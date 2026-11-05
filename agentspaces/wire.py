@@ -606,12 +606,13 @@ def agent_card(group: str, identity: Identity, local_name: str, issued_iso: str,
                ttl_iso: str, description: str, goals: list, consumes: list,
                produces: list, cost_hints: dict, space_bindings: dict,
                agent_public_raw: bytes | None = None, actions: list | None = None,
-               agent_certificate: dict | None = None) -> dict:
+               agent_certificate: dict | None = None, ui: dict | None = None) -> dict:
     """An AgentCard in Java field order: id, issuer, group, issued, ttl,
     agent, description, goals, consumes, produces, costHints, spaceBindings,
-    then the appended agentPublicKey, actions (v0.1.13, item 6), and
-    agentCertificate (v0.1.13), each omitted when absent so earlier cards keep
-    their bytes. A certificate must certify ``agent_public_raw`` for this agent."""
+    then the appended agentPublicKey, actions (v0.1.13, item 6),
+    agentCertificate (v0.1.13), and ui (v0.1.26, what the agent can show), each
+    omitted when absent so earlier cards keep their bytes. A certificate must
+    certify ``agent_public_raw`` for this agent."""
     agent = identity.agent(local_name)
     card = {"id": f"aspace://{group}/agent/{agent}", "issuer": identity.peer_id,
             "group": group, "issued": issued_iso, "ttl": ttl_iso, "agent": agent,
@@ -628,7 +629,28 @@ def agent_card(group: str, identity: Identity, local_name: str, issued_iso: str,
         card["actions"] = actions
     if agent_certificate is not None:
         card["agentCertificate"] = agent_certificate
+    if ui is not None:
+        card["ui"] = ui
     return card
+
+
+def ui_declaration(components: list, reads: list | None = None, writes: list | None = None,
+                   protocol: str = "a2ui", version: str = "v0.9.1") -> dict:
+    """A UiDeclaration in Java field order (SPEC §6.1a.3): protocol, version,
+    components (each id, catalogId, component, entry, controls, role), entries
+    (reads, writes), catalogIds (derived from the components when not given)."""
+    catalogs = list(dict.fromkeys(c["catalogId"] for c in components))
+    return {"protocol": protocol, "version": version, "components": components,
+            "entries": {"reads": list(reads or []), "writes": list(writes or [])}, "catalogIds": catalogs}
+
+
+def ui_component(id: str, catalog_id: str, component: str, entry: str = "", controls: list | None = None,
+                 role: str = "panel") -> dict:
+    """One component of a UiDeclaration, in Java field order."""
+    if role not in ("panel", "control", "row"):
+        raise ValueError("a ui component's role is one of panel, control, row")
+    return {"id": id, "catalogId": catalog_id, "component": component, "entry": entry,
+            "controls": list(controls or []), "role": role}
 
 
 def card_action(name: str, description: str, consumes: list, produces: list,
