@@ -644,6 +644,23 @@ def ui_declaration(components: list, reads: list | None = None, writes: list | N
             "entries": {"reads": list(reads or []), "writes": list(writes or [])}, "catalogIds": catalogs}
 
 
+def app_card_host(url: str, port: int = 0, host_agent: str = "", path: str = "/", sign_on: str = "tenant",
+                  published_by: str = "", published_at_iso: str = "", status: str = "serving") -> dict:
+    """The host group of a published AppCard in Java field order (SPEC §6.1a.4, v0.1.28):
+    url, port, hostAgent, path, signOn (tenant or none), publishedBy, publishedAt,
+    status (serving or stopped). Appended last on the card; a card without it keeps its bytes."""
+    if not url:
+        raise ValueError("a host has a url")
+    if port < 0 or port > 65535:
+        raise ValueError("a host's port is 0 to 65535")
+    if sign_on not in ("tenant", "none"):
+        raise ValueError("a host's signOn is tenant or none")
+    if status not in ("serving", "stopped"):
+        raise ValueError("a host's status is serving or stopped")
+    return {"url": url, "port": port, "hostAgent": host_agent, "path": path or "/", "signOn": sign_on,
+            "publishedBy": published_by, "publishedAt": published_at_iso, "status": status}
+
+
 def ui_component(id: str, catalog_id: str, component: str, entry: str = "", controls: list | None = None,
                  role: str = "panel") -> dict:
     """One component of a UiDeclaration, in Java field order."""
