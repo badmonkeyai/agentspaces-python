@@ -819,6 +819,9 @@ class Content:
         self.bytes_served = 0
         self.wants_refused = 0
         self.pieces_struck = 0
+        # The tree exchange (agentspaces.pdt.tree.Trees) when one is attached: tags 8 to 11
+        # and a REJECT with index -1 go to it (srad/agentspaces-pdt.md §3.5).
+        self.trees = None
         pipes.on_capability(TYPE, self._on_frame)
         self.peer.content = self
         self.start()
@@ -1044,6 +1047,8 @@ class Content:
             self._drive(f)
         for root in list(self.holder_state):
             self._refresh_holding(root, force=False)
+        if self.trees is not None:
+            self.trees.tick()
 
     # ---- holdings
 
@@ -1090,6 +1095,10 @@ class Content:
         if not isinstance(msg, dict):
             return
         t = msg.get("t")
+        if t in (8, 9, 10, 11) or (t == REJECT and msg.get("index") == -1):
+            if self.trees is not None:
+                self.trees.on_frame(sender, msg)
+            return
         if t == PIECE_WANT:
             self._serve(sender, msg)
         elif t == PIECE:

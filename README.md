@@ -489,6 +489,76 @@ network). A holding's `via` names the relay a holder sits behind; the
 scheduler orders sources by hops. `tests/test_content.py` pins the golden
 vectors and runs the swarm in process.
 
+### Values that change: persistent data trees
+
+`agentspaces.pdt` is the Python port of the persistent data trees
+(srad/agentspaces-pdt.md, PD-C-04): content-addressed values whose every
+version shares the nodes it did not change, so a member that holds one
+version fetches only the delta of the next. The layouts match the Java
+build byte for byte, and `tests/test_pdt_vectors.py` proves it against every
+`pdt_*` and `content_*` tree vector of `golden.json`.
+
+- `PMap` and `PSet`: a CHAMP trie with sha256 key hashing; a key set reached
+  in any order has one root. `get`, `assoc`, `dissoc`, `update`,
+  `update_in`, iteration, `count`, `diff`, `merge3`, equality by root.
+  A value that is itself a `dict` is embedded in the order you built it,
+  while the Java codec sorts a map's keys (ISSUE-CanonicalMaps), so put a
+  nested dict in canonical order (`cbor.canonical_map`, or build it with its
+  keys sorted shorter-first then bytewise) when its root must equal Java's;
+  scalars, strings, byte strings, and lists need nothing.
+- Escalated space payloads (PD-E-01, PD-E-03): a `payloadRef` whose CID is
+  dag-cbor names a persistent tree a Java writer escalated into; the peer
+  hands it to the facade (`Pdt.payload`), which reassembles the bytes once
+  the tree is here and starts one tree fetch otherwise, so an entry of an
+  opted-in space reads as any other. `write_payload` and `read_payload` in
+  `agentspaces.pdt.values` are the Java `PayloadTree` byte for byte
+  (`tests/test_pdt_payloads.py` pins the Java roots).
+- `PVector`: Clojure's tailed trie; `conj` and `pop` rewrite the root alone
+  until the tail fills or empties.
+- `PBlob`: FastCDC chunks (16/64/256 KiB) under a prolly tree; `read`,
+  `append`, `splice`, and `PBlob.of` over bytes, a path, or a stream. An
+  insert of 100 bytes into an 8 MiB blob rewrites about one chunk (median
+  79 KiB in the test).
+- `NodeStore`: nodes by CID in memory or one file per node, with pins,
+  `complete`, `missing`, `reachable`, and a mark and sweep.
+- The tree exchange (`agentspaces.pdt.tree.Trees`): tags 8 to 11 of the
+  content swarm, the holder side and the fetcher, holdings for tree roots,
+  the `trees` parameter on the advertisement, and `group-key` sealing of
+  `NODES` answers when the peer holds the content key.
+- Refs (`Pdt`, `Ref`): `deref`, `swap`, `watch`, `history`, `at`, and
+  `heads` over `PRef#v1` entries in a space, with the key-wise three-way
+  merge of several heads (the later HLC wins a both-side conflict and a
+  `PConflict` says so), inline deltas on the head up to 32 KiB, and linear
+  mode over the space's take, as the Python `@reduce` path works.
+
+```python
+from agentspaces.capabilities import Content, MemoryStore, Pipes
+from agentspaces.pdt import Pdt, NodeStore, PBlob
+
+content = Content(Pipes(peer), Space(peer, "content"), MemoryStore())
+pdt = Pdt(content, Space(peer, "pdt"), NodeStore("/var/lib/aspace/pdt"))
+pdt.run()                                        # ticks the exchange and the refs on a thread
+facts = pdt.map_ref("facts")
+facts.swap(lambda m: m.assoc("alpha", 1).assoc("beta", [1, 2, 3]))
+print(facts.deref().to_dict(), facts.heads()[0].seq)
+facts.watch(lambda value: print("new head", value.count()))
+facts.on_conflict(lambda c: print(c.reason, c.key))
+log = pdt.vector_ref("log", mode="linear")       # one writer at a time, through the take
+blob = PBlob.of("/data/model.bin", pdt.store)    # chunk a file; pdt.trees.hold(blob.root()) serves it
+```
+
+A reader that lacks a head's root fetches the delta against the versions it
+holds (`follow="full"`, the default) or loads nodes on access
+(`follow="lazy"`). The ref space is an ordinary replicated space: a head is
+a signed, leased entry with the tags `name` and `root`, and a Python writer
+renews its heads at half-life and lets superseded ones lapse. The peer
+advertises the `wire.recordless` hint and accepts a renew, cancel, or
+complete without its record (SRAD §3.9). `tests/test_pdt_swarm.py` runs two
+peers in process: a delta fetch with a held base receives exactly the
+delta, a swap derefs on the other peer from the inline delta, and a 100-key
+concurrent swap converges on both; `tests/workers/pdt_worker.py` is the
+peer a Java cross-language test drives over tcp.
+
 ## Reading the console's rules (enterprise platform)
 
 A fleet governed by the Bad Monkey enterprise console carries its rules as plain entries: `Vocabulary` and
@@ -528,11 +598,28 @@ endpoints), which is exactly the NAT-restricted peer profile from spec §5.4.
 ## On a network
 
 The client is generous in what it accepts and cautious in what it sends
-(ROBUSTNESS.md). Every verified frame passes a `FrameFilter` first: a stamp
-older than five minutes is stale, one further ahead than the HLC drift bound is
-refused, and a sender-and-stamp pair seen before is a replay; all three are
-dropped without a reply and counted (`peer.frames.stale`, `.ahead`,
-`.replayed`). A kind this client does not speak is counted in
+(ROBUSTNESS.md). Every verified frame passes a `FrameFilter` first, which
+judges the stamp in the order SPEC §9 gives. The filter refuses a stamp outside
+the canonical `physical:logical:node` grammar (each number `0` or ASCII digits
+without a leading zero, a physical that fits a signed 64-bit integer, a node
+part present with no colon and no control character), then one older than five
+minutes and a sender-and-stamp pair it saw before, then one past the HLC drift
+bound by at most five seconds (`wire.FAR_FUTURE_SKEW_MARGIN_MILLIS`, the room a
+receiver whose wall runs a little behind gives an honest peer), one further
+past it, and one whose logical counter is above 65536 (`wire.LOGICAL_LIMIT`).
+It drops each without a reply and counts it (`peer.frames.malformed_stamps`,
+`.stale`, `.replayed`, `.ahead_within_margin`, `.ahead`,
+`.logical_over_limit`). Because each stamp has one spelling, the bytes a signer
+signed always equal the stamp's re-encoding. The peer applies the same rule
+(`wire.acceptable_hlc`) to the issue and lease stamps of folded states and to
+claims, and the grammar alone to signing stamps, as Java does. It refuses a
+verified state or claim that fails and counts it once in
+`peer.refused_stamps`, however often it is offered; this client keeps no
+strikes. Nodes and holders order by UTF-16 code units, as Java's
+`String.compareTo` orders them. The local clock clamps
+a merged physical one millisecond inside the drift bound and carries a counter
+past the limit into the next millisecond, so no stamp it issues repeats,
+exceeds the limit, or runs past what a receiver admits. A kind this client does not speak is counted in
 `peer.ignored_kinds`, a body that does not decode in `peer.malformed_frames`,
 and the reader goes on. A lost socket is a hiccup, not the end: the peer
 re-dials the seed every `reconnect_interval_s` (5 s) for `reconnect_window_s`

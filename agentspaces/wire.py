@@ -18,6 +18,7 @@ dict here lists its keys in the Java record's field order, because the
 envelope signature covers the canonical CBOR and byte order is meaning."""
 
 import hashlib
+import re
 import threading
 import time
 import uuid
@@ -52,9 +53,37 @@ MAX_CLAIM_EPOCH_JUMP = 1 << 20
 MAX_CLAIM_HOLD_MILLIS = 24 * 60 * 60 * 1000
 
 
-# How far ahead of this client's wall clock a remote stamp may run before it
-# is ignored rather than merged (the HLC clamp, ASF-020/043).
+# How far ahead of this client's wall clock a remote stamp may run (the HLC clamp,
+# ASF-020/043): the frame filter drops a frame stamped further ahead, and the clock clamps
+# a merged physical one millisecond inside it.
 MAX_HLC_SKEW_MILLIS = 10 * 60 * 1000
+
+# How far past wall + MAX_HLC_SKEW_MILLIS a frame's stamp may run before the receiver
+# treats it as an attack (HLC canonical stamps, 2026-11-08, decision B). A hostile member
+# can drag an honest peer's clock to its own wall + the skew, and a receiver whose wall
+# runs a little behind then sees the honest frames just past its ceiling: it drops them
+# and counts them apart (``ahead_within_margin``), and a peer that keeps strikes strikes
+# nobody for them. Further past, the frame is ``ahead`` and the sender is struck.
+FAR_FUTURE_SKEW_MARGIN_MILLIS = 5_000
+
+# The largest logical counter a stamp may carry (HLC logical counter, 2026-11-08 (Rust team
+# report)). Every merge and ordering point refuses a remote stamp above it, or one that does
+# not parse strictly (see ``acceptable_hlc``): it drops the frame, the folded state, or the
+# folded claim that carries the stamp, counts the refusal, and keeps the stamp off the
+# clock. A local increment past the limit carries into the next millisecond. An honest
+# counter stays tiny because it resets every millisecond, and Java, Rust, Python, TypeScript
+# and Ruby share this value on the wire.
+LOGICAL_LIMIT = 1 << 16
+
+# The ranges of Java's HlcTimestamp fields (long physical, int logical), which bound what
+# ``parse_hlc`` reads.
+_PHYSICAL_MAX = (1 << 63) - 1
+_LOGICAL_MAX = (1 << 31) - 1
+# A canonical number: "0", or a non-zero ASCII digit followed by ASCII digits, so each value
+# has exactly one spelling (HLC canonical stamps, 2026-11-08, decision A).
+_CANONICAL_NUMBER = re.compile(r"0|[1-9][0-9]*", re.ASCII)
+# What a node may not hold: a colon and the control characters U+0000..U+001F and U+007F.
+_NODE_REFUSED = re.compile(r"[:\x00-\x1f\x7f]")
 
 # How far in the past a frame's stamp may be before it is dropped as stale, and how many
 # (sender, stamp) pairs the replay filter remembers (ROBUSTNESS.md §3.3, §3.4; the Java
@@ -64,37 +93,57 @@ FRAME_FILTER_CAPACITY = 4096
 
 
 class FrameFilter:
-    """Admits each verified frame once, fresh: a stamp older than MAX_FRAME_AGE_MILLIS is
-    stale, one further ahead than MAX_HLC_SKEW_MILLIS is refused, and a (sender, stamp) pair
-    seen before is a replay. All three are dropped silently and counted: late, duplicated and
-    replayed frames are the normal case on a network, not evidence of anything."""
+    """Admits each verified frame once, fresh, judging its stamp in SPEC §9's order (HLC
+    canonical stamps, 2026-11-08). It parses the stamp first and refuses text outside the
+    canonical grammar (``malformed_stamps``). Then it drops a stamp older than
+    MAX_FRAME_AGE_MILLIS (``stale``) and a (sender, stamp) pair it saw before
+    (``replayed``), which anyone can replay. Then it judges the fresh frame only its sender
+    could have signed: a stamp past wall + MAX_HLC_SKEW_MILLIS within
+    FAR_FUTURE_SKEW_MARGIN_MILLIS of it (``ahead_within_margin``), one further past
+    (``ahead``), and one whose logical counter is above LOGICAL_LIMIT
+    (``logical_over_limit``). It drops each silently and counts it: late, duplicated and
+    replayed frames are the normal case on a network. This client keeps no strikes, so the
+    Java node's strike reasons "far-future stamp" and "logical counter above 65536" appear
+    here only as counts."""
 
     def __init__(self, capacity: int = FRAME_FILTER_CAPACITY):
         self._seen = {}
         self._capacity = capacity
+        self.malformed_stamps = 0
         self.stale = 0
-        self.ahead = 0
         self.replayed = 0
+        self.ahead_within_margin = 0
+        self.ahead = 0
+        self.logical_over_limit = 0
 
     def admit(self, env: dict, now_ms: int) -> bool:
         stamp = env.get("stamp")
-        try:
-            physical = hlc_physical(stamp)
-        except (ValueError, TypeError):
+        parsed = parse_hlc(stamp)
+        if parsed is None:
+            self.malformed_stamps += 1
             return False
+        physical, logical, _ = parsed
         if now_ms - physical > MAX_FRAME_AGE_MILLIS:
             self.stale += 1
             return False
-        if physical - now_ms > MAX_HLC_SKEW_MILLIS:
-            self.ahead += 1
-            return False
-        key = f"{env.get('from')}|{stamp}"
+        # A canonical stamp has one spelling, so its text identifies it.
+        key = (env.get("from"), stamp)
         if key in self._seen:
             self.replayed += 1
             return False
         self._seen[key] = True
         if len(self._seen) > self._capacity:
             del self._seen[next(iter(self._seen))]
+        ahead = physical - now_ms - MAX_HLC_SKEW_MILLIS
+        if ahead > FAR_FUTURE_SKEW_MARGIN_MILLIS:
+            self.ahead += 1
+            return False
+        if ahead > 0:
+            self.ahead_within_margin += 1
+            return False
+        if logical > LOGICAL_LIMIT:
+            self.logical_over_limit += 1
+            return False
         return True
 
 _hlc_lock = threading.Lock()
@@ -105,38 +154,108 @@ def hlc_now(node: str, now_ms: int | None = None) -> str:
     """A fresh hybrid-logical-clock stamp in the Java string form: physical
     time never runs backwards, and the logical counter increments within one
     millisecond, so two stamps from the same node never collide and stamps
-    after an observed remote stamp sort after it (ASF-043). ``now_ms`` is the
-    caller's clock (a peer's, so tests are deterministic); default wall time."""
+    after an observed remote stamp sort after it (ASF-043). A counter that
+    would pass LOGICAL_LIMIT carries into the next millisecond instead (HLC
+    logical counter, 2026-11-08 (Rust team report)), so every stamp is new and
+    every peer accepts it. ``now_ms`` is the caller's clock (a peer's, so tests
+    are deterministic); default wall time."""
     wall = int(time.time() * 1000) if now_ms is None else int(now_ms)
     with _hlc_lock:
         physical, logical = _hlc_state.get(node, (0, -1))
         if wall > physical:
             physical, logical = wall, 0
-        else:
+        elif logical < LOGICAL_LIMIT:
             logical += 1
+        else:
+            physical, logical = physical + 1, 0
         _hlc_state[node] = (physical, logical)
     return f"{physical}:{logical}:{node}"
 
 
+def parse_hlc(stamp) -> tuple | None:
+    """``(physical, logical, node)`` when ``stamp`` is a string in the canonical
+    ``physical:logical:node`` grammar, None otherwise (HLC canonical stamps, 2026-11-08,
+    decision A). Each number is "0" or a non-zero ASCII digit followed by ASCII digits, so
+    a leading zero, a sign, a fraction, an exponent, whitespace or an empty part fails;
+    the physical fits a signed 64-bit integer and the logical a Java int; the node is
+    present and holds no colon and no control character. An accepted stamp therefore
+    re-encodes to exactly its text, so a signature over the text is a signature over the
+    stamp. This is syntax alone, which a state's signing time meets as in Java:
+    ``acceptable_hlc`` adds LOGICAL_LIMIT for every merge and ordering point."""
+    if not isinstance(stamp, str):
+        return None
+    parts = stamp.split(":", 2)
+    if len(parts) != 3:
+        return None
+    physical, logical, node = parts
+    if (not _CANONICAL_NUMBER.fullmatch(physical) or not _CANONICAL_NUMBER.fullmatch(logical)
+            or not node or _NODE_REFUSED.search(node)):
+        return None
+    try:
+        physical, logical = int(physical), int(logical)
+    except ValueError:  # more digits than Python converts: far past either range
+        return None
+    if physical > _PHYSICAL_MAX or logical > _LOGICAL_MAX:
+        return None
+    return physical, logical, node
+
+
+def acceptable_hlc(stamp) -> tuple | None:
+    """``(physical, logical, node)`` when ``stamp`` parses strictly (``parse_hlc``) and its
+    logical counter is at most LOGICAL_LIMIT, None otherwise (HLC logical counter,
+    2026-11-08 (Rust team report)). Every merge and ordering point accepts a remote stamp
+    only through this rule: the frame filter, the folded record and lease stamps, and the
+    folded claim. A state's signing stamp meets ``parse_hlc`` alone, as in Java (HLC
+    canonical stamps, 2026-11-08)."""
+    parsed = parse_hlc(stamp)
+    return parsed if parsed is not None and parsed[1] <= LOGICAL_LIMIT else None
+
+
+def utf16_order(text: str) -> bytes:
+    """A key that orders strings by UTF-16 code units, as Java's String.compareTo does
+    (HLC canonical stamps, 2026-11-08): big-endian code units compare bytewise in unit
+    order. Code point order differs above the surrogate range, where Java puts U+E000..U+FFFF
+    after every supplementary character."""
+    return text.encode("utf-16-be", "surrogatepass")
+
+
+def hlc_tuple(stamp) -> tuple:
+    """``(physical, logical, node key)`` of a stamp the rule accepts, ordered as Java's
+    HlcTimestamp.compareTo orders it (the node by ``utf16_order``); raises ValueError on
+    any other stamp. The peer admits only acceptable stamps, so ordering never meets one
+    the rule refuses."""
+    parsed = acceptable_hlc(stamp)
+    if parsed is None:
+        raise ValueError(f"not an acceptable HLC stamp: {stamp!r}")
+    return parsed[0], parsed[1], utf16_order(parsed[2])
+
+
 def hlc_physical(stamp) -> int:
-    """The physical milliseconds of an HLC stamp string: its signing time."""
-    return int(str(stamp).split(":", 1)[0])
+    """The physical milliseconds of an HLC stamp string: its signing time. Raises
+    ValueError on text outside the canonical grammar (``parse_hlc``); like Java, it reads a
+    signing time without judging LOGICAL_LIMIT, which the merge points judge on their own
+    stamps (HLC canonical stamps, 2026-11-08)."""
+    parsed = parse_hlc(stamp)
+    if parsed is None:
+        raise ValueError(f"not a canonical HLC stamp: {stamp!r}")
+    return parsed[0]
 
 
 def hlc_observe(node: str, stamp, now_ms: int | None = None) -> None:
     """Merges a remote stamp into the local clock so later local stamps sort
-    after everything observed. Remote physicals beyond the skew ceiling are
-    ignored: a hostile far-future stamp cannot pin this clock (ASF-020).
-    ``now_ms`` is the caller's clock the skew is judged against (a peer's);
-    default wall time."""
-    try:
-        parts = str(stamp).split(":", 2)
-        physical, logical = int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
+    after everything observed. The clock clamps a remote physical at
+    wall + MAX_HLC_SKEW_MILLIS - 1, so a hostile far-future stamp cannot pin it
+    (ASF-020), and a carry after the merge lands at most at wall + the skew,
+    which a receiver's far-future check (strictly greater) still admits. A
+    stamp the rule refuses (``acceptable_hlc``) never reaches the clock, so one
+    hostile stamp cannot push every later local stamp past what peers accept
+    (HLC logical counter, 2026-11-08 (Rust team report)). ``now_ms`` is the
+    caller's clock the skew is judged against (a peer's); default wall time."""
+    parsed = acceptable_hlc(stamp)
+    if parsed is None:
         return
     wall = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    if physical > wall + MAX_HLC_SKEW_MILLIS:
-        return
+    physical, logical = min(parsed[0], wall + MAX_HLC_SKEW_MILLIS - 1), parsed[1]
     with _hlc_lock:
         current_physical, current_logical = _hlc_state.get(node, (0, -1))
         if (physical, logical) > (current_physical, current_logical):
@@ -687,17 +806,13 @@ def claim_delta(entry_id: str, signed: dict) -> bytes:
     return cbor.dumps({"state": None, "claimEntry": entry_id, "claim": signed})
 
 
-def _hlc_tuple(stamp: str) -> tuple:
-    physical, logical, node = stamp.split(":", 2)
-    return (int(physical), int(logical), node)
-
-
 def claim_sort_key(claim: dict) -> tuple:
     """The claim lattice's total order (spec §7.4): the SMALLEST key wins.
     Epoch descending, bid ascending, HLC stamp ascending, holder ascending,
-    expiry descending; identical to TakeClaim.merge on the Java side."""
+    expiry descending; identical to TakeClaim.merge on the Java side, which compares
+    the stamp's node and the holder by UTF-16 code units (HLC canonical stamps, 2026-11-08)."""
     return (-int(claim.get("epoch", 0)), float(claim.get("bid", 0.0)),
-            _hlc_tuple(claim.get("stamp", "0:0:")), claim.get("holder", ""),
+            hlc_tuple(claim.get("stamp")), utf16_order(claim.get("holder", "")),
             -int(claim.get("expiresAtMillis", 0)))
 
 

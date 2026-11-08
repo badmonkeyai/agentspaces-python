@@ -564,6 +564,51 @@ def test_agent_signed_renew_cancel_and_complete_match_java_and_fold():
             assert held["stateCertificate"] == _agent().certificate
 
 
+def test_a_recordless_renew_matches_java_merges_over_a_held_record_and_waits_otherwise():
+    # The record-free renew of srad/agentspaces-pdt.md §3.9 (PD-L-01, PD-L-02, PD-L-04): the
+    # peer-signed renew of the golden entry travels without its record; a replica that holds
+    # the record merges it, one that does not keeps it pending with no event until the record
+    # arrives, and this client advertises the hint a writer gates the form on (PD-L-03).
+    delta = cbor.loads(_hex("state_delta_recordless_cbor"))
+    state = delta["state"]
+    assert "record" not in state and state["entryId"] == ENTRY
+    assert cbor.dumps(delta) == _hex("state_delta_recordless_cbor")
+    renewed_until = wire.hlc_physical(GOLDEN["hlc_encoded"]) + 7_200_000
+    assert state["leaseStamp"] == _stamp(60_000)
+    assert state["leaseValue"]["expiresAtMillis"] == renewed_until
+
+    # a replica without the record: pending, no entry, no event, until the full DTO arrives
+    waiting = _peer_at(GOLDEN["certificate_verify_at"])
+    events = []
+    waiting.on_state = events.append
+    waiting._fold(dict(state))
+    assert waiting.states == {} and set(waiting.pending_states) == {ENTRY} and events == []
+    waiting._fold(cbor.loads(_hex("delta_cbor"))["state"])
+    assert set(waiting.states) == {ENTRY} and waiting.pending_states == {}
+    held = waiting.states[ENTRY]
+    assert held["leaseStamp"] == state["leaseStamp"]
+    assert held["leaseValue"]["expiresAtMillis"] == renewed_until
+    assert len(events) == 2  # the record's fold and the pending renew's fold
+
+    # a replica that holds the record merges at once
+    holder = _peer_at(GOLDEN["certificate_verify_at"])
+    holder._fold(cbor.loads(_hex("delta_cbor"))["state"])
+    assert holder.states[ENTRY]["leaseValue"]["expiresAtMillis"] == 1735693200000
+    holder._fold(dict(state))
+    assert holder.states[ENTRY]["leaseValue"]["expiresAtMillis"] == renewed_until
+    assert holder.pending_states == {}
+
+    # a recordless state that names no entry is dropped; the rumor item id names it when the DTO does not
+    unnamed = {k: v for k, v in state.items() if k != "entryId"}
+    holder._fold(dict(unnamed))
+    assert holder.pending_states == {}
+    Peer._name_recordless(unnamed, f"r:{ENTRY}:123")
+    assert unnamed["entryId"] == ENTRY
+
+    # the hint rides on this peer's advertisement
+    assert waiting.wire_hints == {"wire.recordless": "1"}
+
+
 def test_a_completion_without_its_claim_is_refused():
     peer = _peer_at(GOLDEN["certificate_verify_at"])
     peer._fold(cbor.loads(_hex("delta_agent_signed_cbor"))["state"])

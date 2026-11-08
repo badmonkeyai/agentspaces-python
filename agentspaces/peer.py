@@ -22,6 +22,7 @@ document (GROUP_AD_WANT / GROUP_AD, spec §5.1, §9, §10.1) and verifying the
 answer against the id it already holds. The point is protocol validation:
 nothing on this wire is Java-specific, and this module holds the proof."""
 
+import hashlib
 import socket
 import struct
 import threading
@@ -38,6 +39,26 @@ from .seed import Seed, parse_seed
 # inside its budget (the schedule of the Java join by id, ISSUE-BootstrapRobustness §9.4).
 JOIN_SLICE_FIRST_S = 1.0
 JOIN_SLICE_MAX_S = 5.0
+
+
+HINT_RECORDLESS = "wire.recordless"
+#: Recordless states held for entries this replica lacks, at most (PD-L-02), as the Java peer's
+#: ``ReplicatedSpace.MAX_PENDING_STATES``; the oldest is dropped past the bound.
+MAX_PENDING_STATES = 1024
+#: How long a pending recordless state waits for its record before it is dropped (ten minutes).
+PENDING_STATE_TTL_S = 600.0
+#: How many distinct refused states and claims the peer remembers so a re-offer is not
+#: counted again (HLC canonical stamps, 2026-11-08); the oldest is forgotten past the bound.
+REFUSED_STAMPS_CAPACITY = 4096
+
+
+def _is_tree_root(ref: str) -> bool:
+    """Whether a ``b`` reference names a persistent tree (dag-cbor) rather than a piece artifact."""
+    try:
+        from .pdt import cids as _cids
+        return _cids.codec_of(ref) == _cids.DAG_CBOR
+    except Exception:  # noqa: BLE001 - a malformed reference is no tree
+        return False
 
 
 class BootstrapTimeout(TimeoutError):
@@ -93,6 +114,11 @@ class Peer:
         self._founding_ready = threading.Event()
         # ROBUSTNESS.md: late, replayed and unknown frames are the normal case; count, never fail.
         self.frames = wire.FrameFilter()
+        # Verified states and claims this peer refused for a stamp the rule refuses, each
+        # counted once however often it is offered (HLC canonical stamps, 2026-11-08); this
+        # client keeps no strikes, so a count is all the refusal leaves.
+        self.refused_stamps: dict[str, int] = {"states": 0, "claims": 0}
+        self._refused_seen: dict[tuple, bool] = {}
         self.ignored_kinds: dict[str, int] = {}
         self.malformed_frames = 0
         # A lost socket is reconnected to the seed and the peer re-introduced and re-pulled,
@@ -115,6 +141,18 @@ class Peer:
         # The resource hints this peer's self-advertisement carries (SPEC §5.1): a join
         # credential under ``aspace:join`` for an INVITE group, set by join_invite.
         self.resource_hints: dict[str, str] = {}
+        # The wire hints this peer's self-advertisement carries beside the resource hints
+        # (SPEC v0.1.17 §9): ``wire.recordless`` says this client accepts a renew, cancel, or
+        # complete whose EntryStateDto carries no record (srad/agentspaces-pdt.md §3.9, PD-L-04).
+        self.wire_hints: dict[str, str] = {HINT_RECORDLESS: "1"}
+        # The pdt facade, when one is built over this peer: it reassembles a dag-cbor payloadRef
+        # (a persistent tree, srad/agentspaces-pdt.md PD-E-01) where the content swarm serves a
+        # raw artifact root; without one such an entry stays invisible here.
+        self.pdt = None
+        # Recordless states for entries whose record has not arrived yet, by entry id:
+        # merged when anti-entropy ships the whole DTO, and no event before that (PD-L-02).
+        self.pending_states: dict[str, dict] = {}
+        self._pending_since: dict[str, float] = {}
         # After join_invite: the key pinned to the delegation this peer joined under
         # (persist it and pass it to join_invite on the next start).
         self.pinned_invite: str | None = None
@@ -475,7 +513,7 @@ class Peer:
         # Whole seconds, as the advertisement has always been stamped.
         ad = wire.peer_advertisement(self.group, self.identity,
                                      instant_iso(now_ms - now_ms % 1000),
-                                     resource_hints=self.resource_hints)
+                                     resource_hints={**self.wire_hints, **self.resource_hints})
         payload = wire.signed_peer_ad(ad, self.identity)
         item_id = f"peer:{self.identity.peer_id}:{now_ms}"
         self._send("RUMOR", wire.rumor_body("peers", item_id, 6, payload))
@@ -666,6 +704,10 @@ class Peer:
         if not isinstance(ref, str) or not ref:
             return b"\xf6"
         if ref[0] == "b":
+            # SPEC §7.1 tree roots: the codec alone tells a persistent tree (dag-cbor, 0x71) from a
+            # piece artifact (raw, 0x55); each goes to the seam that can carry it, never the other.
+            if _is_tree_root(ref):
+                return None if self.pdt is None else self.pdt.payload(ref)
             if self.content is None:
                 return None
             data = self.content.local(ref)
@@ -875,6 +917,7 @@ class Peer:
                     if delta.get("claimEntry") and isinstance(delta.get("claim"), dict):
                         self._fold_claim(delta["claimEntry"], delta["claim"])
                     if isinstance(delta.get("state"), dict):
+                        self._name_recordless(delta["state"], rumor.get("itemId"))
                         self._fold(delta["state"])
         elif kind == "PULL_RESP":
             resp = cbor.loads(body)
@@ -904,6 +947,16 @@ class Peer:
             # acceptance of bare frames changes nothing here): ignored, counted, never fatal.
             self.ignored_kinds[str(kind)] = self.ignored_kinds.get(str(kind), 0) + 1
 
+    @staticmethod
+    def _name_recordless(state: dict, item_id) -> None:
+        """Fills ``entryId`` of a recordless state from the rumor item id (``r:<id>:<stamp>``,
+        ``d:<id>``) when the DTO does not carry one."""
+        if state.get("record") is not None or state.get("entryId") or not isinstance(item_id, str):
+            return
+        parts = item_id.split(":")
+        if len(parts) >= 2 and parts[0] in ("r", "d", "x", "c"):
+            state["entryId"] = parts[1]
+
     def _on_group_ad(self, body: bytes) -> None:
         """A GROUP_AD answer (spec §9): accepted only while a join-by-GroupID
         is pending and only when the body passes the four checks of §5.1 and
@@ -919,10 +972,21 @@ class Peer:
         self._founding_ready.set()
 
     def _fold(self, dto: dict) -> None:
-        record = dto.get("record") or {}
-        entry_id = record.get("entryId")
+        if dto.get("record") is None:
+            self._fold_recordless(dto)
+            return
+        record = dto.get("record")
+        entry_id = record.get("entryId") if isinstance(record, dict) else None
         if not entry_id or not self._verify_state(dto, record):
             return  # unauthenticated record or forged mutable state: drop it
+        # HLC canonical stamps, 2026-11-08: after verification, as Java's ReplicatedSpace
+        # judges it, the peer refuses a state whose stamps the rule refuses and counts it
+        # once per distinct state, so the state never reaches the lease register.
+        if not self._stamps_acceptable(dto):
+            self._count_refused("states", entry_id, dto)
+            return
+        pending = self.pending_states.pop(entry_id, None)
+        self._pending_since.pop(entry_id, None)
         if self._refused_for_revocation(dto, record):
             # Authentic, but its actor is revoked here (SPEC §5.6): what is
             # already held stays as held, and this state is not merged.
@@ -937,14 +1001,80 @@ class Peer:
         if self.on_state is not None:
             self.on_state(merged)
         self._wake_fold_waiters()
+        if pending is not None:
+            self._fold_recordless(pending)
+
+    @staticmethod
+    def _stamps_acceptable(dto: dict) -> bool:
+        """True when the stamps of a verified state pass the rule (HLC canonical stamps,
+        2026-11-08): the record's issue stamp and the lease stamp, when present, meet
+        ``wire.acceptable_hlc``, and the signing stamp, when present, meets the canonical
+        grammar alone (``wire.parse_hlc``), since Java never judges signedAt against
+        LOGICAL_LIMIT."""
+        signed_at = dto.get("signedAt")
+        return (wire.acceptable_hlc(dto["record"].get("issued")) is not None
+                and (dto.get("leaseStamp") is None or wire.acceptable_hlc(dto["leaseStamp"]) is not None)
+                and (signed_at is None or wire.parse_hlc(signed_at) is not None))
+
+    def _count_refused(self, kind: str, entry_id: str, offered: dict) -> None:
+        """Counts a verified state or claim refused for its stamps once per distinct one
+        (HLC canonical stamps, 2026-11-08), as Java's ReplicatedSpace counts it: a re-offer
+        by gossip or anti-entropy is the same refusal again."""
+        key = (kind, entry_id, hashlib.sha256(cbor.dumps(offered)).digest())
+        if key in self._refused_seen:
+            return
+        self._refused_seen[key] = True
+        if len(self._refused_seen) > REFUSED_STAMPS_CAPACITY:
+            del self._refused_seen[next(iter(self._refused_seen))]
+        self.refused_stamps[kind] += 1
+
+    def _expire_pending_states(self, now: float | None = None) -> None:
+        """Drops pending recordless states older than ``PENDING_STATE_TTL_S`` (PD-L-02)."""
+        now = time.monotonic() if now is None else now
+        for entry_id, since in list(self._pending_since.items()):
+            if now - since >= PENDING_STATE_TTL_S:
+                self._pending_since.pop(entry_id, None)
+                self.pending_states.pop(entry_id, None)
+
+    def _fold_recordless(self, dto: dict) -> None:
+        """A renew, cancel, or complete without its record (PD-L-01, PD-L-02): merged when
+        this replica holds the record, kept pending without an event until anti-entropy
+        ships the whole DTO otherwise. The entry id comes from the DTO's ``entryId`` or
+        from the rumor item that carried it. Pending states are bounded at
+        ``MAX_PENDING_STATES`` (the oldest dropped) and age out after
+        ``PENDING_STATE_TTL_S``, as the Java, TypeScript, and Ruby peers bound them;
+        anti-entropy restores whatever was dropped."""
+        entry_id = dto.get("entryId")
+        if not isinstance(entry_id, str) or not entry_id:
+            return
+        previous = self.states.get(entry_id)
+        if previous is None:
+            self._expire_pending_states()
+            if entry_id not in self.pending_states and len(self.pending_states) >= MAX_PENDING_STATES:
+                oldest = next(iter(self.pending_states))
+                self.pending_states.pop(oldest, None)
+                self._pending_since.pop(oldest, None)
+            self.pending_states[entry_id] = dto
+            self._pending_since[entry_id] = time.monotonic()
+            return
+        self._pending_since.pop(entry_id, None)
+        full = dict(dto)
+        full["record"] = previous.get("record")
+        for carried in ("issuerPublicKey", "agentCertificate"):
+            if full.get(carried) is None and previous.get(carried) is not None:
+                full[carried] = previous[carried]
+        self._fold(full)
 
     @staticmethod
     def _join(previous: dict, incoming: dict) -> dict:
         merged = dict(previous)
         merged["adds"] = _union_dots(previous.get("adds"), incoming.get("adds"))
         merged["removes"] = _union_dots(previous.get("removes"), incoming.get("removes"))
-        if (wire._hlc_tuple(str(incoming.get("leaseStamp", "0:0:")))
-                > wire._hlc_tuple(str(previous.get("leaseStamp", "0:0:")))):
+        # Both lease stamps passed the stamp rule or are absent; an absent one loses, and
+        # the rest compare as Java orders them (HLC canonical stamps, 2026-11-08).
+        incoming_stamp, previous_stamp = incoming.get("leaseStamp"), previous.get("leaseStamp")
+        if incoming_stamp is not None and (previous_stamp is None or wire.hlc_tuple(incoming_stamp)
+                                           > wire.hlc_tuple(previous_stamp)):
             merged["leaseStamp"] = incoming.get("leaseStamp")
             merged["leaseValue"] = incoming.get("leaseValue")
         merged["completed"] = bool(previous.get("completed")) or bool(
@@ -1053,9 +1183,9 @@ class Peer:
         if not isinstance(claim, dict) or not isinstance(holder_key, bytes):
             return
         # Validate the signed bindings and numeric fields before the lattice
-        # sees them: a claim transplanted under a foreign map key is dropped
-        # (ASF-002), and a NaN bid cannot win every comparison by making the
-        # total order lie (ASF-033).
+        # sees them: the peer drops a claim transplanted under a foreign map
+        # key (ASF-002), and a NaN bid cannot win every comparison by making
+        # the total order lie (ASF-033).
         if claim.get("entryId") != entry_id:
             return
         epoch = claim.get("epoch")
@@ -1064,12 +1194,18 @@ class Peer:
         if (not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0
                 or not isinstance(expires, int) or isinstance(expires, bool)
                 or not isinstance(bid, (int, float)) or bid != bid
-                or bid in (float("inf"), float("-inf"))
-                or not isinstance(claim.get("stamp"), str)):
+                or bid in (float("inf"), float("-inf"))):
             return
         # The proof: peer-signed, or agent-signed under a peer certificate
         # (TECH-SPEC §7.6's two-key rule, QA4 A4-7 phase 3).
         if not wire.verify_claim_proof(signed, self._now_ms()):
+            return
+        # HLC canonical stamps, 2026-11-08: after verification the peer refuses a claim
+        # whose stamp the rule refuses and counts it once per distinct claim, so the stamp
+        # never reaches the lattice, and a claim signed over non-canonical text cannot
+        # displace an honest claim that every implementation verifies.
+        if wire.acceptable_hlc(claim.get("stamp")) is None:
+            self._count_refused("claims", entry_id, claim)
             return
         # SPEC §5.6 v0.1.13 (review M-1): a revoked holder takes nothing, whatever
         # the claim's stamp, since a renewal keeps it.

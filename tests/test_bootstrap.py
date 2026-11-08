@@ -393,7 +393,8 @@ def test_join_invite_derives_the_golden_credential_and_carries_it_as_the_join_hi
         assert peer.founding == cbor.loads(base64.b64decode(GOLDEN["founding_cbor_base64"]))
         _wait(lambda: len(seed.frames) >= 2)
         ad = _self_ad(seed)
-        assert ad["resourceHints"] == {"aspace:join": GOLDEN["credential"]}
+        # the join credential beside the wire hints this client advertises (PD-L-04)
+        assert ad["resourceHints"] == {"aspace:join": GOLDEN["credential"], "wire.recordless": "1"}
         assert ad["issuer"] == GOLDEN["candidate_peer_id"] and ad["group"] == GOLDEN["group_id"]
         # The hint is bound into the signed advertisement bytes.
         signed = cbor.loads(cbor.loads(next(e for e in seed.envelopes if e["kind"] == "RUMOR")["body"])["payload"])

@@ -343,7 +343,7 @@ def test_an_agent_signed_renewal_folds_at_another_peer_with_a_later_lease():
     receiver._fold(_delta_state(sent[-1][1]))
     held = receiver.states[entry_id]
     assert held["leaseValue"]["expiresAtMillis"] == clock.millis + 60_000
-    assert wire._hlc_tuple(held["leaseStamp"]) > wire._hlc_tuple(original["leaseStamp"])
+    assert wire.hlc_tuple(held["leaseStamp"]) > wire.hlc_tuple(original["leaseStamp"])
 
 
 def test_a_renewal_under_the_wrong_agent_raises_locally():
@@ -367,7 +367,7 @@ def test_a_renewal_under_the_wrong_agent_raises_locally():
     assert sent == []
 
 
-def test_a_state_whose_signed_at_is_not_a_stamp_is_judged_without_raising():
+def test_the_peer_refuses_and_counts_a_state_whose_signed_at_is_not_a_stamp_without_raising():
     clock = Clock(T0)
     host = Identity.generate()
     _, body = wire.entry_delta("tasks", GROUP, "T#v1", b"\x01", host, "x", 600_000,
@@ -381,4 +381,7 @@ def test_a_state_whose_signed_at_is_not_a_stamp_is_judged_without_raising():
     odd = {**state, "signedAt": "not-a-stamp", "stateSig": host.sign(cbor.dumps(view))}
     receiver = _peer(clock)
     receiver._fold(odd)
-    assert len(receiver.states) == 1
+    # HLC logical counter, 2026-11-08 (Rust team report): Java's HlcTimestamp.parse
+    # refuses the signing stamp, and this peer refuses the state with it.
+    assert receiver.states == {}
+    assert receiver.refused_stamps["states"] == 1
