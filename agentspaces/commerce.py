@@ -1,17 +1,3 @@
-"""The Bad Monkey console records as data (enterprise platform, spiral 3
-S3-H-06): the entry types the console and its agents write into a group's
-``constraints``, ``policy``, ``decisions``, and ``findings`` spaces, named by
-the console namespace ``https://badmonkey.ai/console#<Record>`` so a Python
-peer reads them with the same ``Template`` it uses for its own entries. A
-field the wire carries that a class here does not declare is ignored.
-
-    from agentspaces.console import Constraint, rules
-    space = Space(peer, "constraints")
-    for c in space.entries(Template(Constraint)):
-        print(c.value.template, c.value.a, c.value.b)
-    counts = {k: len(v) for k, v in rules(peer).items()}
-"""
-
 """The commerce records (SPEC §6.5a, §7.6; the open ``agentspaces-commerce``
 module): a ``Mandate`` is an AP2 Checkout or Payment Mandate carried as an
 entry of a group's ``commerce`` space, an ``Order`` the UCP order it led to.

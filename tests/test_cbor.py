@@ -16,6 +16,8 @@
 doubles: major-7 items carry no length head, so a float's payload bytes must
 never be consumed as a length."""
 
+import pytest
+
 from agentspaces import cbor
 
 
@@ -33,25 +35,22 @@ def test_double_followed_by_uint64_stays_in_sync():
     assert cbor.loads(encoded) == value
 
 
-def test_definite_maps_and_arrays_decode_too():
-    # Canonical form (wire v2, SPEC v0.1.8) writes indefinite-length maps and
-    # definite-length arrays; the decoder accepts both forms of each so other
-    # CBOR producers interoperate.
-    assert cbor.loads(bytes.fromhex("a161610f")) == {"a": 15}
+def test_only_the_forms_the_encoding_writes_decode():
+    # HLC round six, 2026-11-08 (rules S7, S8 and S10): an indefinite map and a definite
+    # array are the forms Java writes, and a document decodes only in them; a half float is
+    # a float nobody writes. A float32 decodes, as Java writes a float.
     assert cbor.loads(bytes.fromhex("bf61610fff")) == {"a": 15}
     assert cbor.loads(bytes.fromhex("83010203")) == [1, 2, 3]
-    assert cbor.loads(bytes.fromhex("9f010203ff")) == [1, 2, 3]
+    for raw in ("a161610f", "9f010203ff", "f90000"):
+        with pytest.raises(ValueError):
+            cbor.loads(bytes.fromhex(raw))
+    assert abs(cbor.loads(bytes.fromhex("fa40490fdb")) - 3.14159) < 1e-5
 
 
 def test_canonical_form_uses_indefinite_maps_and_definite_arrays():
     # The encoder side of the same rule, pinned as bytes (SPEC v0.1.8).
     assert cbor.dumps([1, 2, 3]) == bytes.fromhex("83010203")
     assert cbor.dumps({"a": 15}) == bytes.fromhex("bf61610fff")
-
-
-def test_half_and_single_floats_decode():
-    assert cbor.loads(bytes.fromhex("f90000")) == 0.0
-    assert abs(cbor.loads(bytes.fromhex("fa40490fdb")) - 3.14159) < 1e-5
 
 
 def test_canonical_map_sorts_keys_by_utf8_length_then_bytes():

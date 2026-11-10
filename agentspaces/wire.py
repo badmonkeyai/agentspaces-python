@@ -18,14 +18,14 @@ dict here lists its keys in the Java record's field order, because the
 envelope signature covers the canonical CBOR and byte order is meaning."""
 
 import hashlib
+import math
 import re
 import threading
 import time
 import uuid
 
-from . import cbor
-from .identity import (Identity, derive_id, verify_agent_certificate,
-                       verify_agent_certificate_at)
+from . import cbor, records
+from .identity import MAX_DRIFT_MILLIS, Identity, derive_id, is_local_name, verify_agent_certificate_covering
 
 # The wire version every envelope carries and the only one a receiver accepts
 # (SPEC §9, TECH-SPEC §3): a frame of any other version is dropped before its
@@ -56,24 +56,39 @@ MAX_CLAIM_HOLD_MILLIS = 24 * 60 * 60 * 1000
 # How far ahead of this client's wall clock a remote stamp may run (the HLC clamp,
 # ASF-020/043): the frame filter drops a frame stamped further ahead, and the clock clamps
 # a merged physical one millisecond inside it.
-MAX_HLC_SKEW_MILLIS = 10 * 60 * 1000
+MAX_HLC_SKEW_MILLIS = MAX_DRIFT_MILLIS
 
 # How far past wall + MAX_HLC_SKEW_MILLIS a frame's stamp may run before the receiver
 # treats it as an attack (HLC canonical stamps, 2026-11-08, decision B). A hostile member
 # can drag an honest peer's clock to its own wall + the skew, and a receiver whose wall
 # runs a little behind then sees the honest frames just past its ceiling: it drops them
-# and counts them apart (``ahead_within_margin``), and a peer that keeps strikes strikes
-# nobody for them. Further past, the frame is ``ahead`` and the sender is struck.
+# and counts them apart (``far_future_skewed``), and a peer that keeps strikes strikes
+# nobody for them. Further past, the frame is ``far_future`` and the sender is struck.
 FAR_FUTURE_SKEW_MARGIN_MILLIS = 5_000
 
+# How far past wall + MAX_HLC_SKEW_MILLIS + FAR_FUTURE_SKEW_MARGIN_MILLIS a folded state's
+# record or lease stamp, or a folded claim's stamp, may run before the peer refuses it as
+# hostile (HLC round four, 2026-11-08, decision D4). Nearer, the peer defers it: it does not
+# merge it, counts it once per distinct offer (HLC round five, 2026-11-08, decision E2), and
+# anti-entropy offers it again until this peer's wall catches up, so an honest taker whose
+# clock a hostile stamp dragged ahead is never refused. The peer judges each offer afresh, so
+# a hostile one merges too once the wall catches up (HLC round five, 2026-11-08, decision E5).
+FAR_FUTURE_HOSTILE_MILLIS = 60 * 60 * 1000
+
 # The largest logical counter a stamp may carry (HLC logical counter, 2026-11-08 (Rust team
-# report)). Every merge and ordering point refuses a remote stamp above it, or one that does
-# not parse strictly (see ``acceptable_hlc``): it drops the frame, the folded state, or the
-# folded claim that carries the stamp, counts the refusal, and keeps the stamp off the
-# clock. A local increment past the limit carries into the next millisecond. An honest
+# report)). Every merge and ordering point refuses a remote stamp above it (see
+# ``acceptable_hlc``): it drops the frame, the folded state, or the folded claim that carries
+# the stamp, counts the refusal, and keeps the stamp off the clock. A stamp that does not
+# parse strictly never gets that far: its frame or space delta does not decode (HLC round
+# four, 2026-11-08, decision D3). A local increment past the limit carries into the next millisecond. An honest
 # counter stays tiny because it resets every millisecond, and Java, Rust, Python, TypeScript
 # and Ruby share this value on the wire.
 LOGICAL_LIMIT = 1 << 16
+# HLC round seven, 2026-11-08 (SPEC §9.1, S6): a stamp is one definite text of at most this many
+# UTF-16 units, and a clock's node leaves room for the longest physical part (19 digits), the
+# longest logical part (10 digits) and their two colons, so every stamp it issues fits.
+MAX_STAMP_UNITS = cbor.JACKSON_CHUNK_UNITS
+MAX_NODE_UNITS = MAX_STAMP_UNITS - 31
 
 # The ranges of Java's HlcTimestamp fields (long physical, int logical), which bound what
 # ``parse_hlc`` reads.
@@ -82,8 +97,10 @@ _LOGICAL_MAX = (1 << 31) - 1
 # A canonical number: "0", or a non-zero ASCII digit followed by ASCII digits, so each value
 # has exactly one spelling (HLC canonical stamps, 2026-11-08, decision A).
 _CANONICAL_NUMBER = re.compile(r"0|[1-9][0-9]*", re.ASCII)
-# What a node may not hold: a colon and the control characters U+0000..U+001F and U+007F.
-_NODE_REFUSED = re.compile(r"[:\x00-\x1f\x7f]")
+# What a node may not hold: a colon, the control characters U+0000..U+001F and U+007F, and a
+# lone surrogate U+D800..U+DFFF, which no peer can send as UTF-8 (HLC round five, 2026-11-08,
+# decision E11). A decoded stamp never holds a surrogate, so the last range binds the local node.
+_NODE_REFUSED = re.compile(r"[:\x00-\x1f\x7f\ud800-\udfff]")
 
 # How far in the past a frame's stamp may be before it is dropped as stale, and how many
 # (sender, stamp) pairs the replay filter remembers (ROBUSTNESS.md §3.3, §3.4; the Java
@@ -94,14 +111,18 @@ FRAME_FILTER_CAPACITY = 4096
 
 class FrameFilter:
     """Admits each verified frame once, fresh, judging its stamp in SPEC §9's order (HLC
-    canonical stamps, 2026-11-08). It parses the stamp first and refuses text outside the
-    canonical grammar (``malformed_stamps``). Then it drops a stamp older than
-    MAX_FRAME_AGE_MILLIS (``stale``) and a (sender, stamp) pair it saw before
-    (``replayed``), which anyone can replay. Then it judges the fresh frame only its sender
-    could have signed: a stamp past wall + MAX_HLC_SKEW_MILLIS within
-    FAR_FUTURE_SKEW_MARGIN_MILLIS of it (``ahead_within_margin``), one further past
-    (``ahead``), and one whose logical counter is above LOGICAL_LIMIT
-    (``logical_over_limit``). It drops each silently and counts it: late, duplicated and
+    canonical stamps, 2026-11-08). A frame reaches it only with a stamp that decoded:
+    ``decode_frame_detailed`` drops a frame whose stamp is no stamp item before it checks the
+    frame's signature, and the peer counts it among its malformed frames (HLC round five,
+    2026-11-08, decision E9). The filter drops a stamp older than MAX_FRAME_AGE_MILLIS
+    (``stale``) and a (sender, stamp) pair it saw before (``replayed``), which anyone can
+    replay. Then it judges the fresh frame only its
+    sender could have signed: a stamp past wall + MAX_HLC_SKEW_MILLIS within
+    FAR_FUTURE_SKEW_MARGIN_MILLIS of it (``far_future_skewed``), one further past
+    (``far_future``), and one whose logical counter is above LOGICAL_LIMIT
+    (``logical_refused``); the three counters carry the names of the Java node's
+    framesFarFutureSkewed, framesFarFuture and framesLogicalRefused (HLC round four,
+    2026-11-08, decision D5). It drops each silently and counts it: late, duplicated and
     replayed frames are the normal case on a network. This client keeps no strikes, so the
     Java node's strike reasons "far-future stamp" and "logical counter above 65536" appear
     here only as counts."""
@@ -109,19 +130,19 @@ class FrameFilter:
     def __init__(self, capacity: int = FRAME_FILTER_CAPACITY):
         self._seen = {}
         self._capacity = capacity
-        self.malformed_stamps = 0
         self.stale = 0
         self.replayed = 0
-        self.ahead_within_margin = 0
-        self.ahead = 0
-        self.logical_over_limit = 0
+        self.far_future_skewed = 0
+        self.far_future = 0
+        self.logical_refused = 0
 
     def admit(self, env: dict, now_ms: int) -> bool:
+        """Whether to handle a decoded frame; raises ValueError when its stamp does not parse,
+        which a frame from ``decode_frame_detailed`` never carries."""
         stamp = env.get("stamp")
         parsed = parse_hlc(stamp)
         if parsed is None:
-            self.malformed_stamps += 1
-            return False
+            raise ValueError(f"a decoded frame carries no stamp: {stamp!r}")
         physical, logical, _ = parsed
         if now_ms - physical > MAX_FRAME_AGE_MILLIS:
             self.stale += 1
@@ -136,13 +157,13 @@ class FrameFilter:
             del self._seen[next(iter(self._seen))]
         ahead = physical - now_ms - MAX_HLC_SKEW_MILLIS
         if ahead > FAR_FUTURE_SKEW_MARGIN_MILLIS:
-            self.ahead += 1
+            self.far_future += 1
             return False
         if ahead > 0:
-            self.ahead_within_margin += 1
+            self.far_future_skewed += 1
             return False
         if logical > LOGICAL_LIMIT:
-            self.logical_over_limit += 1
+            self.logical_refused += 1
             return False
         return True
 
@@ -158,7 +179,14 @@ def hlc_now(node: str, now_ms: int | None = None) -> str:
     would pass LOGICAL_LIMIT carries into the next millisecond instead (HLC
     logical counter, 2026-11-08 (Rust team report)), so every stamp is new and
     every peer accepts it. ``now_ms`` is the caller's clock (a peer's, so tests
-    are deterministic); default wall time."""
+    are deterministic); default wall time. A ``node`` the stamp grammar refuses (empty,
+    or holding a colon, a control character or a lone surrogate) raises ValueError, so this
+    peer never emits a stamp its peers refuse (HLC round four, 2026-11-08, decision D6; HLC
+    round five, 2026-11-08, decision E11), and so does a node past MAX_NODE_UNITS (HLC round
+    seven, 2026-11-08)."""
+    if (not isinstance(node, str) or not node or _NODE_REFUSED.search(node)
+            or cbor.utf16_units(node) > MAX_NODE_UNITS):
+        raise ValueError(f"not a stamp node: {node!r}")
     wall = int(time.time() * 1000) if now_ms is None else int(now_ms)
     with _hlc_lock:
         physical, logical = _hlc_state.get(node, (0, -1))
@@ -178,11 +206,17 @@ def parse_hlc(stamp) -> tuple | None:
     decision A). Each number is "0" or a non-zero ASCII digit followed by ASCII digits, so
     a leading zero, a sign, a fraction, an exponent, whitespace or an empty part fails;
     the physical fits a signed 64-bit integer and the logical a Java int; the node is
-    present and holds no colon and no control character. An accepted stamp therefore
-    re-encodes to exactly its text, so a signature over the text is a signature over the
-    stamp. This is syntax alone, which a state's signing time meets as in Java:
-    ``acceptable_hlc`` adds LOGICAL_LIMIT for every merge and ordering point."""
-    if not isinstance(stamp, str):
+    present and holds no colon, no control character and no lone surrogate (HLC round five,
+    2026-11-08, decision E11). An accepted stamp therefore re-encodes to exactly its text,
+    so a signature over the text is a signature over the stamp. Only a plain ``str`` of at most
+    3996 UTF-16 units parses: a longer text travels only in Jackson's chunks, and a stamp is one
+    definite text, so no such text is a stamp, a ``pdt.issued`` included (HLC round seven,
+    2026-11-08). The decoder already refuses text under a longer head than it needs, a tag over
+    text and ill-formed UTF-8 (HLC round four, 2026-11-08, decision D3; HLC round five,
+    2026-11-08, decisions E1 and E8; HLC round six, 2026-11-08, rule S3). This is syntax
+    alone, which decides whether a stamp decodes; ``acceptable_hlc`` adds LOGICAL_LIMIT for
+    every merge and ordering point."""
+    if type(stamp) is not str or cbor.utf16_units(stamp) > MAX_STAMP_UNITS:
         return None
     parts = stamp.split(":", 2)
     if len(parts) != 3:
@@ -204,11 +238,40 @@ def acceptable_hlc(stamp) -> tuple | None:
     """``(physical, logical, node)`` when ``stamp`` parses strictly (``parse_hlc``) and its
     logical counter is at most LOGICAL_LIMIT, None otherwise (HLC logical counter,
     2026-11-08 (Rust team report)). Every merge and ordering point accepts a remote stamp
-    only through this rule: the frame filter, the folded record and lease stamps, and the
-    folded claim. A state's signing stamp meets ``parse_hlc`` alone, as in Java (HLC
-    canonical stamps, 2026-11-08)."""
+    only through this rule: the frame filter, the folded record, lease and signing stamps,
+    the folded claim, and a ref's advisory ``pdt.issued`` (HLC round four, 2026-11-08,
+    decisions D1 and D2)."""
     parsed = parse_hlc(stamp)
     return parsed if parsed is not None and parsed[1] <= LOGICAL_LIMIT else None
+
+
+def is_agent_id(text) -> bool:
+    """Whether ``text`` is an agent id in Java's AgentId grammar: a non-empty peer, one slash,
+    and a non-empty local name that holds no slash (HLC round five, 2026-11-08, decision E3)
+    and no colon, since a stamp's node holds no colon and an agent signs stamps under its id
+    (HLC round six, 2026-11-08, R5)."""
+    if not isinstance(text, str):
+        return False
+    peer, slash, local = text.partition("/")
+    return bool(peer) and bool(slash) and is_local_name(local)
+
+
+def decode_delta(raw) -> dict | None:
+    """A space delta (``SpaceWire.Delta``, the payload of a ``space:`` rumor), or None when it
+    does not decode: bytes outside the wire encoding, a field of another kind or out of its
+    place (HLC round six, 2026-11-08, owner rulings F1 and F3), a stamp that is no canonical
+    stamp (HLC round four, 2026-11-08, decision D3), or a claim or record Java's records
+    refuse. Java's codec refuses the same deltas before any signature check, and the caller
+    counts each one as undecodable (decision D5)."""
+    return records.decode(raw, "SpaceWire.Delta")
+
+
+def decode_sync_delta(raw) -> dict | None:
+    """An anti-entropy SyncDelta (``{states, claims}``, one stream of a PULL_RESP), or None
+    when it does not decode, under the rule of ``decode_delta``: one state or claim that does
+    not decode drops the whole SyncDelta, as Java's codec drops it (HLC round four,
+    2026-11-08, decisions D3 and D5)."""
+    return records.decode(raw, "SpaceWire.SyncDelta")
 
 
 def utf16_order(text: str) -> bytes:
@@ -232,9 +295,9 @@ def hlc_tuple(stamp) -> tuple:
 
 def hlc_physical(stamp) -> int:
     """The physical milliseconds of an HLC stamp string: its signing time. Raises
-    ValueError on text outside the canonical grammar (``parse_hlc``); like Java, it reads a
-    signing time without judging LOGICAL_LIMIT, which the merge points judge on their own
-    stamps (HLC canonical stamps, 2026-11-08)."""
+    ValueError on text outside the canonical grammar (``parse_hlc``). It reads the time
+    alone; the merge points judge LOGICAL_LIMIT on every stamp a state or claim carries,
+    its signing stamp included (HLC round four, 2026-11-08, decision D1)."""
     parsed = parse_hlc(stamp)
     if parsed is None:
         raise ValueError(f"not a canonical HLC stamp: {stamp!r}")
@@ -297,39 +360,63 @@ def decode_frame_detailed(frame: bytes, attested: str | None = None):
     """``(envelope, auth)`` with auth ``"signed"`` or ``"attested"``, or None. A bare
     frame (no key, no signature) is accepted only on a connection whose transport
     attested exactly its sender (``attested``, SPEC §5.6), and a hello never travels
-    bare. Mirrors Java ``WireCodec`` as the Ruby and TypeScript clients do."""
+    bare. Mirrors Java ``WireCodec`` as the Ruby and TypeScript clients do.
+
+    The frame decodes in the receiver's order (HLC round six, 2026-11-08, owner ruling F3):
+    the item rules over its bytes, then ``ver`` (a frame of another version drops before any
+    other work, so versions coexist), then the record rules of ``WireCodec.Signed`` and its
+    ``Envelope``, then the canonical-bytes rule, and only then the signature, over the
+    envelope's bytes, which equal its re-encoding. A frame whose stamp is no stamp item
+    does not decode: it drops before any signature check, so its sender is never blamed for
+    it (HLC round five, 2026-11-08, decision E9)."""
     try:
         signed = cbor.loads(frame)
-    except (ValueError, IndexError, UnicodeDecodeError):
+    except ValueError:  # the decoder raises ValueError on every input outside the encoding
         return None
-    if not isinstance(signed, dict):
+    env = signed.get("envelope") if isinstance(signed, dict) else None
+    if not isinstance(env, dict) or type(env.get("ver")) is not int or env["ver"] != WIRE_VERSION:
         return None
-    env = signed.get("envelope")
-    if not isinstance(env, dict):
+    if not records.conforms(signed, "WireCodec.Signed") or cbor.dumps(signed) != frame:
         return None
-    ver = env.get("ver")
-    if not isinstance(ver, int) or isinstance(ver, bool) or ver != WIRE_VERSION:
-        return None
-    key = signed.get("senderPublicKey")
-    signature = signed.get("signature")
+    key = signed["senderPublicKey"]
+    signature = signed["signature"]
     if key is None and signature is None:
         if env.get("kind") in HELLO_KINDS or attested is None or attested != env.get("from"):
             return None
         return env, "attested"
-    if not isinstance(key, bytes) or len(key) != 32:
-        return None
-    if derive_id(key) != env.get("from"):
+    if key is None or len(key) != 32 or derive_id(key) != env["from"]:
         return None
     if not Identity.verify(key, cbor.dumps(env), signature or b""):
         return None
     return env, "signed"
 
 
+# The body record of each kind this client acts on (appendix A of the round six definition).
+BODY_RECORDS = {
+    "PING": "Bodies.Ping",
+    "RUMOR": "Bodies.Rumor",
+    "PULL_RESP": "Bodies.PullResp",
+    "RELAY_FRAME": "Bodies.RelayFrame",
+    "BLOCK_WANT": "BlockExchange.Want",
+    "BLOCK": "BlockExchange.Block",
+    "PIPE_DATA": "CapabilityPipes.PipeFrame",
+    KIND_GROUP_AD: "SignedGroupAdvertisement",
+}
+
+
+def decode_body(kind: str, body: bytes) -> dict | None:
+    """The body of a verified frame of ``kind`` as its record, or None when it holds no such
+    record in the wire encoding (HLC round six, 2026-11-08, owner rulings F1 and F3): the
+    frame is then undecodable, and the receiver drops it and counts it as malformed."""
+    return records.decode(body, BODY_RECORDS[kind])
+
+
 def encode_bare_frame(env: dict) -> bytes:
     """An envelope with no signature (WireCodec.encodeBare): what a node sends on a
     connection whose transport attested it, toward a peer that announced it accepts
-    bare frames there. This client never sends one; tests and stand-in seeds do."""
-    return cbor.dumps({"envelope": env})
+    bare frames there, its key and signature written null as Java writes them. This
+    client never sends one; tests and stand-in seeds do."""
+    return cbor.dumps({"envelope": env, "senderPublicKey": None, "signature": None})
 
 
 # ------------------------------------------------------------------ bodies
@@ -348,7 +435,9 @@ def rumor_body(stream_id: str, item_id: str, hops: int, payload: bytes) -> bytes
 
 
 def digest_body(digests: dict) -> bytes:
-    return cbor.dumps({"digests": digests})
+    """A DIGEST body, its digests map in the canonical order a map field takes (HLC round
+    six, 2026-11-08, rule P2): ``peers`` before ``space:<name>``."""
+    return cbor.dumps({"digests": cbor.canonical_map(digests)})
 
 
 def channel_hello_body(accepts_bare: bool, attested_remote: str) -> bytes:
@@ -481,6 +570,21 @@ def stored_ad(ad_type: str, ad: dict, identity: Identity) -> dict:
             "signature": identity.sign(ad_bytes)}
 
 
+def decode_signed_peer_ad(payload) -> dict | None:
+    """The PeerAdvertisement a 'peers' stream item (PeerNode.SignedPeerAd) carries, or None
+    when the item or its advertisement is outside the wire encoding or its record (HLC round
+    six, 2026-11-08, owner rulings F1 and F3), the signature over the advertisement's bytes
+    fails, or the key does not derive the issuer."""
+    signed = records.decode(payload, "PeerNode.SignedPeerAd")
+    if signed is None or None in (signed["adBytes"], signed["publicKey"], signed["signature"]):
+        return None
+    ad = records.decode(signed["adBytes"], "PeerAdvertisement")
+    if (ad is None or len(signed["publicKey"]) != 32 or ad["issuer"] != derive_id(signed["publicKey"])
+            or not Identity.verify(signed["publicKey"], signed["adBytes"], signed["signature"])):
+        return None
+    return ad
+
+
 def signed_peer_ad(ad: dict, identity: Identity) -> bytes:
     """The 'peers' stream payload: PeerNode.SignedPeerAd."""
     ad_bytes = cbor.dumps(ad)
@@ -522,17 +626,17 @@ def sign_view_of(record: dict) -> dict:
     return view
 
 
-def verify_record(record: dict, issuer_public_raw, certificate,
-                  now_ms: int) -> bool:
+def verify_record(record: dict, issuer_public_raw, certificate) -> bool:
     """TECH-SPEC §7.2's record rule, as ReplicatedSpace.verifyRecord applies
     it. ``issuer_public_raw`` must always be the 32-byte key of the record's
     issuing peer. Without a certificate the record signature verifies under
     that peer key. With one, the certificate must verify under the peer key
     for exactly this issuer, judged at the record's own issue stamp (v0.1.13:
-    signing time, not receipt; ``now_ms`` bounds how far that stamp may lead),
-    and the record signature must then verify under the certificate's agent
-    key: a record that arrives with a certificate but a peer-key signature is
-    refused."""
+    signing time, not receipt), and the record signature must then verify
+    under the certificate's agent key: a record that arrives with a
+    certificate but a peer-key signature is refused. How far the issue stamp
+    may lead is the far-future rule's to judge after verification, as for a
+    peer-signed record (HLC round five, 2026-11-08, decision E4)."""
     if (not isinstance(issuer_public_raw, (bytes, bytearray))
             or len(issuer_public_raw) != 32):
         return False
@@ -550,15 +654,18 @@ def verify_record(record: dict, issuer_public_raw, certificate,
         signed_at = hlc_physical(record.get("issued"))
     except (TypeError, ValueError):
         return False
-    if not verify_agent_certificate_at(certificate, bytes(issuer_public_raw),
-                                       issuer, signed_at, now_ms):
+    if not verify_agent_certificate_covering(certificate, bytes(issuer_public_raw),
+                                             issuer, signed_at):
         return False
     return Identity.verify(bytes(certificate["agentPublicKey"]), view, bytes(signature))
 
 
 def _sorted_dots(dots: list) -> list:
-    """Dots sorted by (replica, counter), matching ReplicatedSpace.sortedDots."""
-    return sorted(dots, key=lambda d: (d.get("replica", ""), d.get("counter", 0)))
+    """Dots sorted by (replica, counter) as ReplicatedSpace.sortedDots sorts them, the replica
+    by UTF-16 code units as Java's String.compareTo orders it (HLC round six, 2026-11-08,
+    vector delta-13): a replica holding a supplementary character sorts before one holding
+    U+E000 to U+FFFF, where code point order puts it after."""
+    return sorted(dots, key=lambda d: (utf16_order(d.get("replica", "")), d.get("counter", 0)))
 
 
 def state_sign_view(space_id: str, entry_id: str, adds: list, removes: list,
@@ -674,12 +781,22 @@ def take_claim(entry_id: str, space_id: str, epoch: int, stamp: str, holder: str
             "bid": float(bid), "expiresAtMillis": expires_at_millis}
 
 
+def canonical_claim(claim: dict) -> dict:
+    """The TakeClaim a claim map stands for, its fields in the record's declared order and no
+    other field: what a claim's signature covers and how it travels (HLC round five,
+    2026-11-08, decision E13)."""
+    return take_claim(claim.get("entryId"), claim.get("spaceId"), claim.get("epoch"),
+                      claim.get("stamp"), claim.get("holder"), claim.get("bid"), claim.get("expiresAtMillis"))
+
+
 def signed_claim(claim: dict, identity: Identity, agent=None) -> dict:
     """A SignedClaim: the claim, the holder's *peer* key, the holder's signature.
     With ``agent`` (an ``AgentIdentity``) the signature is the agent key's and
     the peer's certificate covering the claim's stamp rides beside it in the
     appended ``holderCertificate`` field (QA4 A4-7 phase 3; v0.1.13 judges it at
-    that stamp); without it the proof is byte-identical to before."""
+    that stamp); without it the proof is byte-identical to before. The claim is
+    signed and carried in Java's field order (``canonical_claim``)."""
+    claim = canonical_claim(claim)
     signed = {"claim": claim, "holderKey": identity.public_raw,
               "signature": (agent or identity).sign(cbor.dumps(claim))}
     if agent is not None:
@@ -690,35 +807,39 @@ def signed_claim(claim: dict, identity: Identity, agent=None) -> dict:
     return signed
 
 
-def verify_claim_proof(signed: dict, now_ms: int) -> bool:
+def verify_claim_proof(signed: dict) -> bool:
     """TECH-SPEC §7.6's proof rule, as ReplicatedSpace.verifyClaim applies it.
     ``holderKey`` is always the holder's 32-byte peer key and must hash to the
     claim's holder peer. Without a certificate the signature verifies under
     that key; with one, the certificate must verify under the peer key for
-    exactly the claim's holder at the claim's own stamp (not at ``now_ms``,
-    which only bounds how far ahead that stamp may run) and the signature
-    under the certificate's agent key. The entry and space bindings are the caller's."""
-    from .identity import derive_id, verify_agent_certificate
+    exactly the claim's holder at the claim's own stamp and the signature
+    under the certificate's agent key. Either signature covers the claim as it
+    travels, a TakeClaim in Java's field order (HLC round five, 2026-11-08,
+    decision E13), which a claim in any other form is not (HLC round six,
+    2026-11-08, owner ruling F3). How far the stamp may lead is the far-future
+    rule's to judge after verification, as for a peer-signed claim (HLC round
+    five, 2026-11-08, decision E4). The entry and space bindings are the caller's."""
     claim = signed.get("claim")
     holder_key = signed.get("holderKey")
     signature = signed.get("signature")
-    if (not isinstance(claim, dict) or not isinstance(holder_key, (bytes, bytearray))
-            or len(holder_key) != 32 or not isinstance(signature, (bytes, bytearray))):
+    if (not records.conforms(claim, "TakeClaim") or not isinstance(holder_key, bytes)
+            or len(holder_key) != 32 or not isinstance(signature, bytes)):
         return False
-    holder = claim.get("holder")
-    if not isinstance(holder, str) or not holder.startswith(derive_id(bytes(holder_key)) + "/"):
+    holder = claim["holder"]
+    if not isinstance(holder, str) or not holder.startswith(derive_id(holder_key) + "/"):
         return False
+    signed_bytes = cbor.dumps(claim)
     certificate = signed.get("holderCertificate")
     if certificate is None:
-        return Identity.verify(bytes(holder_key), cbor.dumps(claim), bytes(signature))
+        return Identity.verify(bytes(holder_key), signed_bytes, bytes(signature))
     try:
         stamped = hlc_physical(claim.get("stamp"))
     except (TypeError, ValueError):
         return False
     # v0.1.13: judged at the claim's own stamp, which a renewal keeps.
-    if not verify_agent_certificate_at(certificate, bytes(holder_key), holder, stamped, now_ms):
+    if not verify_agent_certificate_covering(certificate, bytes(holder_key), holder, stamped):
         return False
-    return Identity.verify(bytes(certificate["agentPublicKey"]), cbor.dumps(claim), bytes(signature))
+    return Identity.verify(bytes(certificate["agentPublicKey"]), signed_bytes, bytes(signature))
 
 
 def agent_card(group: str, identity: Identity, local_name: str, issued_iso: str,
@@ -763,21 +884,216 @@ def ui_declaration(components: list, reads: list | None = None, writes: list | N
             "entries": {"reads": list(reads or []), "writes": list(writes or [])}, "catalogIds": catalogs}
 
 
-def app_card_host(url: str, port: int = 0, host_agent: str = "", path: str = "/", sign_on: str = "tenant",
+# ------------------------------------------------------------- the AppCard
+#
+# SPEC §6.1a.2 to §6.1a.5 (v0.1.32; AppCard origin and formats, 2026-11-09). ``kind`` says how an app
+# connects and is closed; ``origin`` names the external system it came from and ``formats`` the
+# media types and vocabularies it reads or renders, both open values; no kind is tied to an origin.
+# ``records`` checks each rule at decode, and every builder here refuses what a reader refuses.
+
+#: How an app connects: ``peer``, the app is a member; ``fed``, an agent of the group feeds it;
+#: ``gateway``, it sits behind the A2A gateway; ``assembled``, a static app its publisher
+#: assembled from extracted data and serves as is, reading nothing live.
+APP_CARD_KINDS = ("peer", "fed", "gateway", "assembled")
+APP_CARD_SHAPES = ("web", "desktop", "static", "a2ui")
+APP_CARD_TRANSPORTS = ("views", "a2a")
+#: ``idp``, the identity provider of whoever runs the host, enforced at its door (the default), or ``none``.
+APP_CARD_SIGN_ONS = ("idp", "none")
+APP_CARD_STATUSES = ("serving", "stopped")
+APP_CARD_MAX_TERMS = 64
+APP_CARD_MAX_FORMATS = 16
+APP_CARD_MAX_FORMAT_LENGTH = 256
+UI_ROLES = ("panel", "control", "row")
+UI_MAX_COMPONENTS = 32
+
+#: The fields a stub moves into its parts document, in field order (SPEC §6.1a.5).
+APP_CARD_SPILL_SET = ("reads", "actions", "views", "ui")
+AGENT_CARD_SPILL_SET = ("actions", "ui")
+#: A card whose encoding is more than this many bytes spills: the inline limit of a payload.
+CARD_SPILL_THRESHOLD_BYTES = 65_536
+#: A publisher warns once a card's encoding passes this many bytes (56 KiB), just before it spills.
+CARD_SPILL_WARN_BYTES = 57_344
+#: The piece size of a parts document, so every implementation computes the same root for the same bytes.
+CARD_SPILL_PIECE_SIZE = 65_536
+#: The default bound on a parts document a reader fetches.
+CARD_SPILL_MAX_FETCH_BYTES = 16_777_216
+#: The largest ``spill.size``: 2^53 - 1, the largest integer every implementation holds exactly.
+CARD_SPILL_MAX_SIZE = (1 << 53) - 1
+#: The length of ``spill.root``.
+CARD_SPILL_ROOT_LENGTH = 59
+
+_APP_CARD_FIELDS = ("id", "issuer", "group", "issued", "ttl", "name", "kind", "shape", "owner", "reads", "actions",
+                    "idpClient", "url", "pkg", "version", "views", "ui", "host", "origin", "formats", "spill")
+_AGENT_CARD_FIELDS = ("id", "issuer", "group", "issued", "ttl", "agent", "description", "goals", "consumes",
+                      "produces", "costHints", "spaceBindings", "agentPublicKey", "actions", "agentCertificate",
+                      "ui", "spill")
+
+
+def _require(value: dict, record: str) -> dict:
+    if not records.conforms(value, record):
+        raise ValueError(f"not a valid {record} under SPEC §6.1a" + (f": {value['id']}" if "id" in value else ""))
+    return value
+
+
+def app_card(group: str, identity: Identity, app: str, issued_iso: str, ttl_iso: str = "PT15M", *,
+             name: str | None = None, kind: str = "fed", shape: str = "web", owner: str = "", reads=(), actions=(),
+             idp_client: str = "", url: str = "", pkg: str = "", version: str = "1", views=(), ui: dict | None = None,
+             host: dict | None = None, origin: dict | None = None, formats=None) -> dict:
+    """An AppCard in Java field order (SPEC §6.1a.2), its id ``aspace://<group>/app/<peer>/<app>``
+    and its name ``app`` unless given: ui, host, origin (``app_card_origin``), and formats
+    (normalised by ``app_card_formats``) are each omitted when absent, so a card without them
+    keeps its earlier bytes. The peer publishes it through ``Peer.publish_ad``, which applies
+    the AppCard level and the spill; a card the record refuses raises ``ValueError``."""
+    card = {"id": f"aspace://{group}/app/{identity.peer_id}/{app}", "issuer": identity.peer_id, "group": group,
+            "issued": issued_iso, "ttl": ttl_iso, "name": app if name is None else name, "kind": kind, "shape": shape,
+            "owner": owner, "reads": list(reads), "actions": list(actions), "idpClient": idp_client, "url": url,
+            "pkg": pkg, "version": version, "views": list(views)}
+    for field, value in (("ui", ui), ("host", host), ("origin", origin), ("formats", app_card_formats(formats))):
+        if value is not None:
+            card[field] = value
+    return _require(card, "AppCard")
+
+
+def app_card_host(url: str, port: int = 0, host_agent: str = "", path: str = "/", sign_on: str = "idp",
                   published_by: str = "", published_at_iso: str = "", status: str = "serving") -> dict:
     """The host group of a published AppCard in Java field order (SPEC §6.1a.4, v0.1.28):
-    url, port, hostAgent, path, signOn (tenant or none), publishedBy, publishedAt,
-    status (serving or stopped). Appended last on the card; a card without it keeps its bytes."""
+    url, port, hostAgent, path, signOn (idp or none, v0.1.32), publishedBy, publishedAt,
+    status (serving or stopped). Appended after ui; a card without it keeps its bytes."""
     if not url:
         raise ValueError("a host has a url")
     if port < 0 or port > 65535:
         raise ValueError("a host's port is 0 to 65535")
-    if sign_on not in ("tenant", "none"):
-        raise ValueError("a host's signOn is tenant or none")
-    if status not in ("serving", "stopped"):
+    if sign_on not in APP_CARD_SIGN_ONS:
+        raise ValueError("a host's signOn is idp or none")
+    if status not in APP_CARD_STATUSES:
         raise ValueError("a host's status is serving or stopped")
+    if not records.is_canonical_instant(published_at_iso):
+        raise ValueError("a host names when it was published, an Instant as Java prints it")
     return {"url": url, "port": port, "hostAgent": host_agent, "path": path or "/", "signOn": sign_on,
             "publishedBy": published_by, "publishedAt": published_at_iso, "status": status}
+
+
+def app_card_origin(system: str, ref: str, version: str | None = "", attrs: dict | None = None) -> dict:
+    """The origin group of an AppCard in Java field order (FR-2): system, ref, version (empty when
+    the system names none), and attrs in the SPEC §9.1 order of a map, omitted when empty. A
+    registered system is a token such as ``realm``; an unregistered one is a reverse-DNS name its
+    owner controls (``agentspaces-spec/REGISTRY.md``)."""
+    origin = {"system": system, "ref": ref, "version": "" if version is None else version}
+    if attrs:
+        origin["attrs"] = cbor.canonical_map({str(k): str(v) for k, v in attrs.items()})
+    return _require(origin, "AppCard.Origin")
+
+
+def app_card_formats(formats) -> list | None:
+    """``formats`` as the issuer writes it (FR-3): media types lower-cased, a repeated entry
+    dropped after its first occurrence, the issuer's order kept, and an empty list absent."""
+    if not formats:
+        return None
+    normalised = list(dict.fromkeys(f if ":" in f else f.lower() for f in formats))
+    if not records.formats_hold(normalised):
+        raise ValueError(f"formats holds 1 to {APP_CARD_MAX_FORMATS} media types or vocabulary IRIs: {formats!r}")
+    return normalised
+
+
+def from_origin(card: dict, system: str, ref: str | None = None) -> bool:
+    """Whether an AppCard came from ``system`` (FR-8), and under ``ref`` when given: a ref ending
+    in ``/*`` matches every ref that starts with the part before ``*``. A stub keeps its origin."""
+    origin = card.get("origin")
+    if origin is None or origin.get("system") != system:
+        return False
+    if ref is None:
+        return True
+    return origin["ref"].startswith(ref[:-1]) if ref.endswith("/*") else origin["ref"] == ref
+
+
+def handles(card: dict, format: str) -> bool:
+    """Whether an AppCard reads or renders ``format`` (FR-8): a media type is lower-cased and
+    matches an entry exactly, ``type/*`` matches every media type of that type, and a
+    vocabulary IRI matches exactly."""
+    formats = card.get("formats")
+    if not formats or format is None:
+        return False
+    if ":" in format:
+        return format in formats
+    wanted = format.lower()
+    if wanted.endswith("/*"):
+        return any(":" not in f and f.startswith(wanted[:-1]) for f in formats)
+    return wanted in formats
+
+
+def app_card_for_view(card: dict, gate_open: bool) -> dict:
+    """The AppCard a view may receive (FR-7): the card itself while every member reads the
+    v0.1.32 fields, and otherwise the card without origin, formats, and a host whose signOn is
+    ``idp``. A host of signOn ``none`` reads at level 1 and stays."""
+    if "spill" in card:
+        raise ValueError("the gate applies to a full card; a stub exists only behind an open gate")
+    if gate_open:
+        return card
+    stripped = {k: v for k, v in card.items() if k not in ("origin", "formats")}
+    if (card.get("host") or {}).get("signOn") == "idp":
+        del stripped["host"]
+    return stripped
+
+
+# ------------------------------------------------------------- the card spill
+
+def card_spill(root: str, size: int, parts) -> dict:
+    """The CardSpill a stub carries (SPEC §6.1a.5): the parts document's content root, its
+    length, and the non-empty spill-set fields it holds."""
+    return _require({"root": root, "size": size, "parts": list(parts)}, "CardSpill")
+
+
+def _is_agent_card(card: dict) -> bool:
+    return "agent" in card
+
+
+def card_parts(card: dict) -> dict:
+    """The parts record of a full AppCard or AgentCard: the full values of its spill set, what
+    a publisher writes as the parts document (``AppCard.Parts`` or ``AgentCard.Parts``)."""
+    if "spill" in card:
+        raise ValueError("a stub's parts are in its spill document; resolve the card first")
+    if _is_agent_card(card):
+        return {field: card[field] for field in AGENT_CARD_SPILL_SET if card.get(field) is not None}
+    parts = {"reads": list(card["reads"]), "actions": list(card["actions"]), "views": list(card["views"])}
+    if card.get("ui") is not None:
+        parts["ui"] = card["ui"]
+    return parts
+
+
+def non_empty_parts(parts: dict) -> list:
+    """The names of a parts record's non-empty fields, in field order: what ``spill.parts`` lists."""
+    return [field for field in (APP_CARD_SPILL_SET if "reads" in parts else AGENT_CARD_SPILL_SET)
+            if parts.get(field) not in (None, [])]
+
+
+def _ordered(card: dict, fields: tuple) -> dict:
+    return {field: card[field] for field in fields if field in card}
+
+
+def card_stub(card: dict, spill: dict) -> dict:
+    """The stub of a full card (SPEC §6.1a.5): every spill-set field at its placeholder (``[]``
+    for the AppCard's lists, absent for the optional fields) and ``spill`` appended."""
+    named = non_empty_parts(card_parts(card))
+    if list(spill["parts"]) != named:
+        raise ValueError(f"a stub moves every non-empty part {named}: {spill['parts']}")
+    if _is_agent_card(card):
+        stub = {k: v for k, v in card.items() if k not in AGENT_CARD_SPILL_SET}
+        return _ordered({**stub, "spill": spill}, _AGENT_CARD_FIELDS)
+    stub = {k: v for k, v in card.items() if k != "ui"}
+    stub.update(reads=[], actions=[], views=[], spill=spill)
+    return _ordered(stub, _APP_CARD_FIELDS)
+
+
+def card_complete(stub: dict, parts: dict) -> dict:
+    """The full card of a stub (FR-15): the parts document's values in place and no ``spill``."""
+    spill = stub.get("spill")
+    if spill is None:
+        raise ValueError("only a stub completes; this card carries its parts inline")
+    if non_empty_parts(parts) != list(spill["parts"]):
+        raise ValueError(f"the parts document holds {non_empty_parts(parts)} where the stub names {spill['parts']}")
+    full = {k: v for k, v in stub.items() if k != "spill"}
+    full.update(parts)
+    return _ordered(full, _AGENT_CARD_FIELDS if _is_agent_card(stub) else _APP_CARD_FIELDS)
 
 
 def ui_component(id: str, catalog_id: str, component: str, entry: str = "", controls: list | None = None,
@@ -810,10 +1126,13 @@ def claim_sort_key(claim: dict) -> tuple:
     """The claim lattice's total order (spec §7.4): the SMALLEST key wins.
     Epoch descending, bid ascending, HLC stamp ascending, holder ascending,
     expiry descending; identical to TakeClaim.merge on the Java side, which compares
-    the stamp's node and the holder by UTF-16 code units (HLC canonical stamps, 2026-11-08)."""
-    return (-int(claim.get("epoch", 0)), float(claim.get("bid", 0.0)),
-            hlc_tuple(claim.get("stamp")), utf16_order(claim.get("holder", "")),
-            -int(claim.get("expiresAtMillis", 0)))
+    the stamp's node and the holder by UTF-16 code units (HLC canonical stamps, 2026-11-08),
+    and the bids as Double.compare orders them, -0.0 below 0.0 (HLC round six, 2026-11-08,
+    vector claim-20)."""
+    bid = claim["bid"]
+    return (-int(claim["epoch"]), (bid, math.copysign(1.0, bid)),
+            hlc_tuple(claim["stamp"]), utf16_order(claim["holder"]),
+            -int(claim["expiresAtMillis"]))
 
 
 def merge_claims(a: dict, b: dict) -> dict:

@@ -382,6 +382,8 @@ def test_the_peer_refuses_and_counts_a_state_whose_signed_at_is_not_a_stamp_with
     receiver = _peer(clock)
     receiver._fold(odd)
     # HLC logical counter, 2026-11-08 (Rust team report): Java's HlcTimestamp.parse
-    # refuses the signing stamp, and this peer refuses the state with it.
+    # refuses the signing stamp, and this peer refuses the state with it. On the wire the
+    # delta never decodes (HLC round four, 2026-11-08, decision D3); folded directly, the
+    # merge point refuses the verified state and counts it.
     assert receiver.states == {}
-    assert receiver.refused_stamps["states"] == 1
+    assert receiver.stamps_logical_refused == 1

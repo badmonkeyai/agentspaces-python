@@ -188,7 +188,7 @@ def test_a_claim_command_carries_the_holders_proof_in_record_order():
     assert list(command) == ["entryId", "claim", "holderKey", "signature", "holderCertificate"]
     assert wire.verify_claim_proof({"claim": command["claim"], "holderKey": command["holderKey"],
                                     "signature": command["signature"],
-                                    "holderCertificate": command["holderCertificate"]}, now_ms + 1_000)
+                                    "holderCertificate": command["holderCertificate"]})
 
 
 # ------------------------------------------------------------ the client

@@ -56,7 +56,7 @@ def test_stale_and_far_ahead_frames_are_dropped_quietly():
     peer._handle(frame(other, "PING", wire.ping_body(2), peer.identity.peer_id,
                        stamp(now + wire.MAX_HLC_SKEW_MILLIS + 60_000)))
     assert peer.sent == []
-    assert peer.frames.stale == 1 and peer.frames.ahead == 1
+    assert peer.frames.stale == 1 and peer.frames.far_future == 1
     # Within the bounds either way, answered.
     peer._handle(frame(other, "PING", wire.ping_body(3), peer.identity.peer_id,
                        stamp(now - wire.MAX_FRAME_AGE_MILLIS // 2)))

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Callable, Iterator
 
-from . import cids, nodes, values
+from . import nodes, values
 from .nodes import NodeFormatError
 from .values import Ctx, Flusher, StoreLoader, TreeNode
 
@@ -530,6 +530,13 @@ class PMap:
                 continue
             if _same_outcome(my[1], after):
                 continue
+            if my[1] is not None and after is not None:
+                # PDT 2 phase 7, P2-T-03: a key both sides changed to texts takes their union, raising no conflict;
+                # two texts that disagree on a character, or a union past the node bound, go to the resolver
+                merged = _text_union(values.resolve(my[1], self.ctx()), values.resolve(after, theirs.ctx()))
+                if merged is not None:
+                    out = out.assoc_raw(kb, merged)
+                    continue
             key = values.decode_value(kb)
             b = None if before is None else values.decode_value(values.resolve(before, base.ctx()))
             m = None if my[1] is None else values.decode_value(values.resolve(my[1], self.ctx()))
@@ -548,6 +555,11 @@ class PMap:
 
     def __repr__(self) -> str:
         return f"PMap[{self.count()} entries]"
+
+
+def _text_union(mine: bytes, theirs: bytes) -> bytes | None:
+    from .text import is_text, union
+    return union(mine, theirs) if is_text(mine) and is_text(theirs) else None
 
 
 def _same_outcome(a, b) -> bool:

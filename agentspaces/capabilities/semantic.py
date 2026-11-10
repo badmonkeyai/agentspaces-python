@@ -24,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .. import cbor
+from .. import cbor, records
 
 TYPE = "aspace:cap/semantic-discovery"
 MIN_SCORE = 0.2
@@ -87,7 +87,14 @@ def text_of(ad_type: str, ad: dict) -> str:
         return f"{ad.get('name', '')} {ad.get('version', '')} {' '.join(ad.get('tasks') or [])} " \
                f"{ad.get('modality', '')} {ad.get('engine', '')} {ad.get('licence', '')}"
     if ad_type == "AppCard":
-        return f"{ad.get('name', '')} {ad.get('kind', '')} {ad.get('shape', '')} {ad.get('owner', '')} {ad.get('url', '')}"
+        # SPEC §6.1a.2 v0.1.32 (AppCard origin and formats, 2026-11-09): the inline fields, which a stub keeps
+        text = f"{ad.get('name', '')} {ad.get('kind', '')} {ad.get('shape', '')} {ad.get('owner', '')} {ad.get('url', '')}"
+        origin = ad.get("origin")
+        if origin is not None:
+            text += f" {origin.get('system', '')} {origin.get('ref', '')}"
+        if ad.get("formats") is not None:
+            text += " " + " ".join(ad["formats"])
+        return text
     if ad_type == "CapabilityAdvertisement":
         return f"{ad.get('capabilityType', '')} {ad.get('binding', '')} {ad.get('parameters', {})}"
     if ad_type == "SpaceAdvertisement":
@@ -150,19 +157,18 @@ class Semantic:
         return self.query(text, limit)
 
     def _on_frame(self, sender: str, payload: bytes) -> None:
-        try:
-            frame = cbor.loads(payload)
-        except ValueError:
+        # HLC round seven, 2026-11-08: a query, else a response, as Java's fromWire reads each
+        # under its annex I schema and the canonical-bytes rule; anything else is dropped
+        query = records.decode(payload, "SemanticDiscovery.SemQuery")
+        if query is not None and query["text"] is not None:
+            self._answer(sender, query)
             return
-        if not isinstance(frame, dict):
-            return
-        if isinstance(frame.get("text"), str):
-            self._answer(sender, frame)
-        elif isinstance(frame.get("hits"), list):
-            for hit in frame["hits"]:
-                if isinstance(hit, dict) and hit.get("adType"):
+        response = records.decode(payload, "SemanticDiscovery.SemResponse")
+        if response is not None and response["hits"] is not None:
+            for hit in response["hits"]:
+                if hit.get("adType"):
                     self.peer.accept_ad(hit)
-            event = self._pending.get(int(frame.get("nonce", -1)))
+            event = self._pending.get(response["nonce"])
             if event is not None:
                 event.set()
 
@@ -177,7 +183,7 @@ class Semantic:
             if score >= MIN_SCORE:
                 scored.append((score, entry["stored"]))
         scored.sort(key=lambda s: -s[0])
-        limit = max(1, min(int(query.get("limit", 10)), 16))
+        limit = max(1, min(query["limit"], 16))
         hits = [{"adType": st["adType"], "adBytes": st["adBytes"], "publicKey": st["publicKey"],
                  "signature": st["signature"]} for _, st in scored[:limit]]
-        self.pipes.send(sender, TYPE, cbor.dumps({"nonce": query.get("nonce", 0), "hits": hits}))
+        self.pipes.send(sender, TYPE, cbor.dumps({"nonce": query["nonce"], "hits": hits}))

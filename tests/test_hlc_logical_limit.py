@@ -29,8 +29,13 @@ clamps a remote physical at wall + MAX_DRIFT - 1, so a carry after merging lands
 at wall + MAX_DRIFT, where a receiver's far-future check still admits it.
 
 Round three (HLC canonical stamps, 2026-11-08) narrows the grammar to one spelling per
-stamp, judges a signing stamp by the grammar alone, and counts a refusal after
-verification once per distinct state or claim; test_hlc_canonical_stamps.py pins it."""
+stamp and counts a refusal after verification once per distinct state or claim;
+test_hlc_canonical_stamps.py pins it. Round four (HLC round four, 2026-11-08) judges a
+signing stamp like every other stamp, makes a space delta holding a stamp outside the
+grammar undecodable, as Java's codec makes it, and counts under the Java node's names;
+test_hlc_round_four.py pins it. Here a counter above the limit is refused after
+verification (``stampsLogicalRefused``), and malformed text never decodes
+(``deltasUndecodable``)."""
 
 import pytest
 
@@ -239,7 +244,7 @@ def test_the_clock_clamps_a_remote_physical_one_millisecond_inside_the_drift_cap
     # A receiver at the same wall time admits it: its far-future check is strictly greater.
     receiver = wire.FrameFilter()
     assert receiver.admit({"from": node, "stamp": carried}, T)
-    assert receiver.ahead == 0
+    assert receiver.far_future == 0
     # Far past the cap the clamp holds too.
     far = _node()
     wire.hlc_observe(far, f"{LONG_MAX}:{LIMIT}:remote", T)
@@ -261,7 +266,11 @@ def test_an_honest_frame_at_the_cap_leaves_the_receiver_admissible_to_its_peers(
 # (c) frames, end to end through the frame handler ---------------------------------------
 
 def _hostile_ping(peer: CapturingPeer, other: Identity, stamp: str, nonce: int = 1) -> None:
-    peer._handle(_frame(other, "PING", wire.ping_body(nonce), peer.identity.peer_id, stamp))
+    """A PING signed by ``other`` and stamped ``stamp``, off the connection: a stamp outside
+    the grammar never decodes, so the frame counts as malformed before its signature is
+    checked (HLC round five, 2026-11-08, decision E9)."""
+    env = wire.envelope(GROUP, "PING", other.peer_id, stamp, wire.ping_body(nonce), peer.identity.peer_id)
+    peer._receive(wire.encode_frame(env, other))
 
 
 def test_the_peer_drops_counts_and_keeps_off_its_clock_a_frame_stamped_above_the_limit():
@@ -269,13 +278,13 @@ def test_the_peer_drops_counts_and_keeps_off_its_clock_a_frame_stamped_above_the
     other = Identity.generate()
     _hostile_ping(peer, other, f"{T + DRIFT - 1}:{JAVA_INT_MAX}:{other.peer_id}")
     assert peer.sent == [], "a frame carrying a hostile counter earns no ACK"
-    assert peer.frames.logical_over_limit == 1
+    assert peer.frames.logical_refused == 1
     assert other.peer_id not in peer.members and other.peer_id not in peer.reachable
     assert wire.hlc_now(peer.identity.peer_id, T) == f"{T}:0:{peer.identity.peer_id}"
     # The honest path: a counter at exactly the limit is a frame like any other.
     _hostile_ping(peer, other, f"{T}:{LIMIT}:{other.peer_id}", 2)
     assert [kind for kind, _, _ in peer.sent] == ["ACK"]
-    assert peer.frames.logical_over_limit == 1
+    assert peer.frames.logical_refused == 1
     assert wire.hlc_now(peer.identity.peer_id, T) == f"{T + 1}:0:{peer.identity.peer_id}"
 
 
@@ -285,7 +294,7 @@ def test_the_peer_drops_and_counts_a_frame_with_a_malformed_counter(name):
     other = Identity.generate()
     _hostile_ping(peer, other, f"{T + 5}:{HOSTILE_COUNTERS[name]}:{other.peer_id}")
     assert peer.sent == []
-    assert peer.frames.malformed_stamps == 1
+    assert peer.malformed_frames == 1
     assert other.peer_id not in peer.members
     assert wire.hlc_now(peer.identity.peer_id, T) == f"{T}:0:{peer.identity.peer_id}"
     _hostile_ping(peer, other, f"{T}:0:{other.peer_id}", 2)
@@ -298,7 +307,7 @@ def test_the_peer_drops_and_counts_a_frame_with_a_malformed_physical(name):
     other = Identity.generate()
     _hostile_ping(peer, other, f"{HOSTILE_PHYSICALS[name].format(t=T)}:0:{other.peer_id}")
     assert peer.sent == []
-    assert peer.frames.malformed_stamps == 1
+    assert peer.malformed_frames == 1
     assert wire.hlc_now(peer.identity.peer_id, T) == f"{T}:0:{peer.identity.peer_id}"
 
 
@@ -308,7 +317,7 @@ def test_the_peer_drops_and_counts_a_frame_without_a_node_part():
     _hostile_ping(peer, other, f"{T}:0:")
     _hostile_ping(peer, other, f"{T}:0", 2)
     assert peer.sent == []
-    assert peer.frames.malformed_stamps == 2
+    assert peer.malformed_frames == 2
 
 
 def test_a_stamp_has_one_spelling_so_a_respelled_replay_is_malformed():
@@ -319,7 +328,7 @@ def test_a_stamp_has_one_spelling_so_a_respelled_replay_is_malformed():
     # leading zeros, which the canonical grammar refuses before the replay filter.
     _hostile_ping(peer, other, f"{T}:007:{other.peer_id}", 2)
     assert [kind for kind, _, _ in peer.sent] == ["ACK"]
-    assert (peer.frames.malformed_stamps, peer.frames.replayed) == (1, 0)
+    assert (peer.malformed_frames, peer.frames.replayed) == (1, 0)
 
 
 # (d) folded states and claims, end to end through RUMOR and PULL_RESP -------------------
@@ -329,21 +338,31 @@ def _receiver_of(host: Identity) -> tuple:
     return receiver, Wire(host, receiver)
 
 
-@pytest.mark.parametrize("counter", [str(JAVA_INT_MAX), "-1", "1.5", ""])
-def test_the_peer_refuses_and_counts_a_rumored_record_with_a_refused_issue_stamp(counter):
+def _counted(peer: Peer) -> dict:
+    return {name: value for name, value in peer.counters().items() if value}
+
+
+# A counter above the limit decodes, verifies and is refused (HLC round four, 2026-11-08,
+# decision D5); text outside the grammar makes the delta undecodable (decision D3).
+REFUSED_COUNTERS = [(str(JAVA_INT_MAX), "stampsLogicalRefused"), ("-1", "deltasUndecodable"),
+                    ("1.5", "deltasUndecodable"), ("", "deltasUndecodable")]
+
+
+@pytest.mark.parametrize("counter,counted", REFUSED_COUNTERS)
+def test_the_peer_refuses_and_counts_a_rumored_record_with_a_refused_issue_stamp(counter, counted):
     host = Identity.generate()
     honest = _write(host, T)
     receiver, link = _receiver_of(host)
     link.rumor(_with_issued(honest, host, f"{T}:{counter}:{host.agent('w')}"))
     assert receiver.states == {}
-    assert receiver.refused_stamps["states"] == 1
+    assert _counted(receiver) == {counted: 1}
     link.rumor(_with_issued(honest, host, f"{T}:{LIMIT}:{host.agent('w')}"))
     assert set(receiver.states) == {honest["record"]["entryId"]}
-    assert receiver.refused_stamps["states"] == 1
+    assert _counted(receiver) == {counted: 1}
 
 
-@pytest.mark.parametrize("counter", [str(JAVA_INT_MAX), "-1", "1.5", ""])
-def test_the_peer_refuses_and_counts_a_rumored_lease_stamp_the_rule_refuses(counter):
+@pytest.mark.parametrize("counter,counted", REFUSED_COUNTERS)
+def test_the_peer_refuses_and_counts_a_rumored_lease_stamp_the_rule_refuses(counter, counted):
     host = Identity.generate()
     write = _write(host, T)
     entry_id = write["record"]["entryId"]
@@ -352,7 +371,7 @@ def test_the_peer_refuses_and_counts_a_rumored_lease_stamp_the_rule_refuses(coun
     hostile = _with_lease_stamp(write, host, f"{T + 1}:{counter}:{host.agent('w')}", T)
     link.rumor(hostile)
     assert receiver.states[entry_id]["leaseStamp"] == write["leaseStamp"]
-    assert receiver.refused_stamps["states"] == 1
+    assert _counted(receiver) == {counted: 1}
     # The honest renewal at exactly the limit extends the lease.
     renewed = _with_lease_stamp(write, host, f"{T + 1}:{LIMIT}:{host.agent('w')}", T)
     link.rumor(renewed)
@@ -364,29 +383,32 @@ def test_the_peer_drops_a_rumored_agent_state_whose_signing_stamp_does_not_parse
     agent = host.renewing_subordinate("w", "PT24H", clock=_at(T))
     write = _write(host, T, agent=agent)
     receiver, link = _receiver_of(host)
-    # HLC canonical stamps, 2026-11-08: the certificate is judged at the signing time, so
-    # the state does not verify, and the peer counts only verified refusals.
+    # HLC round four, 2026-11-08 (decision D3): a signing stamp outside the grammar does not
+    # decode, so the delta carrying it is undecodable before any signature check.
     link.rumor(_with_signed_at(write, agent, f"{T}:-1:{agent.agent_id}"))
     assert receiver.states == {}
-    assert receiver.refused_stamps["states"] == 0
+    assert _counted(receiver) == {"deltasUndecodable": 1}
     link.rumor(_with_signed_at(write, agent, f"{T}:{LIMIT}:{agent.agent_id}"))
     assert set(receiver.states) == {write["record"]["entryId"]}
 
 
-def test_a_lease_without_a_stamp_joins_a_later_renewal():
+def test_a_lease_without_a_stamp_merges_nothing_until_a_renewal_carries_one():
+    # HLC round five, 2026-11-08 (decision E7): the state decodes, and the peer drops it before
+    # any judgement, as Java's mergeState does; the renewal that carries a stamp merges.
     host = Identity.generate()
     write = _with_lease_stamp(_write(host, T), host, None, T)
     entry_id = write["record"]["entryId"]
     receiver, link = _receiver_of(host)
     link.rumor(write)
-    assert receiver.states[entry_id]["leaseStamp"] is None
+    assert receiver.states == {} and _counted(receiver) == {}
     renewed = _with_lease_stamp(write, host, f"{T + 1}:0:{host.agent('w')}", T)
     link.rumor(renewed)
     assert receiver.states[entry_id]["leaseStamp"] == renewed["leaseStamp"]
 
 
-@pytest.mark.parametrize("counter", [str(JAVA_INT_MAX), "-1", "1.5", "", "1e3", "x"])
-def test_the_peer_refuses_and_counts_a_rumored_claim_the_rule_refuses(counter):
+@pytest.mark.parametrize("counter,counted", REFUSED_COUNTERS + [("1e3", "deltasUndecodable"),
+                                                                   ("x", "deltasUndecodable")])
+def test_the_peer_refuses_and_counts_a_rumored_claim_the_rule_refuses(counter, counted):
     host = Identity.generate()
     write = _write(host, T)
     entry_id = write["record"]["entryId"]
@@ -394,7 +416,7 @@ def test_the_peer_refuses_and_counts_a_rumored_claim_the_rule_refuses(counter):
     link.rumor(write)
     link.rumor(claim=(entry_id, _claim(write, host, f"{T}:{counter}:{host.agent('w')}", T)))
     assert receiver.claims == {}
-    assert receiver.refused_stamps["claims"] == 1
+    assert _counted(receiver) == {counted: 1}
     # Every later honest claim on the entry still folds: the hostile one left nothing behind.
     honest = _claim(write, host, f"{T}:{LIMIT}:{host.agent('w')}", T)
     link.rumor(claim=(entry_id, honest))
@@ -405,26 +427,37 @@ def test_the_peer_refuses_and_counts_a_hostile_state_and_claim_in_a_pull_respons
     host = Identity.generate()
     write = _write(host, T)
     entry_id = write["record"]["entryId"]
-    hostile_state = _with_issued(_write(host, T), host, f"{T}:-5:{host.agent('w')}")
-    hostile_claim = _claim(write, host, f"{T}.25:0:{host.agent('w')}", T)
+    hostile_state = _with_issued(_write(host, T), host, f"{T}:{LIMIT + 1}:{host.agent('w')}")
+    hostile_claim = _claim(write, host, f"{T}:{JAVA_INT_MAX}:{host.agent('w')}", T)
     receiver, link = _receiver_of(host)
     link.pull_resp([write, hostile_state], {entry_id: hostile_claim})
     assert set(receiver.states) == {entry_id}
     assert receiver.claims == {}
-    assert receiver.refused_stamps == {"states": 1, "claims": 1}
+    assert _counted(receiver) == {"stampsLogicalRefused": 2}
+    # One stamp outside the grammar makes the whole SyncDelta undecodable, as in Java.
+    malformed = _with_issued(_write(host, T), host, f"{T}:-5:{host.agent('w')}")
+    link.pull_resp([_write(host, T), malformed], {entry_id: _claim(write, host, f"{T}.25:0:{host.agent('w')}", T)})
+    assert set(receiver.states) == {entry_id}
+    assert _counted(receiver) == {"stampsLogicalRefused": 2, "deltasUndecodable": 1}
     honest = _claim(write, host, f"{T}:0:{host.agent('w')}", T)
     link.pull_resp([], {entry_id: honest})
     assert receiver.claims[entry_id] == honest
-    assert wire.hlc_now(receiver.identity.peer_id, T) == f"{T}:{3}:{receiver.identity.peer_id}"
+    assert wire.hlc_now(receiver.identity.peer_id, T) == f"{T}:{4}:{receiver.identity.peer_id}"
 
 
 # (e) the PDT head order ------------------------------------------------------------------
 
 def test_the_pdt_head_order_reads_an_advisory_issue_stamp_as_java_refs_does():
     from agentspaces.pdt import refs
-    # Refs.java reads pdt.issued with HlcTimestamp.parse and keeps the entry's own stamp
-    # when it fails; the (0, 0, "") answer is that fallback's signal.
+    # Refs.java keeps the entry's own stamp and issuer when pdt.issued is not acceptable
+    # (HLC round four, 2026-11-08, decision D2): text outside the grammar, or a counter above
+    # the limit.
+    own = ((T, 0, "n"), "zPeer/w")
+
+    def order(stamp):
+        return refs.head_order(f"{T}:0:n", "zPeer/w", {refs.ISSUED_ATTR: stamp, refs.ISSUER_ATTR: "zOther/w"}, T)
     for name, counter in HOSTILE_COUNTERS.items():
-        assert refs._hlc(f"{T}:{counter}:n") == (0, 0, ""), name
-    assert refs._hlc(f"{T}.5:0:n") == (0, 0, "")
-    assert refs._hlc(f"{T}:{JAVA_INT_MAX}:n") == (T, JAVA_INT_MAX, "n")
+        assert order(f"{T - 1}:{counter}:n") == own, name
+    assert order(f"{T - 1}.5:0:n") == own
+    assert order(f"{T - 1}:{LIMIT + 1}:n") == own
+    assert order(f"{T - 1}:{LIMIT}:n") == ((T - 1, LIMIT, "n"), "zOther/w")

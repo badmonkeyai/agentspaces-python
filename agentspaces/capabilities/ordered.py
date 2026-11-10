@@ -31,7 +31,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from .. import cbor, wire
+from .. import cbor, records, wire
 from ..identity import parse_instant_millis, space_id_local
 
 TYPE = "aspace:cap/ordered-log"  # RaftLog.TYPE
@@ -81,14 +81,13 @@ def claim_command(entry_id: str, claim: dict, peer_public_raw: bytes, signature:
 
 def parse_frame(payload: bytes) -> dict | None:
     """The Frame a member received, as a dict of the present fields, or None
-    when malformed: what a test voter (or a future Python voter) dispatches on."""
-    try:
-        frame = cbor.loads(payload)
-    except ValueError:
+    when it is no RaftMessages.Frame in the wire encoding, as Java's fromWire
+    reads one (HLC round seven, 2026-11-08): what a test voter (or a future
+    Python voter) dispatches on."""
+    frame = records.decode(payload, "RaftMessages.Frame")
+    if frame is None:
         return None
-    if not isinstance(frame, dict):
-        return None
-    return {k: v for k, v in frame.items() if k in _FRAME_FIELDS and v is not None}
+    return {k: v for k, v in frame.items() if v is not None}
 
 
 class OrderedLog:

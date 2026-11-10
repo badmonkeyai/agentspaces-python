@@ -48,12 +48,22 @@ class Raw:
 
 
 def encode_value(value) -> bytes:
+    from .text import PText, to_wire
     if isinstance(value, Raw):
         return value.bytes
+    if isinstance(value, PText):
+        return to_wire(value.leaf())  # PDT 2 phase 7, P2-T-02: a text travels in its value form
     return cbor.dumps(value)
 
 
 def decode_value(data: bytes):
+    """A value's CBOR as Python data; a text in its value form reads as a ``PText`` with no replica (P2-T-02)."""
+    from .text import TEXT_PREFIX, PText, from_wire
+    if data.startswith(TEXT_PREFIX):
+        try:
+            return PText.of(from_wire(data))
+        except ValueError:
+            pass  # an indefinite map that only starts like a text
     return cbor.loads(data)
 
 
@@ -77,11 +87,13 @@ class StoreLoader:
 
 
 class Ctx:
-    """The loader and hasher a value operation runs under."""
+    """The loader and hasher a value operation runs under. A level-one context writes and reads level-1 kinds only, so
+    a text spills as any other map does (PDT 2 phase 7; §6.10.3, rule 7: every member reads an escalated payload)."""
 
-    def __init__(self, loader, store=None):
+    def __init__(self, loader, store=None, level_one: bool = False):
         self.loader = loader
         self.store = store
+        self.level_one = level_one
 
     def load(self, cid: str) -> bytes:
         return self.loader.load(cid)
@@ -151,6 +163,24 @@ class XNode(TreeNode):
         return x
 
 
+class TextNode(TreeNode):
+    """A text value held out of line, kind ``t`` (PDT 2 phase 7, P2-T-02): a value in the text form above 1 KiB spills
+    to a node holding the canonical bytes of the same leaf, and reads back as the value it was. The node bytes are
+    made at once, so a text whose node would pass the 1 MiB node bound is refused on its way into a map or a vector,
+    as an ``x`` value of that size is (the phase 6 review's T1)."""
+
+    def __init__(self, value: bytes):
+        from .text import from_wire
+        self.value = value
+        try:
+            self.node = from_wire(value).encode()
+        except NodeFormatError as too_large:
+            raise ValueError(f"a text value whose t node exceeds the 1 MiB node bound (PD-N-04): {too_large}") from None
+
+    def encode(self, flusher: Flusher) -> bytes:
+        return self.node
+
+
 class BlobNode(TreeNode):
     """A spilled byte string: the blob tree of §3.3 over its content."""
 
@@ -200,6 +230,8 @@ def same_value(a, b) -> bool:
         return a.value == b.value
     if isinstance(a, BlobNode) and isinstance(b, BlobNode):
         return a.content == b.content
+    if isinstance(a, TextNode) and isinstance(b, TextNode):
+        return a.value == b.value
     if isinstance(a, str) and isinstance(b, str):
         return a == b
     return False
@@ -232,6 +264,10 @@ def spill(item: bytes, ctx: Ctx):
                          "a link item in a value slot names a spilled node (PD-N-05); hold a CID as text")
     if len(item) <= VALUE_LIMIT:
         return item
+    if not ctx.level_one:
+        from .text import is_text
+        if is_text(item):
+            return TextNode(item)
     major, info = item[0] >> 5, item[0] & 0x1F
     if len(item) > TREE_LIMIT:
         if major == 5 and info == 31:
@@ -349,6 +385,8 @@ def resolve(ref, ctx: Ctx, depth: int = 0) -> bytes:
         return ref
     if isinstance(ref, BlobNode):
         return byte_string(ref.content)
+    if isinstance(ref, TextNode):
+        return ref.value
     if depth > nodes.MAX_DEPTH:
         raise NodeFormatError(f"spilled values nested deeper than {nodes.MAX_DEPTH} levels", cid_of(ref))
     if isinstance(ref, XNode):
@@ -373,6 +411,12 @@ def resolve(ref, ctx: Ctx, depth: int = 0) -> bytes:
         return _reassemble_array(VecRoot.decode(cid, data), ctx, depth)
     if kind == nodes.KIND_B:
         return byte_string(read_blob(cid, data, ctx))
+    if kind == nodes.KIND_T:
+        if ctx.level_one:
+            raise NodeFormatError("a level-one tree holds no text node (rule 7)", cid)
+        from .kinds import TextLeaf
+        from .text import to_wire
+        return to_wire(TextLeaf.decode(cid, data))
     raise NodeFormatError(f"a spilled value cannot be a node of kind '{kind}'", cid)
 
 
@@ -470,7 +514,7 @@ def write_payload(item: bytes, store) -> tuple[str, dict[str, bytes]]:
     envelope, so a root is always a dag-cbor node. Returns the root and the nodes written."""
     if not item:
         raise ValueError("an empty payload is not a CBOR item")
-    ctx = Ctx(StoreLoader(store), store)
+    ctx = Ctx(StoreLoader(store), store, level_one=True)
     spilled = spill(item, ctx)
     if isinstance(spilled, bytes):
         root = XNode(spilled)

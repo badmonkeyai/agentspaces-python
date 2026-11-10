@@ -23,12 +23,14 @@ then the larger SHA-256 of the signed bytes."""
 
 import hashlib
 
-from . import cbor
+from . import records
 from .identity import Identity, derive_id, parse_instant_millis
 
 PEER_STREAM = "revocations"
 CREDENTIAL_STREAM = "credential-revocations"
 STREAMS = (PEER_STREAM, CREDENTIAL_STREAM)
+# The advertisement record each stream carries.
+_AD_RECORDS = {PEER_STREAM: "RevocationAdvertisement", CREDENTIAL_STREAM: "CredentialRevocation"}
 
 KEY_COMPROMISE = "key-compromise"
 REASONS = (KEY_COMPROMISE, "retired", "superseded", "privilege-withdrawn", "unspecified")
@@ -85,38 +87,41 @@ class Registry:
 
     def accept(self, stream: str, payload, now_ms: int) -> bool:
         """Verifies and accepts one rumor payload (a CBOR SignedRevocation)."""
-        try:
-            signed = cbor.loads(bytes(payload))
-        except (ValueError, IndexError, TypeError, UnicodeDecodeError):
-            return False
-        return self.accept_signed(stream, signed, now_ms)
+        signed = records.load_canonical(payload)
+        return signed is not None and self.accept_signed(stream, signed, now_ms)
+
+    def accept_delta(self, stream: str, delta, now_ms: int) -> None:
+        """Verifies and accepts each SignedRevocation of an anti-entropy delta (Java's
+        ``SignedRevocation[]``); a delta outside the wire encoding accepts nothing (HLC round
+        six, 2026-11-08, owner ruling F3)."""
+        signed_list = records.load_canonical(delta)
+        for signed in signed_list if isinstance(signed_list, list) else []:
+            self.accept_signed(stream, signed, now_ms)
 
     def accept_signed(self, stream: str, signed, now_ms: int) -> bool:
         """Verifies and accepts one decoded SignedRevocation {adBytes,
-        publicKey, signature}; returns whether it newly revoked its target."""
-        if not isinstance(signed, dict):
+        publicKey, signature}; returns whether it newly revoked its target. The
+        record and its advertisement each obey the record rules, the
+        advertisement as the record its stream carries, in the wire encoding
+        (HLC round six, 2026-11-08, owner rulings F1 and F3)."""
+        if stream not in _AD_RECORDS or not records.conforms(signed, "RevocationRegistry.SignedRevocation"):
             return False
-        ad_bytes, key, signature = (signed.get("adBytes"), signed.get("publicKey"),
-                                    signed.get("signature"))
-        if (not isinstance(ad_bytes, (bytes, bytearray)) or not isinstance(key, (bytes, bytearray))
-                or len(key) != 32 or not isinstance(signature, (bytes, bytearray))):
+        ad_bytes, key, signature = signed["adBytes"], signed["publicKey"], signed["signature"]
+        if ad_bytes is None or key is None or len(key) != 32 or signature is None:
             return False
-        try:
-            ad = cbor.loads(bytes(ad_bytes))
-            issued = parse_instant_millis(ad.get("issued"))
-        except (ValueError, IndexError, TypeError, AttributeError, UnicodeDecodeError):
+        ad = records.decode(ad_bytes, _AD_RECORDS[stream])
+        if ad is None:
             return False
-        if (not isinstance(ad, dict) or derive_id(bytes(key)) != ad.get("issuer")
-                or not Identity.verify(bytes(key), bytes(ad_bytes), bytes(signature))
+        issued = parse_instant_millis(ad["issued"])
+        if (derive_id(key) != ad["issuer"]
+                or not Identity.verify(key, ad_bytes, signature)
                 or issued > now_ms + MAX_ISSUED_SKEW_MILLIS
                 or (self._group is not None and self._group() not in (None, ad.get("group")))):
             return False
-        digest = hashlib.sha256(bytes(ad_bytes)).hexdigest()
+        digest = hashlib.sha256(ad_bytes).hexdigest()
         if stream == PEER_STREAM:
             return self._accept_peer(ad, issued, digest)
-        if stream == CREDENTIAL_STREAM:
-            return self._accept_credential(ad, issued, digest)
-        return False
+        return self._accept_credential(ad, issued, digest)
 
     def _accept_peer(self, ad: dict, issued: int, digest: str) -> bool:
         founder = self._founder()

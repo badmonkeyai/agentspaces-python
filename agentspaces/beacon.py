@@ -20,18 +20,20 @@ founding advertisement (base64 CBOR), the seeds, the wire hints, and, at a
 social beacon, the public delegation; document-wide the issuer PeerID, its
 raw key, the issue time, a TTL, and the issuer's Ed25519 signature over the
 canonical bytes: every field but ``signature``, in declared order, map keys
-sorted, no whitespace, exactly as Jackson writes them. A reader ignores
-unknown fields. The document never carries a content key, a credential, or
-a membership hint."""
+sorted, no whitespace, exactly as Jackson writes them. A signed document
+arrives as exactly its canonical JSON, signature last (HLC round seven,
+2026-11-08); a reader ignores unknown fields of an unsigned one and refuses a named field of
+another type (2026-11-09). The document
+never carries a content key, a credential, or a membership hint."""
 
 import base64
 import json
-import re
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
-from . import cbor
+from . import records
+from .wire import utf16_order
 from .identity import Identity, derive_id, verify_signed_group_ad
 from . import seed as seed_module
 from .seed import Seed
@@ -78,46 +80,116 @@ def document_group(name: str, group_id: str | None = None, founding: str | None 
     return group
 
 
-def _canonical_group(group: dict) -> dict:
-    out = {"name": group.get("name")}
+# Java's field types: an int (v, a seed's priority, a wire hint) and a long (ttl).
+_INT = (-(1 << 31), (1 << 31) - 1)
+_LONG = (-(1 << 63), (1 << 63) - 1)
+# Jackson's short escapes; every other control character is \u00XX, upper-case.
+_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+
+
+def _integer(value, bounds, what: str) -> int:
+    """A JSON integer the Java field holds; None reads as Java's default 0."""
+    if value is None:
+        return 0
+    if type(value) is not int or not bounds[0] <= value <= bounds[1]:
+        raise ValueError(f"{what} is no integer a Java {'int' if bounds is _INT else 'long'} holds")
+    return value
+
+
+def _text(value, what: str):
+    if value is not None and type(value) is not str:
+        raise ValueError(f"{what} is not text")
+    return value
+
+
+def _sorted_map(mapping, value, what: str) -> dict:
+    """A Map<String, X> as Jackson's ORDER_MAP_ENTRIES_BY_KEYS writes it: keys in String.compareTo
+    order, UTF-16 code units (HLC round seven, 2026-11-08)."""
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{what} is not an object")
+    return {k: value(mapping[k], f"{what}.{k}") for k in sorted(mapping, key=utf16_order)}
+
+
+def _canonical_group(group) -> dict:
+    if not isinstance(group, dict) or type(group.get("name")) is not str:
+        raise ValueError("a group is an object with a name")
+    out = {"name": group["name"]}
     for key in ("id", "founding"):
         if group.get(key) is not None:
-            out[key] = group[key]
-    seeds = []
-    for seed in group.get("seeds") or []:
-        seeds.append({"transport": seed.get("transport"), "address": seed.get("address"),
-                      "priority": int(seed.get("priority") or 0)})
-    out["seeds"] = seeds
+            out[key] = _text(group[key], key)
+    seeds = [] if group.get("seeds") is None else group["seeds"]
+    if not isinstance(seeds, list) or not all(isinstance(seed, dict) for seed in seeds):
+        raise ValueError("seeds are a list of objects")
+    out["seeds"] = [{"transport": _text(seed.get("transport"), "transport"),
+                     "address": _text(seed.get("address"), "address"),
+                     "priority": _integer(seed.get("priority"), _INT, "priority")} for seed in seeds]
     if group.get("wire") is not None:
-        out["wire"] = {k: int(v) for k, v in sorted(group["wire"].items())}
+        out["wire"] = _sorted_map(group["wire"], lambda v, w: None if v is None else _integer(v, _INT, w), "wire")
     if group.get("multicast") is not None:
-        out["multicast"] = group["multicast"]
+        out["multicast"] = _text(group["multicast"], "multicast")
     if group.get("parameters") is not None:
-        out["parameters"] = {k: group["parameters"][k] for k in sorted(group["parameters"])}
+        out["parameters"] = _sorted_map(group["parameters"], _text, "parameters")
     if group.get("invite") is not None:
-        out["invite"] = group["invite"]
+        out["invite"] = _text(group["invite"], "invite")
     return out
 
 
-def _jackson_json(value) -> bytes:
-    """Jackson's compact JSON: no whitespace, non-ASCII unescaped, control
-    characters as short escapes or upper-case ``\\u00XX``."""
-    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    text = re.sub(r"\\u00([0-9a-f]{2})", lambda m: "\\u00" + m.group(1).upper(), text)
-    return text.encode("utf-8")
+def _json_string(text: str, signed: bool) -> str:
+    """A string as Jackson writes it: ``"`` and ``\\`` escaped, the short escapes, any other
+    control character as upper-case ``\\u00XX``, and everything else as is, except that the
+    signed bytes come from Jackson's byte writer, which writes each UTF-16 surrogate as an
+    upper-case ``\\uXXXX`` escape, so a code point past U+FFFF becomes its two surrogates
+    (HLC round seven, 2026-11-08)."""
+    out = ['"']
+    for ch in text:
+        code = ord(ch)
+        if ch in _SHORT_ESCAPES:
+            out.append(_SHORT_ESCAPES[ch])
+        elif code < 0x20:
+            out.append(f"\\u{code:04X}")
+        elif signed and code > 0xFFFF:
+            code -= 0x10000
+            out.append(f"\\u{0xD800 + (code >> 10):04X}\\u{0xDC00 + (code & 0x3FF):04X}")
+        elif signed and 0xD800 <= code <= 0xDFFF:
+            out.append(f"\\u{code:04X}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _jackson_json(value, signed: bool) -> str:
+    """Jackson's compact JSON of the canonical body: no whitespace, members in the order built."""
+    if value is None:
+        return "null"
+    if type(value) is int:
+        return str(value)
+    if type(value) is str:
+        return _json_string(value, signed)
+    if isinstance(value, list):
+        return "[" + ",".join(_jackson_json(item, signed) for item in value) + "]"
+    return "{" + ",".join(_json_string(k, signed) + ":" + _jackson_json(v, signed) for k, v in value.items()) + "}"
+
+
+def _canonical_body(doc: dict) -> dict:
+    """Every known field but ``signature``, in declared order (v, issuer, issuerKey, issued,
+    ttl, groups), null fields omitted, each of its Java type or a ValueError."""
+    body = {"v": _integer(doc.get("v"), _INT, "v")}
+    for key in ("issuer", "issuerKey", "issued"):
+        if doc.get(key) is not None:
+            body[key] = _text(doc[key], key)
+    body["ttl"] = _integer(doc.get("ttl"), _LONG, "ttl")
+    groups = [] if doc.get("groups") is None else doc["groups"]
+    if not isinstance(groups, list):
+        raise ValueError("groups are a list")
+    body["groups"] = [_canonical_group(g) for g in groups]
+    return body
 
 
 def canonical_bytes(doc: dict) -> bytes:
-    """The bytes the signature covers: every known field but ``signature``,
-    in declared order (v, issuer, issuerKey, issued, ttl, groups), null
-    fields omitted, map keys sorted, no whitespace."""
-    body = {"v": int(doc.get("v") or 0)}
-    for key in ("issuer", "issuerKey", "issued"):
-        if doc.get(key) is not None:
-            body[key] = doc[key]
-    body["ttl"] = int(doc.get("ttl") or 0)
-    body["groups"] = [_canonical_group(g) for g in (doc.get("groups") or [])]
-    return _jackson_json(body)
+    """The bytes the signature covers: Java's ``canonicalBytes``, the canonical body as
+    Jackson's byte writer writes it, map keys sorted, no whitespace."""
+    return _jackson_json(_canonical_body(doc), signed=True).encode("utf-8")
 
 
 def sign_document(issuer: Identity, issued_iso: str, ttl_seconds: int, groups: list) -> dict:
@@ -130,11 +202,20 @@ def sign_document(issuer: Identity, issued_iso: str, ttl_seconds: int, groups: l
 
 
 def to_json(doc: dict) -> bytes:
-    """The document as one line of JSON, signature last."""
-    body = json.loads(canonical_bytes(doc))
+    """The document as one line of JSON, signature last: Java's ``toBytes``, which Jackson's
+    text writer writes, so a code point past U+FFFF stays as it is."""
+    body = _canonical_body(doc)
     if doc.get("signature") is not None:
-        body["signature"] = doc["signature"]
-    return _jackson_json(body)
+        body["signature"] = _text(doc["signature"], "signature")
+    return _jackson_json(body, signed=False).encode("utf-8")
+
+
+def _canonical_base64(text) -> bool:
+    """Whether ``text`` is absent or the padded standard base64 of the bytes it decodes to."""
+    try:
+        return text is None or base64.b64encode(base64.b64decode(text, validate=True)).decode("ascii") == text
+    except (ValueError, TypeError):
+        return False
 
 
 def document_signer(doc: dict) -> str | None:
@@ -212,10 +293,53 @@ def fetch_beacon_document(url: str, *, allow_plain: bool = False, beacon_peer: s
     except urllib.error.URLError as e:
         raise OSError(f"GET {url}: {e.reason}") from e
     try:
+        doc = parse_document(body)
+    except ValueError as e:
+        raise ValueError(f"GET {url}: {e}") from e
+    verify_document(doc, beacon_peer)
+    return doc
+
+
+def _refuse_malformed_groups(doc: dict) -> None:
+    """What Java's Group record refuses in a document signed or not: a group that is no object or
+    has no name, a seed that is no object, and a parameter by a forbidden name (HLC round seven,
+    2026-11-08)."""
+    groups = doc.get("groups") or []
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict) or group.get("name") is None:
+            raise ValueError("not a beacon document: a group is no object with a name")
+        seeds = group.get("seeds") or []
+        if isinstance(seeds, list) and not all(isinstance(seed, dict) for seed in seeds):
+            raise ValueError("not a beacon document: a seed is no object")
+        parameters = group.get("parameters")
+        if isinstance(parameters, dict) and any(str(k).lower() in FORBIDDEN_PARAMETERS for k in parameters):
+            raise ValueError("a beacon document never carries a secret")
+
+
+def parse_document(body: bytes) -> dict:
+    """The document the JSON bytes ``body`` hold. An unsigned document reads leniently in form,
+    with whitespace, any member order, and unknown members, while every member it names holds
+    its Java type, signed or not (SPEC v0.1.32 9.3, 2026-11-09): a group name sent as a number or
+    a ttl sent as text refuses it, as Java's reader refuses it. A document that carries a
+    signature must be exactly its canonical JSON, ``to_json`` of what it decodes to, as Java's
+    BeaconDocument.parse requires (HLC round seven, 2026-11-08, owner ruling F3 applied to the
+    beacon document): the signature covers ``canonical_bytes``, which
+    are then the bytes received less the signature member, so whitespace, another member order,
+    an unknown or repeated member, another escape, or a number in another form refuses the
+    document instead of relabelling it. Raises ValueError for anything else."""
+    try:
         doc = json.loads(body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as e:
-        raise ValueError(f"GET {url}: not a JSON document") from e
-    verify_document(doc, beacon_peer)
+        raise ValueError("not a JSON document") from e
+    if not isinstance(doc, dict):
+        raise ValueError("not a beacon document")
+    _refuse_malformed_groups(doc)
+    _canonical_body(doc)
+    if doc.get("signature") is not None and to_json(doc) != body:
+        raise ValueError("a signed beacon document is not its canonical JSON")
+    if doc.get("signature") is not None and not (_canonical_base64(doc["signature"])
+                                                 and _canonical_base64(doc.get("issuerKey"))):
+        raise ValueError("a signed beacon document's signature or key is not canonical base64")
     return doc
 
 
@@ -251,15 +375,20 @@ def group_from_document(doc: dict, group_id: str | None = None, name: str | None
 
 
 def founding_of(group: dict) -> dict | None:
-    """The decoded SignedGroupAdvertisement a group carries, or None."""
+    """The decoded SignedGroupAdvertisement a group carries, or None when it carries none.
+    ValueError when the founding is no SignedGroupAdvertisement in the wire encoding (HLC
+    round six, 2026-11-08, owner rulings F1 and F3)."""
     founding = group.get("founding")
     if not founding:
         return None
     try:
-        signed = cbor.loads(base64.b64decode(founding))
+        raw = base64.b64decode(founding)
     except (ValueError, TypeError) as e:
-        raise ValueError(f"the founding of {group.get('name')!r} is not base64 CBOR") from e
-    return signed if isinstance(signed, dict) else None
+        raise ValueError(f"the founding of {group.get('name')!r} is not base64") from e
+    signed = records.decode(raw, "SignedGroupAdvertisement")
+    if signed is None:
+        raise ValueError(f"the founding of {group.get('name')!r} is no SignedGroupAdvertisement")
+    return signed
 
 
 def verified_group_id(group: dict, expected: str | None = None) -> str:

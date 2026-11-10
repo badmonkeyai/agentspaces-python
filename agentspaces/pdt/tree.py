@@ -36,7 +36,16 @@
   with AES-256-GCM and the AAD ``aspace:pdt|<recipient>|<req>``; the sealed
   bytes are ``nonce || ciphertext || tag`` as the group key seals.
 - The advertisement carries ``trees = "1"``; tags 8 to 11 go only to a member
-  whose newest content-swarm advertisement carries it."""
+  whose newest content-swarm advertisement carries it.
+
+PDT 2 phase 7 (srad/agentspaces-pdt2.md §6.10, P2-C-01, P2-F-05) brings this port to feature level 2: it reads
+every message of tags 8 to 12 strictly under its annex I schema (``read_message``), the level-2 schemas of 6.10.4
+included, and advertises ``pdt = "2"``. A fetch applies the ``NODES.deltas`` of a ``TREE_WANT`` answer (P2-Z-01) by
+the rules of Java's ``TreeFetchSession``; the holder answers ``CHALLENGE`` (tag 12, P2-S-07) and sketch rounds
+(``TREE_WANT`` with root ``""``, P2-K-02) through ``sync.SketchServer``, and ``reconcile_held`` runs the asker's side.
+A level-2 form goes only to a member whose newest advertisement carries ``pdt`` as canonical decimal text of 2 or
+above; a sketch from a member read at level 1 gets the level-1 refusal, ``REJECT`` reason 3. This holder keeps no
+delta frames, so it never sends ``NODES.deltas``."""
 
 from __future__ import annotations
 
@@ -51,11 +60,12 @@ from typing import Callable
 
 from .. import cbor
 from ..capabilities import content as swarm
-from . import cids, nodes
+from . import cids, dcz, nodes, sync
 
-NODE_WANT, NODES, TREE_WANT, TREE_END = 8, 9, 10, 11
+NODE_WANT, NODES, TREE_WANT, TREE_END, CHALLENGE = 8, 9, 10, 11, 12
 TREE_INDEX = -1
-END_DONE, END_BUDGET, END_HAVES_NOT_HELD, END_WALK_CAP = 1, 2, 3, 4
+END_DONE, END_BUDGET, END_HAVES_NOT_HELD, END_WALK_CAP, END_SKETCH = 1, 2, 3, 4, 5
+MAX_PICKS = 16
 MAX_WANT_CIDS = 256
 MAX_NODES_BYTES = 4 * 1024 * 1024
 MAX_HAVES = 64
@@ -67,6 +77,9 @@ MESSAGE_FRAMING_BYTES = 33
 SEALING_AAD_PREFIX = "aspace:pdt|"
 TREES_PARAMETER = "trees"
 TREES_VERSION = "1"
+#: The PDT feature level on the content-swarm advertisement (P2-F-05): this port reads every level-2 schema of 6.10.4.
+PDT_PARAMETER = "pdt"
+PDT_LEVEL = "2"
 HINT_RECORDLESS = "wire.recordless"
 
 
@@ -85,8 +98,77 @@ def tree_want(req: int, root: str, haves: list[str] | None, budget: int, sketch:
     return {"t": TREE_WANT, "req": int(req), "root": root, "haves": haves, "budget": int(budget), "sketch": sketch}
 
 
-def tree_end(req: int, frontier: list[str], reason: int) -> dict:
-    return {"t": TREE_END, "req": int(req), "frontier": list(frontier), "reason": int(reason)}
+def tree_end(req: int, frontier: list[str], reason: int, sketch: bytes | None = None) -> dict:
+    """A ``TREE_END``; ``sketch``, the reply of a reconciliation round, is appended and left off when None (rule 13)."""
+    msg = {"t": TREE_END, "req": int(req), "frontier": list(frontier), "reason": int(reason)}
+    if sketch is not None:
+        msg["sketch"] = sketch
+    return msg
+
+
+# The annex I schema of each tree message (PDT 2 phase 7, §6.10.4): its fields in Java's order, then the fields a
+# later level appends, which leave the wire when null (P2-F-07).
+_SCHEMAS = {NODE_WANT: (("t", "req", "cids"), ()),
+            NODES: (("t", "req", "nodes", "sealed", "epoch", "missing"), ("deltas",)),
+            TREE_WANT: (("t", "req", "root", "haves", "budget", "sketch"), ()),
+            TREE_END: (("t", "req", "frontier", "reason"), ("sketch",)),
+            CHALLENGE: (("t", "req", "root", "picks"), ())}
+_INT, _LONG = 1 << 31, 1 << 63
+
+
+def _int(value, bound=_INT) -> bool:
+    return type(value) is int and -bound <= value < bound
+
+
+def _texts(value, nullable: bool) -> bool:
+    return (nullable and value is None) or (isinstance(value, list) and all(isinstance(v, str) for v in value))
+
+
+def _fields(value: dict, fixed: tuple, appended: tuple) -> bool:
+    return list(value) == list(fixed) + [f for f in appended if f in value] \
+        and all(value[f] is not None for f in appended if f in value)
+
+
+def _typed(msg: dict) -> bool:
+    t = msg["t"]
+    if not _int(msg["req"]):
+        return False
+    if t == NODE_WANT:
+        return _texts(msg["cids"], False)
+    if t == NODES:
+        return ((msg["nodes"] is None or (isinstance(msg["nodes"], list) and all(isinstance(n, bytes) for n in msg["nodes"])))
+                and (msg["sealed"] is None or isinstance(msg["sealed"], bytes))
+                and (msg["epoch"] is None or _int(msg["epoch"], _LONG)) and _texts(msg["missing"], True)
+                and ("deltas" not in msg or (isinstance(msg["deltas"], list) and all(
+                    isinstance(d, dict) and _fields(d, ("cid", "base", "dcz"), ()) and isinstance(d["cid"], str)
+                    and isinstance(d["base"], str) and isinstance(d["dcz"], bytes) for d in msg["deltas"]))))
+    if t == TREE_WANT:
+        return (isinstance(msg["root"], str) and _texts(msg["haves"], True) and _int(msg["budget"], _LONG)
+                and (msg["sketch"] is None or isinstance(msg["sketch"], bytes)))
+    if t == TREE_END:
+        return _texts(msg["frontier"], True) and _int(msg["reason"]) and ("sketch" not in msg or isinstance(msg["sketch"], bytes))
+    return isinstance(msg["root"], str) and isinstance(msg["picks"], list) and all(
+        isinstance(p, dict) and _fields(p, ("cid",), ("offset", "length")) and isinstance(p["cid"], str)
+        and ("offset" not in p or _int(p["offset"], _LONG)) and ("length" not in p or _int(p["length"]))
+        for p in msg["picks"])
+
+
+def fits_schema(msg) -> bool:
+    """Whether a decoded tree message holds exactly its schema's fields, in order and of their types (§9.1)."""
+    if not isinstance(msg, dict) or msg.get("t") not in _SCHEMAS or type(msg.get("t")) is not int:
+        return False
+    fixed, appended = _SCHEMAS[msg["t"]]
+    return _fields(msg, fixed, appended) and _typed(msg)
+
+
+def read_message(raw: bytes) -> dict | None:
+    """A tree message read strictly (PDT 2 phase 7, P2-F-05): the wire encoding of one map that fits its schema, or
+    None. ``cbor.loads`` reads only the wire encoding, so the message re-encodes to exactly these bytes."""
+    try:
+        msg = cbor.loads(raw)
+    except ValueError:
+        return None
+    return msg if fits_schema(msg) else None
 
 
 def _cid_list(value, bound: int, what: str) -> str | None:
@@ -115,17 +197,38 @@ def violation(msg: dict) -> str | None:
             return "a NODES carries exactly one of nodes and sealed"
         if (sealed is None) != (msg.get("epoch") is None):
             return "epoch is present exactly when sealed is"
+        if sealed is not None and msg.get("deltas") is not None:
+            # PDT 2 phase 4 measures (srad/agentspaces-pdt2.md §10.14): frames travel in plaintext answers only
+            return "a sealed NODES carries no deltas"
         if plain is not None:
             if not isinstance(plain, list) or any(not isinstance(n, bytes) for n in plain):
                 return "nodes is not a list of byte strings"
-            if sum(len(n) for n in plain) > MAX_NODES_BYTES:
+            size = sum(len(n) for n in plain)
+            if size > MAX_NODES_BYTES:
                 return f"a NODES carries at most {MAX_NODES_BYTES} bytes of nodes"
         elif not isinstance(sealed, bytes) or len(sealed) > MAX_NODES_BYTES:
             return f"a NODES carries at most {MAX_NODES_BYTES} sealed bytes"
+        deltas = msg.get("deltas")
+        if deltas is not None:
+            # PDT 2 phase 7, P2-Z-01: at most 256 deltas, each a chunk, a base, and a frame, in the 4 MiB bound
+            if len(deltas) > MAX_WANT_CIDS:
+                return f"a NODES carries at most {MAX_WANT_CIDS} deltas, got {len(deltas)}"
+            if any(not cids.is_cid(d.get("cid")) or not cids.is_cid(d.get("base")) or not isinstance(d.get("dcz"), bytes)
+                   for d in deltas):
+                return "deltas holds an entry without a CID, a base CID, and a frame"
+            if size + sum(len(d["dcz"]) for d in deltas) > MAX_NODES_BYTES:
+                return f"a NODES carries at most {MAX_NODES_BYTES} bytes of nodes and deltas"
         if msg.get("missing") is not None:
             return _cid_list(msg["missing"], MAX_WANT_CIDS, "missing")
         return None
     if t == TREE_WANT:
+        if msg.get("root") == "" and msg.get("sketch") is not None:
+            # PDT 2 phase 7, P2-K-02 (rule 12): a reconciliation round names no root and no haves
+            if msg.get("haves"):
+                return "a sketch TREE_WANT names no haves"
+            budget = msg.get("budget")
+            return None if isinstance(budget, int) and 0 < budget <= MAX_TREE_BUDGET \
+                else f"budget is not in (0, {MAX_TREE_BUDGET}]"
         if not cids.is_cid(msg.get("root")):
             return "root is not a cid"
         if msg.get("haves") is not None:
@@ -140,8 +243,32 @@ def violation(msg: dict) -> str | None:
         bad = _cid_list(msg.get("frontier"), MAX_FRONTIER, "frontier")
         if bad:
             return bad
-        if msg.get("reason") not in (END_DONE, END_BUDGET, END_HAVES_NOT_HELD, END_WALK_CAP):
+        if msg.get("reason") not in (END_DONE, END_BUDGET, END_HAVES_NOT_HELD, END_WALK_CAP, END_SKETCH):
             return "unknown TREE_END reason"
+        if (msg["reason"] == END_SKETCH) != (msg.get("sketch") is not None):
+            return f"a TREE_END carries a sketch exactly when its reason is {END_SKETCH}"
+        if msg["reason"] == END_SKETCH and msg["frontier"]:
+            return "a sketch TREE_END carries an empty frontier"
+        return None
+    if t == CHALLENGE:
+        # PDT 2 phase 7, P2-S-07: 1 to 16 picks; a node pick names a CID, a chunk-group pick a BLAKE3 identity
+        if not cids.is_cid(msg.get("root")):
+            return "root is not a cid"
+        picks = msg.get("picks") or []
+        if not picks:
+            return "a CHALLENGE names at least one pick"
+        if len(picks) > MAX_PICKS:
+            return f"a CHALLENGE names at most {MAX_PICKS} picks, got {len(picks)}"
+        for pick in picks:
+            if ("offset" in pick) != ("length" in pick):
+                return "a pick carries both or neither of offset and length"
+            if not (cids.is_cid(pick.get("cid")) if "offset" not in pick else cids.is_identity(pick.get("cid"))):
+                return ("picks holds a value that is not a CID: a node pick names a sha2-256 CID and a chunk-group"
+                        " pick a BLAKE3 identity")
+            if pick.get("offset", 0) < 0:
+                return "a pick's offset is negative"
+            if "length" in pick and not 0 < pick["length"] <= MAX_NODES_BYTES:
+                return f"a pick's length is not in (0, {MAX_NODES_BYTES}]"
         return None
     return f"not a tree message: tag {t}"
 
@@ -180,6 +307,12 @@ def open_nodes(keys: list[bytes], sealed: bytes, aad: bytes) -> list[bytes] | No
 
 # ------------------------------------------------------------------ the fetch
 
+#: The first bench of a source that answered ``missing`` for a CID, in seconds; each later such answer doubles it up
+#: to ``MISSING_BENCH_MAX_S`` (swarm retries, ROBUSTNESS.md §10.3 B6 and E4).
+MISSING_BENCH_S = 1.0
+MISSING_BENCH_MAX_S = 16.0
+
+
 @dataclass
 class _Source:
     peer: str
@@ -191,8 +324,24 @@ class _Source:
     strikes: int = 0
     dropped_until: float = 0.0
     bytes_verified: int = 0
-    missing: set = field(default_factory=set)
+    #: CIDs this source answered ``missing`` for, each with ``[bench end, answers]``: a holder that lacked a node may
+    #: hold it later, so the fetch asks it again once the bench ends, with a random spread (swarm retries).
+    missing: dict = field(default_factory=dict)
     hops: int = 0
+    #: A frame of this source did not open, so the fetch opens none of its later frames (P2-Q-SEC-05).
+    frames_refused: bool = False
+
+    def lacks(self, cid: str, now: float) -> bool:
+        bench = self.missing.get(cid)
+        return bench is not None and now < bench[0]
+
+    def lack(self, cid: str, now: float) -> None:
+        bench = self.missing.setdefault(cid, [0.0, 0])
+        if now < bench[0]:
+            return
+        bench[1] += 1
+        wait = min(MISSING_BENCH_MAX_S, MISSING_BENCH_S * 2 ** (bench[1] - 1))
+        bench[0] = now + wait + random.uniform(0, wait / 2)
 
 
 @dataclass
@@ -338,10 +487,11 @@ class TreeFetch:
     def _stalled(self) -> bool:
         if self.outstanding:
             return False
-        usable = [s for s in self.sources.values() if s.dropped_until <= time.monotonic()]
+        now = time.monotonic()
+        usable = [s for s in self.sources.values() if s.dropped_until <= now]
         if not usable:
             return True
-        return all(all(c in s.missing for s in usable) for c in self.frontier_set) if self.frontier_set else True
+        return all(all(s.lacks(c, now) for s in usable) for c in self.frontier_set) if self.frontier_set else True
 
     def _refresh_sources(self) -> None:
         self.sources_read_at = time.monotonic()
@@ -445,7 +595,9 @@ class TreeFetch:
         if self.bare is None:
             if not self.store.has(self.root):
                 if self.root not in self.asked:
-                    self._send_node_want(ranked[0], [self.root], 0)
+                    asked = next((s for s in ranked if not s.lacks(self.root, now)), None)
+                    if asked is not None:
+                        self._send_node_want(asked, [self.root], 0)
                 return
             if not self.planned:
                 self._plan_subtrees(ranked)
@@ -463,7 +615,7 @@ class TreeFetch:
                 self.frontier_set.discard(c)
                 if self.store.has(c) or c in self.asked:
                     continue
-                if c in s.missing:
+                if s.lacks(c, now):
                     skipped.append(c)
                     continue
                 batch.append(c)
@@ -497,9 +649,12 @@ class TreeFetch:
             wanted = [self.root] if not self.store.complete(self.root) else []
         top = ranked[:2]
         for i, subtree in enumerate(wanted):
-            self._send_tree_want(top[i % len(top)], subtree, 1 if subtree != self.root else 0)
-            if self._reschedule or self.done.is_set():
+            # an answer that arrives during the send (an in-process holder) only marks a reschedule, so the plan
+            # still asks for every wanted subtree; a root held before the fetch has no frontier to fall back on
+            # (PDT 2 phase 7: a push that stored the root and part of the tree)
+            if self.done.is_set():
                 return
+            self._send_tree_want(top[i % len(top)], subtree, 1 if subtree != self.root else 0)
 
     def _send_node_want(self, s: _Source, batch: list[str], depth: int) -> None:
         req = self.trees.next_req()
@@ -545,29 +700,24 @@ class TreeFetch:
             rtt = (time.monotonic() - r.sent_at) * 1000
             s.srtt_ms = rtt if s.srtt_ms < 0 else (s.srtt_ms * 7 + rtt) / 8
             s.timeouts = 0
-            struck = False
             for data in node_list:
                 cid = self._match(r, data)
                 if cid is None:
-                    struck = True
-                    break
+                    return self._strike(r, f"a node from {sender[:10]} matched nothing it was asked for")
                 self._accept(r, cid, data)
-            if struck:
-                s.strikes += 1
-                s.dropped_until = float("inf")
-                self.trees.nodes_struck += 1
-                self._note(f"a node from {sender[:10]} matched nothing it was asked for; struck")
-                self.outstanding.pop(r.req)
-                s.in_flight = max(0, s.in_flight - 1)
-                self._release(r)
-                self._schedule()
-                return
+            if r.kind == "tree" and msg.get("deltas") is not None:
+                # PDT 2 phase 7, P2-Z-01: a level-2 holder sends a chunk as a frame over a base under the haves
+                for delta in msg["deltas"]:
+                    struck = self._accept_delta(r, delta)
+                    if struck:
+                        return self._strike(r, struck)
             if r.kind == "nodes":
                 missing = msg.get("missing")
+                now = time.monotonic()
                 if missing is not None:
                     for c in missing:
                         if c in r.cids and c not in r.matched:
-                            s.missing.add(c)
+                            s.lack(c, now)
                             self.asked.discard(c)
                             self._queue(c, r.depth)
                 if missing is not None or len(r.matched) >= len(r.cids):
@@ -575,12 +725,62 @@ class TreeFetch:
                     s.in_flight = max(0, s.in_flight - 1)
                     self.round_trips = max(self.round_trips, r.depth + 1)
                     for c in r.cids:
-                        if c not in r.matched and c not in s.missing:
+                        if c not in r.matched and not s.lacks(c, now):
                             self.asked.discard(c)
                             self._queue(c, r.depth)
                     if s.window < self.trees.max_window:
                         s.window += 1
             self._schedule()
+
+    def _strike(self, r: _Request, why: str) -> None:
+        s = r.source
+        s.strikes += 1
+        s.dropped_until = float("inf")
+        self.trees.nodes_struck += 1
+        self._note(f"{why}; struck")
+        self.outstanding.pop(r.req, None)
+        s.in_flight = max(0, s.in_flight - 1)
+        self._release(r)
+        self._schedule()
+
+    def _accept_delta(self, r: _Request, delta: dict) -> str | None:
+        """Applies one delta of a ``TREE_WANT`` answer as Java's ``TreeFetchSession.acceptDelta`` does; returns why
+        its sender is struck, or None. A delta for a chunk no verified node links, or a frame that rebuilds bytes
+        its CID does not name, strikes; a frame that does not open costs no strike, and the fetch then asks for the
+        chunk whole and opens no later frame from that source (P2-Q-SEC-05); a delta over a base this store lacks
+        asks for the chunk by ``NODE_WANT``. Only the verified chunk is stored, never the frame."""
+        cid, base, frame = delta["cid"], delta["base"], delta["dcz"]
+        digest = cids.parse(cid).digest
+        if self.expected.get(digest) != cid:
+            self.foreign_refused += 1
+            return f"a delta from {r.source.peer[:10]} names {cid}, which no verified node links to"
+        if self.store.has(cid) or cid in self.verified:
+            self.bytes_received += len(frame)  # a duplicate delivery still costs its bytes
+            return None
+        chunks = cids.codec_of(cid) == cids.RAW and cids.codec_of(base) == cids.RAW
+        if not chunks:
+            self.trees.deltas_refused += 1
+        held = self.store.get(base) if chunks and not r.source.frames_refused else None
+        if held is None:
+            self._note(f"a delta for {cid} over {base} is not applied here; asking for the chunk by NODE_WANT")
+            self.asked.discard(cid)
+            self._queue(cid, r.depth + 1)
+            return None
+        try:
+            chunk = dcz.decode(held, frame)
+        except dcz.DczRefused as e:
+            self.trees.deltas_refused += 1
+            r.source.frames_refused = True
+            self._note(f"a delta for {cid} from {r.source.peer[:10]} refused ({e}); asking for it whole")
+            self.asked.discard(cid)
+            self._queue(cid, r.depth + 1)
+            return None
+        if not cids.verifies(cid, chunk):
+            self.trees.deltas_refused += 1
+            return f"a delta from {r.source.peer[:10]} rebuilds bytes that do not hash to {cid}"
+        self.trees.deltas_applied += 1
+        self._accept(r, cid, chunk, len(frame))
+        return None
 
     def _match(self, r: _Request, data: bytes) -> str | None:
         digest = hashlib.sha256(data).digest()
@@ -592,7 +792,7 @@ class TreeFetch:
                 if cids.parse(candidate).digest == digest:
                     for skipped in r.cids[r.pointer:p]:
                         if skipped not in r.matched:
-                            r.source.missing.add(skipped)
+                            r.source.lack(skipped, time.monotonic())
                     r.pointer = p + 1
                     r.matched.add(candidate)
                     return candidate
@@ -601,9 +801,10 @@ class TreeFetch:
         cid = self.expected.get(digest)
         return cid
 
-    def _accept(self, r: _Request, cid: str, data: bytes) -> None:
+    def _accept(self, r: _Request, cid: str, data: bytes, wire_bytes: int | None = None) -> None:
+        """Stores a verified node and follows its links; ``wire_bytes`` is what it cost to receive (a delta's frame)."""
         r.delivered += 1
-        self.bytes_received += len(data)
+        self.bytes_received += len(data) if wire_bytes is None else wire_bytes
         r.source.bytes_verified += len(data)
         if cid in self.verified:
             self.duplicates += 1
@@ -644,12 +845,16 @@ class TreeFetch:
                     s.strikes += 1
                     continue
                 self._queue(c, r.depth + 1)
+            # a CID a NODE_WANT already asks for (a delta that did not apply asked for its chunk) is not asked again
+            in_flight = {c for x in self.outstanding.values() if x.kind == "nodes" for c in x.cids if c not in x.matched}
             for c in list(self.under_walk):
                 self.under_walk.discard(c)
-                self._queue(c, r.depth + 1)
+                if c not in in_flight:
+                    self._queue(c, r.depth + 1)
             for c in self.store.missing(subtree):
                 self._expect(c)
-                self._queue(c, r.depth + 1)
+                if c not in in_flight:
+                    self._queue(c, r.depth + 1)
             if s.window < self.trees.max_window:
                 s.window += 1
             self._schedule()
@@ -667,7 +872,8 @@ class TreeFetch:
                     if msg.get("reason") in (swarm.REASON_OVER_BUDGET, swarm.REASON_POLICY):
                         s.dropped_until = time.monotonic() + self.DROP_S
                     else:
-                        s.missing.update(r.cids)
+                        for c in r.cids:
+                            s.lack(c, time.monotonic())
                     self._release(r)
                     break
             self._schedule()
@@ -713,6 +919,14 @@ class Trees:
         self.nodes_unopenable = 0
         self.tree_requests_rejected = 0
         self.tree_messages_dropped = 0
+        # PDT 2 phase 7: chunks rebuilt from a delta and deltas refused (P2-Z-01), challenges answered (P2-S-07)
+        self.deltas_applied = 0
+        self.deltas_refused = 0
+        self.challenges_answered = 0
+        # the roots this peer reconciles (P2-K-03): those it holds complete, unless a host gives another set
+        self.reconcile_set: Callable[[], list[str]] = self.held_roots
+        self.sketches = sync.SketchServer(lambda: self.reconcile_set())
+        self.sessions: dict[int, sync.SketchSession] = {}
         self.advertised_at = 0.0
         self._lock = threading.Lock()
         content.trees = self
@@ -722,7 +936,8 @@ class Trees:
     # ---- wiring
 
     def describe(self) -> dict:
-        """This node's content-swarm CapabilityAdvertisement with ``trees = "1"`` (PD-X-01)."""
+        """This node's content-swarm CapabilityAdvertisement with ``trees = "1"`` (PD-X-01) and ``pdt = "2"``, the
+        PDT feature level (PDT 2 phase 7, P2-F-05)."""
         from ..identity import instant_iso
         now_ms = self.peer._now_ms()
         return {"id": f"aspace://{self.peer.group}/cap/content-swarm/{self.self_id}",
@@ -732,7 +947,7 @@ class Trees:
                 "parameters": cbor.canonical_map({
                     "pieceSizes": f"{swarm.MIN_PIECE_SIZE}-{swarm.MAX_PIECE_SIZE}",
                     "sealing": swarm.SEALING_GROUP_KEY if self.keys else swarm.SEALING_NONE,
-                    "seedMode": "always", TREES_PARAMETER: TREES_VERSION}),
+                    "seedMode": "always", TREES_PARAMETER: TREES_VERSION, PDT_PARAMETER: PDT_LEVEL}),
                 "costHints": {}}
 
     def advertise(self) -> None:
@@ -756,6 +971,17 @@ class Trees:
     def advertises_trees(self, peer_id: str) -> bool:
         params = self._ad_parameters(peer_id)
         return params is not None and params.get(TREES_PARAMETER) == TREES_VERSION
+
+    def reads_level_two(self, peer_id: str) -> bool:
+        """Whether a member's newest unexpired advertisement carries ``pdt`` as canonical decimal text of 2 or above,
+        so it may receive a level-2 form (P2-F-05); a member without one is read at level 1."""
+        level = (self._ad_parameters(peer_id) or {}).get(PDT_PARAMETER)
+        return isinstance(level, str) and level.isascii() and level.isdigit() and (level == "0" or level[0] != "0") \
+            and int(level) >= 2
+
+    def held_roots(self) -> list[str]:
+        """The tree roots this peer holds complete and publishes holdings for: its set for reconciliation (P2-K-03)."""
+        return [root for root in list(self.holder_state) if self.store.complete(root)]
 
     def advertises_sealing(self, peer_id: str) -> bool:
         params = self._ad_parameters(peer_id)
@@ -887,6 +1113,10 @@ class Trees:
     def tick(self) -> None:
         for f in list(self.fetches):
             f.tick()
+        for req, session in list(self.sessions.items()):
+            session.tick()
+            if session.done:
+                self.sessions.pop(req, None)
         for root in list(self.holder_state):
             if root in self.store.pinned():
                 self._refresh_holding(root, force=False)
@@ -897,20 +1127,38 @@ class Trees:
 
     def on_frame(self, sender: str, msg: dict) -> None:
         t = msg.get("t")
-        if t in (NODE_WANT, TREE_WANT):
+        # PDT 2 phase 7 (§9.1): a tree message outside its schema is undecodable; dropped, counted, nobody struck,
+        # and a NODES releases its request as a NODES that breaks a bound does
+        undecodable = t in _SCHEMAS and not fits_schema(msg)
+        if undecodable and t != NODES:
+            self.tree_messages_dropped += 1
+            return
+        if t in (NODE_WANT, TREE_WANT, CHALLENGE):
             bad = violation(msg)
             if bad:
                 self.tree_messages_dropped += 1
                 return
             if t == NODE_WANT:
                 self._serve_node_want(sender, msg)
+            elif t == CHALLENGE:
+                self._serve_challenge(sender, msg)
+            elif msg["root"] == "":
+                self._serve_sketch(sender, msg)
             else:
                 self._serve_tree_want(sender, msg)
+        elif t == TREE_END and msg.get("reason") == END_SKETCH:
+            session = self.sessions.get(msg.get("req"))
+            if violation(msg) or session is None or session.holder != sender:
+                self.tree_messages_dropped += 1
+                return
+            session.on_reply(msg["sketch"])
+            if session.done:
+                self.sessions.pop(msg["req"], None)
         elif t in (NODES, TREE_END):
-            bad = violation(msg)
+            bad = undecodable or violation(msg)
             if bad:
                 self.tree_messages_dropped += 1
-                f = self._by_req.get(msg.get("req"))
+                f = self._by_req.get(msg["req"]) if type(msg.get("req")) is int else None
                 if f is not None and t == NODES:
                     with f._lock:
                         r = f.outstanding.pop(msg.get("req"), None)
@@ -925,6 +1173,12 @@ class Trees:
                 f.on_nodes(sender, msg)
             else:
                 f.on_tree_end(sender, msg)
+        elif t == swarm.REJECT and msg.get("index") == TREE_INDEX and msg.get("root") == "":
+            # a refusal of a sketch round names no request, so it ends this peer's oldest session with that holder
+            session = next((x for x in self.sessions.values() if x.holder == sender), None)
+            if session is not None:
+                session.on_reject(msg.get("reason"))
+                self.sessions = {r: x for r, x in self.sessions.items() if not x.done}
         elif t == swarm.REJECT and msg.get("index") == TREE_INDEX:
             for f in list(self.fetches):
                 f.on_reject(sender, msg)
@@ -1060,9 +1314,63 @@ class Trees:
         rest = frontier + [c for c, _ in queue if c not in sent and c not in prune]
         self.send(sender, tree_end(req, list(dict.fromkeys(rest))[:MAX_FRONTIER], reason))
 
+    def _serve_challenge(self, sender: str, msg: dict) -> None:
+        """Answers a possession challenge (P2-S-07) as Java's ``TreeServer.serve``: the grant as for a ``NODE_WANT``,
+        the held node picks in ``NODES`` under the challenge's ``req`` with the rest in ``missing``, and ``REJECT``
+        reason 1 when this peer holds none. A chunk-group pick (a BLAKE3 identity) reads as missing, as in Java."""
+        root, picks = msg["root"], msg["picks"]
+        artifact = cids.codec_of(root) == cids.RAW
+        if not self._may_serve(sender, root) or (not artifact and not all(
+                self._may_serve(sender, p["cid"]) for p in picks if "offset" not in p)):
+            return self._reject(sender, root, swarm.REASON_POLICY)
+        if (not self.keys and self._must_seal(sender)) or (self.keys and self.keys.get(self.write_epoch) is None):
+            return self._reject(sender, root, swarm.REASON_POLICY)
+        held, missing = [], []
+        for pick in picks:
+            data = None if "offset" in pick else self.store.get(pick["cid"])
+            if data is None:
+                missing.append(pick["cid"])
+            else:
+                held.append(data)
+        if not held:
+            return self._reject(sender, root, swarm.REASON_NOT_HELD)
+        if self._packed(sender, msg["req"], held, missing or None) and not missing:
+            self.challenges_answered += 1
+
+    def _serve_sketch(self, sender: str, msg: dict) -> None:
+        """Answers a reconciliation round (P2-K-02, rule 12) with ``TREE_END`` reason 5 and the reply appended; a member
+        this holder reads at level 1 gets the level-1 refusal (P2-F-05, the phase 5 adversary's A6)."""
+        if not self.reads_level_two(sender):
+            return self._reject(sender, "", swarm.REASON_POLICY)
+        answer = self.sketches.answer(sender, msg["req"], msg["sketch"], msg["budget"])
+        if answer[0] == "reply":
+            self.send(sender, tree_end(msg["req"], [], END_SKETCH, answer[1]))
+        elif answer[0] == "refuse":
+            self._reject(sender, "", answer[1])
+        else:
+            self.tree_messages_dropped += 1
+
+    def reconcile_held(self, holder: str, expected: int = 0) -> sync.SketchSession:
+        """Reconciles this peer's set (``reconcile_set``, by default ``held_roots``) with a level-2 holder's (P2-K-02,
+        P2-K-03): by RIBLT first when ``expected`` is above 0, falling back to negentropy, else by negentropy. The
+        session's ``outcome`` is ``(have, need)``: the roots this peer holds that the holder lacks, and the roots the
+        holder holds that this peer lacks. A member read at level 1 gets no sketch (P2-F-05)."""
+        if not self.reads_level_two(holder):
+            raise ValueError(f"{holder} is read at level 1: a sketch goes only to a member at level 2 (P2-F-05)")
+        req = self.next_req()
+        session = sync.SketchSession(holder, req, self.reconcile_set(),
+                                     lambda sketch: self.send(holder, tree_want(req, "", [], sync.MAX_SKETCH_BYTES, sketch)),
+                                     expected)
+        self.sessions[req] = session
+        session.start()
+        if session.done:
+            self.sessions.pop(req, None)
+        return session
+
     def stats(self) -> dict:
         return {"treeFetchesActive": len(self.fetches), "nodesServed": self.nodes_served, "bytesServed": self.bytes_served,
                 "nodesReceived": self.nodes_received, "nodesStruck": self.nodes_struck,
                 "nodesUnopenable": self.nodes_unopenable,
                 "treeRequestsRejected": self.tree_requests_rejected, "treeMessagesDropped": self.tree_messages_dropped,
-                "nodesHeld": self.store.count()}
+                "deltasApplied": self.deltas_applied, "deltasRefused": self.deltas_refused,
+                "challengesAnswered": self.challenges_answered, "nodesHeld": self.store.count()}

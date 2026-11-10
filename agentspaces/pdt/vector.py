@@ -19,7 +19,15 @@ empty), the trie root link or null, and a tail of 1 to 32 items; an interior
 node is ``{k:"v", c:[links]}`` and a leaf ``{k:"v", e:[32 items]}``;
 ``tailoff = n < 32 ? 0 : ((n - 1) >> 5) << 5``. ``conj`` and ``pop`` rewrite
 the root alone until the tail fills or empties; the shape is a function of the
-count, so the layout is canonical."""
+count, so the layout is canonical.
+
+PDT 2 phase 7 (srad/agentspaces-pdt2.md §3.7; P2-C-01 group R, P2-R-03, P2-R-04): a relaxed vector, an ``rr`` root
+over ``rv`` and ``v`` nodes that another port's splices wrote, reads here. An index finds its child through ``z`` by
+binary search on an ``rv`` node and by radix on a dense ``v`` node, every node is checked against the elements its
+parent counts under it, and the reader refuses by name the forms §3.7 refuses: an ``rv`` node without ``z``, a size
+table a radix index reads the same way, a child that holds more elements than its level holds, an ``rv`` node at the
+leaf level, a leaf where an interior node belongs, and a shift past 30. ``packed`` gives the ``vr`` vector of the same
+elements. This port writes no relaxed node: a write to a relaxed vector packs it first, which §10.10 allows."""
 
 from __future__ import annotations
 
@@ -30,6 +38,9 @@ from .nodes import NodeFormatError
 from .values import Ctx, Flusher, StoreLoader, TreeNode
 
 WIDTH, BITS, MASK = 32, 5, 31
+#: The deepest shift a reader reads (P2-R-04), which the ``vr`` layout of 2^31 - 1 elements needs.
+MAX_SHIFT = 30
+MAX_COUNT = 0x7FFFFFFF
 
 
 def tailoff(n: int) -> int:
@@ -45,12 +56,14 @@ def shift_for(n: int) -> int:
 
 
 class VecNode(TreeNode):
-    __slots__ = ("leaf", "slots", "cid")
+    __slots__ = ("leaf", "slots", "cid", "sizes")
 
-    def __init__(self, leaf: bool, slots: list):
+    def __init__(self, leaf: bool, slots: list, sizes: list | None = None):
         self.leaf = leaf
         self.slots = slots
         self.cid = None
+        #: The cumulative element counts of a relaxed node's children (an ``rv`` node), else None (PDT 2 phase 7).
+        self.sizes = sizes
 
     def item(self, i: int):
         if i < 0 or i >= len(self.slots):
@@ -83,6 +96,14 @@ class VecNode(TreeNode):
 
     @staticmethod
     def decode(cid: str, data: bytes) -> "VecNode":
+        n = VecNode._decode_v(cid, data)
+        if n.leaf and len(n.slots) != WIDTH:
+            raise NodeFormatError(f"vector leaf with {len(n.slots)} items; a leaf in the trie holds exactly 32", cid)
+        return n
+
+    @staticmethod
+    def _decode_v(cid: str, data: bytes) -> "VecNode":
+        """A ``v`` node of 1 to 32 slots."""
         node = nodes.decode(data, cid)
         if node.get("k") != nodes.KIND_V:
             raise NodeFormatError(f"expected a vector node, found kind '{node.get('k')}'", cid)
@@ -92,23 +113,64 @@ class VecNode(TreeNode):
         lst = node["c"] if has_c else node["e"]
         if not lst or len(lst) > WIDTH:
             raise NodeFormatError(f"vector node with {len(lst)} slots; 1 to 32 expected", cid)
-        if has_e and len(lst) != WIDTH:
-            raise NodeFormatError(f"vector leaf with {len(lst)} items; a leaf in the trie holds exactly 32", cid)
         slots = [link.cid for link in lst] if has_c else [values.ref_of(e.bytes) for e in lst]
         n = VecNode(has_e, slots)
         n.cid = cid
         return n
 
+    @staticmethod
+    def decode_relaxed(cid: str, data: bytes, level: int, count: int) -> "VecNode":
+        """A node of a relaxed tree at a known level (P2-R-04), as Java's ``VecNode.decodeRelaxed``: a ``v`` leaf of 1
+        to 32 items at level 0, a dense ``v`` interior node above it, or an ``rv`` node whose size table describes a
+        relaxed node; the node must hold exactly the ``count`` elements its parent counts under it."""
+        if nodes.kind_of(data) == nodes.KIND_RV:
+            node = VecNode._decode_rv(cid, data, level)
+        else:
+            node = VecNode._decode_v(cid, data)
+            if node.leaf != (level == 0):
+                raise NodeFormatError(f"a vector {'leaf' if node.leaf else 'interior node'} at level {level}", cid)
+        width, capacity = len(node.slots), 1 << level
+        fits = node.sizes[-1] == count if node.sizes is not None else (width - 1) * capacity < count <= width * capacity
+        if not fits:
+            raise NodeFormatError(f"a vector node of {width} slots at level {level} does not hold the {count} elements "
+                                  "its parent counts under it", cid)
+        return node
+
+    @staticmethod
+    def _decode_rv(cid: str, data: bytes, level: int) -> "VecNode":
+        from .kinds import RvNode
+        if level == 0:
+            raise NodeFormatError("an rv node where a vector leaf belongs", cid)
+        rv = RvNode.decode(cid, data)
+        if rv.sizes is None:
+            raise NodeFormatError("an rv node without z; a dense interior node is a v node", cid)
+        capacity, previous, dense = 1 << level, 0, True
+        for i, size in enumerate(rv.sizes):
+            if size > MAX_COUNT:
+                raise NodeFormatError(f"an rv size of {size} passes the 2^31 - 1 elements a vector holds", cid)
+            if size - previous > capacity:
+                raise NodeFormatError(f"an rv child holds {size - previous} elements, more than the {capacity} its "
+                                      "level holds", cid)
+            dense = dense and (i == len(rv.sizes) - 1 or size - previous == capacity)
+            previous = size
+        if dense:
+            raise NodeFormatError("a size table on a dense node; a dense interior node is a v node", cid)
+        node = VecNode(False, [link.cid for link in rv.children], list(rv.sizes))
+        node.cid = cid
+        return node
+
 
 class VecRoot(TreeNode):
-    __slots__ = ("n", "shift", "trie", "tail", "cid")
+    __slots__ = ("n", "shift", "trie", "tail", "cid", "relaxed")
 
-    def __init__(self, n: int, shift: int, trie, tail: list):
+    def __init__(self, n: int, shift: int, trie, tail: list, relaxed: bool = False):
         self.n = n
         self.shift = shift
         self.trie = trie
         self.tail = tail
         self.cid = None
+        #: Whether this is the root of a relaxed tree, kind ``rr``, read here and never written (PDT 2 phase 7).
+        self.relaxed = relaxed
 
     @staticmethod
     def empty() -> "VecRoot":
@@ -135,10 +197,46 @@ class VecRoot(TreeNode):
     def nth(self, i: int, ctx: Ctx):
         if i < 0 or i >= self.n:
             raise IndexError(f"index {i} of a vector of {self.n}")
+        if self.relaxed:
+            return self._relaxed_nth(i, ctx)
         off = self.tailoff()
         if i >= off:
             return self.tail[i - off]
         return self.leaf_for(i, ctx).item(i & MASK)
+
+    def _relaxed_nth(self, i: int, ctx: Ctx):
+        """The element at an index of a relaxed root (P2-R-04): by binary search of ``z`` on a relaxed node and by
+        radix on a dense one, each node checked against the count its parent gives it and kept once loaded."""
+        off = self.n - len(self.tail)
+        if i >= off:
+            return self.tail[i - off]
+        if not isinstance(self.trie, VecNode):
+            self.trie = VecNode.decode_relaxed(self.trie, ctx.load(self.trie), self.shift, off)
+        node, level, count, base = self.trie, self.shift, off, 0
+        while level > 0:
+            index = i - base
+            if node.sizes is None:
+                j = index >> level
+                before = j << level
+                last = len(node.slots) - 1
+                child_count = (1 << level) if j < last else count - (last << level)
+            else:
+                lo, hi = 0, len(node.sizes) - 1
+                while lo < hi:
+                    mid = (lo + hi) >> 1
+                    if node.sizes[mid] > index:
+                        hi = mid
+                    else:
+                        lo = mid + 1
+                j = lo
+                before = node.sizes[j - 1] if j else 0
+                child_count = node.sizes[j] - before
+            ref = node.item(j)
+            if not isinstance(ref, VecNode):
+                ref = VecNode.decode_relaxed(ref, ctx.load(ref), level - BITS, child_count)
+                node.slots[j] = ref
+            node, level, count, base = ref, level - BITS, child_count, base + before
+        return node.item(i - base)
 
     # ---- writes
 
@@ -219,6 +317,8 @@ class VecRoot(TreeNode):
 
     @staticmethod
     def decode(cid: str, data: bytes) -> "VecRoot":
+        if nodes.kind_of(data) == nodes.KIND_RR:
+            return VecRoot._decode_rr(cid, data)
         node = nodes.decode(data, cid)
         if node.get("k") != nodes.KIND_VR:
             raise NodeFormatError(f"expected a vector root, found kind '{node.get('k')}'", cid)
@@ -234,6 +334,20 @@ class VecRoot(TreeNode):
         if shift != shift_for(n):
             raise NodeFormatError(f"vector root with shift {shift} where the count {n} implies {shift_for(n)}", cid)
         r = VecRoot(n, shift, trie, [values.ref_of(e.bytes) for e in t])
+        r.cid = cid
+        return r
+
+
+    @staticmethod
+    def _decode_rr(cid: str, data: bytes) -> "VecRoot":
+        """An ``rr`` root (P2-R-04): the shape ``kinds.RrRoot`` checks, a count a vector can hold, a shift of at most
+        30, and a tail another port may have left empty; the nodes below load on demand."""
+        from .kinds import RrRoot
+        rr = RrRoot.decode(cid, data)
+        if rr.count > MAX_COUNT or rr.shift > MAX_SHIFT:
+            raise NodeFormatError(f"rr root with count {rr.count} and shift {rr.shift}", cid)
+        r = VecRoot(rr.count, rr.shift, None if rr.trie is None else rr.trie.cid,
+                    [values.ref_of(e.bytes) for e in rr.tail], relaxed=True)
         r.cid = cid
         return r
 
@@ -275,6 +389,20 @@ class PVector:
     def ctx(self) -> Ctx:
         return Ctx(self.loader, self.store)
 
+    def relaxed(self) -> bool:
+        """Whether the vector's tree is relaxed, an ``rr`` root another port's splices wrote (P2-R-01)."""
+        return self._node.relaxed
+
+    def packed(self) -> "PVector":
+        """The ``vr`` vector of the same elements, whose root those elements have whatever the history (P2-R-03)."""
+        if not self._node.relaxed:
+            return self
+        ctx = self.ctx()
+        root = VecRoot.empty()
+        for i in range(self._node.n):
+            root = root.conj(self._node.nth(i, ctx), ctx)
+        return PVector(self.store, self.loader, root)
+
     def nth(self, i: int):
         return values.decode_value(values.resolve(self._node.nth(i, self.ctx()), self.ctx()))
 
@@ -309,6 +437,8 @@ class PVector:
     def conj(self, element) -> "PVector":
         if element is None:
             raise ValueError("a PVector element may not be None")
+        if self._node.relaxed:
+            return self.packed().conj(element)
         ctx = self.ctx()
         return PVector(self.store, self.loader, self._node.conj(values.spill(values.encode_value(element), ctx), ctx))
 
@@ -319,11 +449,15 @@ class PVector:
         return v
 
     def pop(self) -> "PVector":
+        if self._node.relaxed:
+            return self.packed().pop()
         return PVector(self.store, self.loader, self._node.pop(self.ctx()))
 
     def assoc(self, i: int, element) -> "PVector":
         if element is None:
             raise ValueError("a PVector element may not be None")
+        if self._node.relaxed:
+            return self.packed().assoc(i, element)
         ctx = self.ctx()
         nxt = self._node.assoc_n(i, values.spill(values.encode_value(element), ctx), ctx)
         return self if nxt is self._node else PVector(self.store, self.loader, nxt)
@@ -335,10 +469,11 @@ class PVector:
         return self._node.depth()
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, PVector) and self.root() == other.root()
+        """Equality of elements: two vectors compare by their packed roots (P2-R-03)."""
+        return isinstance(other, PVector) and self.packed().root() == other.packed().root()
 
     def __hash__(self) -> int:
-        return hash(self.root())
+        return hash(self.packed().root())
 
     def __repr__(self) -> str:
         return f"PVector[{self._node.n} elements]"

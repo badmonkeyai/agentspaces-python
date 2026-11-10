@@ -41,6 +41,7 @@ import time
 from typing import Any, Callable
 
 from . import cbor
+from .peer import lease_of, present
 
 # ----------------------------------------------------------------- durations
 
@@ -454,6 +455,7 @@ class Space:
         if getattr(peer, "_agentspaces_spaces", None) is None:
             peer._agentspaces_spaces = []
             previous_state, previous_claim = peer.on_state, peer.on_claim
+            previous_withdrawn = peer.on_withdrawn
 
             def on_state(dto):
                 if previous_state is not None:
@@ -461,13 +463,19 @@ class Space:
                 for s in list(peer._agentspaces_spaces):
                     s._on_state(dto)
 
+            def on_withdrawn(dto):
+                if previous_withdrawn is not None:
+                    previous_withdrawn(dto)
+                for s in list(peer._agentspaces_spaces):
+                    s._on_withdrawn(dto)
+
             def on_claim(entry_id, signed):
                 if previous_claim is not None:
                     previous_claim(entry_id, signed)
                 for s in list(peer._agentspaces_spaces):
                     s._on_claim(entry_id, signed)
 
-            peer.on_state, peer.on_claim = on_state, on_claim
+            peer.on_state, peer.on_claim, peer.on_withdrawn = on_state, on_claim, on_withdrawn
 
             def sweep():
                 # EXPIRED and REAPPEARED are judged by the clock, not by a fold.
@@ -502,15 +510,14 @@ class Space:
         found = []
         for entry_id, dto in list(self.peer.states.items()):
             record = dto.get("record") or {}
-            if record.get("type") != template.schema or not self._mine(dto) or dto.get("completed"):
-                continue
-            lease = record.get("lease") or {}
+            if record.get("type") != template.schema or not self._mine(dto) or not present(dto):
+                continue  # completed, or withdrawn by a cancel (core cancel events, 2026-11-09)
+            lease = lease_of(dto)
             if int(lease.get("expiresAtMillis", 0)) <= now_ms:
                 continue
-            raw = self.peer.payload_of(dto)
-            if raw is None:
-                continue  # a block or artifact still on its way: its transfer has started
-            payload = cbor.loads(raw)
+            readable, payload = self.peer.value_of(dto)
+            if not readable:
+                continue  # a block or artifact still on its way, or a payload outside the encoding
             tags = record.get("tags") or {}
             if not template.matches(payload, tags):
                 continue
@@ -573,7 +580,9 @@ class Space:
         """Delivers WRITTEN, TAKEN, and COMPLETED events for matching entries
         as they fold, once per entry and kind, on the peer's reader thread:
         return promptly. (Lease expiry is not timed here; a reader's
-        ``entries`` already excludes lapsed entries.)"""
+        ``entries`` already excludes lapsed entries.) A cancel that folds
+        here delivers EXPIRED, as the sweep delivers it for a lapse (core
+        cancel events, 2026-11-09)."""
         with self._lock:
             key = self._next_key
             self._next_key += 1
@@ -595,23 +604,27 @@ class Space:
     def _deliver(self, dto: dict, kind: str, mark: str | None = None) -> None:
         record = dto.get("record") or {}
         entry_id = record.get("entryId")
-        raw = self.peer.payload_of(dto)
-        if raw is None:
-            return  # a referenced payload not here yet: the event waits for a later fold or read
-        payload = cbor.loads(raw)
+        readable, payload = self.peer.value_of(dto)
+        if not readable:
+            return  # a referenced payload not here yet, or one outside the encoding
         tags = record.get("tags") or {}
         now_ms = self.peer._now_ms()
+        # one mark for every watch: a watch's mark must not depend on the watches before it
+        # (core cancel events, 2026-11-09)
+        seen = (entry_id, mark or kind)
         for template, callback, delivered, subscription in list(self._watchers.values()):
             if subscription.lapsed(now_ms):
                 subscription.close("lapsed")  # judged here as well as on the sweep: nothing after the lease
                 continue
             if record.get("type") != template.schema or not template.matches(payload, tags):
                 continue
-            mark = (entry_id, mark or kind)
-            if mark in delivered:
-                continue
-            delivered.add(mark)
-            lease = record.get("lease") or {}
+            with self._lock:
+                # the reader thread and the sweep thread both deliver EXPIRED, for a cancel and for
+                # a lapse: one judges the mark (core cancel events, 2026-11-09)
+                if seen in delivered:
+                    continue
+                delivered.add(seen)
+            lease = lease_of(dto)
             entry = Entry(entry_id, template.decode(payload), dict(tags), record.get("issuer"),
                           int(lease.get("expiresAtMillis", 0)), kind == COMPLETED, kind == TAKEN)
             callback(Event(kind, entry))
@@ -621,12 +634,18 @@ class Space:
             return
         if dto.get("completed"):
             self._deliver(dto, COMPLETED)
-        else:
-            self._deliver(dto, WRITTEN)
+        elif present(dto):
+            self._deliver(dto, WRITTEN)  # a withdrawn entry learned late is history, not news
+
+    def _on_withdrawn(self, dto: dict) -> None:
+        """EXPIRED for a cancel that withdrew an entry present here, the kind Java's ReplicatedSpace and
+        LocalSpace raise for a cancel, once per entry with the sweep's (core cancel events, 2026-11-09)."""
+        if self._mine(dto):
+            self._deliver(dto, EXPIRED)
 
     def _on_claim(self, entry_id: str, signed: dict) -> None:
         dto = self.peer.states.get(entry_id)
-        if dto is None or not self._mine(dto) or dto.get("completed"):
+        if dto is None or not self._mine(dto) or not present(dto):
             return
         self._deliver(dto, TAKEN)
 
@@ -643,10 +662,10 @@ class Space:
         if not self._watchers:
             return
         for entry_id, dto in list(self.peer.states.items()):
-            if not self._mine(dto) or dto.get("completed"):
-                continue
+            if not self._mine(dto) or not present(dto):
+                continue  # a cancel already delivered a withdrawn entry's EXPIRED (core cancel events, 2026-11-09)
             record = dto.get("record") or {}
-            lease = record.get("lease") or {}
+            lease = lease_of(dto)
             if int(lease.get("expiresAtMillis", 0)) <= now:
                 self._deliver(dto, EXPIRED)
                 continue

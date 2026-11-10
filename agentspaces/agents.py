@@ -101,15 +101,16 @@ def _mark(fn, verb: str, **attrs):
     return fn
 
 
-DATA_USE_TYPE = "https://badmonkey.ai/console#DataUse"
-CATALOG_SPACE = "catalog"
+#: The space a binder writes data-use declarations into unless its caller names another.
+DATA_USE_SPACE = "catalog"
 
 
 def data_use(reads=(), writes=(), source: str = "", sensitivity: str = "", freshness: str = ""):
-    """Declares what the agent reads from a source that is not a space (the console's
-    data catalog, SRAD bma-spiral1-console §3.4): on bind the binder writes one
-    ``DataUse`` entry into the group's ``catalog`` space under the card's TTL and
-    renews it at half-TTL while the agent stays bound. Stack it for several sources."""
+    """Declares what the agent reads from a source that is not a space: on bind a binder
+    given ``data_use_type`` writes one entry of that type into ``data_use_space`` under the
+    card's TTL and renews it at half-TTL while the agent stays bound; a binder given no type
+    writes nothing. The caller names the record type, so the open client carries no
+    product's record (neutral vectors, 2026-11-09). Stack it for several sources."""
     def bind(cls):
         declared = list(getattr(cls, "__agentspaces_data_use__", []))
         declared.append({"reads": list(reads), "writes": list(writes), "source": source,
@@ -336,7 +337,7 @@ class Bound:
         self.binder = binder
         self.name = name
         self.card = card
-        self.data_use: list[str] = []  # the DataUse entry ids the binder declared and renews
+        self.data_use: list[str] = []  # the data-use entry ids the binder declared and renews
         self._threads: list[threading.Thread] = []
         self._subscriptions = []
         self._running = True
@@ -349,6 +350,9 @@ class Bound:
             s.close()
         for t in self._threads:
             t.join(timeout=5)
+        if self.card is not None:
+            # the peer stops reissuing the card; the last one lapses at its ttl (SPEC §6.1a.5)
+            self.binder.peer.withdraw_ad(self.card["id"])
 
     def __enter__(self):
         return self
@@ -360,10 +364,13 @@ class Bound:
 class Binder:
     """Runs decorated agents over one peer. ``agent`` (an ``AgentIdentity``)
     makes every record the agent's own attested one; the peer-signed
-    ``agent_name`` otherwise. ``publish_card`` sends the AgentCard on bind."""
+    ``agent_name`` otherwise. ``publish_card`` sends the AgentCard on bind. ``data_use_type``
+    names the record type a ``@data_use`` declaration is written as, into ``data_use_space``;
+    without it the binder writes no declaration."""
 
     def __init__(self, peer, agent=None, agent_name: str = "python", publish_card: bool = True,
-                 card_ttl: str = "PT10M", aggregate=None, vote_space: str | None = None):
+                 card_ttl: str = "PT10M", aggregate=None, vote_space: str | None = None,
+                 data_use_type: str | None = None, data_use_space: str = DATA_USE_SPACE):
         self.peer = peer
         self.agent = agent
         self.agent_name = agent_name
@@ -371,6 +378,8 @@ class Binder:
         self.card_ttl = card_ttl
         self.aggregate = aggregate
         self.vote_space = vote_space  # where a Motion without a space is proposed
+        self.data_use_type = data_use_type
+        self.data_use_space = data_use_space
         self._spaces: dict[str, Space] = {}
         self._bids: dict[str, Callable] = {}
 
@@ -449,10 +458,10 @@ class Binder:
     # ------------------------------------------------------------- data use
 
     def _declare_data_use(self, bound: Bound, obj, name: str) -> None:
-        """The ``@data_use`` carrier (S1-G-09): one leased ``DataUse`` entry per
-        declaration in the ``catalog`` space, renewed at half the card TTL."""
+        """The ``@data_use`` carrier: one leased entry of ``data_use_type`` per declaration
+        in ``data_use_space``, renewed at half the card TTL."""
         declared = getattr(type(obj), "__agentspaces_data_use__", None)
-        if not declared or not hasattr(self.peer, "write_entry"):
+        if not declared or self.data_use_type is None or not hasattr(self.peer, "write_entry"):
             return
         ttl_ms = duration_millis(self.card_ttl)
         peer_id = self.peer.identity.peer_id
@@ -461,8 +470,8 @@ class Binder:
             payload = {"schemaVersion": 1, "agent": name, "peer": peer_id, "reads": list(use["reads"]),
                        "writes": list(use["writes"]), "source": use["source"], "sensitivity": use["sensitivity"],
                        "freshness": use["freshness"], "declaredBy": "decorator"}
-            ids.append(self.peer.write_entry(CATALOG_SPACE, DATA_USE_TYPE, payload, agent_name=self.agent_name,
-                                             lease_millis=ttl_ms, agent=self.agent))
+            ids.append(self.peer.write_entry(self.data_use_space, self.data_use_type, payload,
+                                             agent_name=self.agent_name, lease_millis=ttl_ms, agent=self.agent))
         bound.data_use = ids
         half_seconds = max(0.25, ttl_ms / 2000)
 
@@ -472,7 +481,7 @@ class Binder:
                     return
                 for entry_id in ids:
                     if bound._running:
-                        self.peer.renew_entry(CATALOG_SPACE, entry_id, lease_millis=ttl_ms, agent=self.agent)
+                        self.peer.renew_entry(self.data_use_space, entry_id, lease_millis=ttl_ms, agent=self.agent)
 
         thread = threading.Thread(target=renew, name=f"{bound.name}.data-use", daemon=True)
         bound._threads.append(thread)

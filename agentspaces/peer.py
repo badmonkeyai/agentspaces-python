@@ -23,13 +23,16 @@ answer against the id it already holds. The point is protocol validation:
 nothing on this wire is Java-specific, and this module holds the proof."""
 
 import hashlib
+import logging
+import random
 import socket
 import struct
 import threading
 import time
+from typing import Callable
 
-from . import beacon, cbor, social, tls, wire
-from .identity import (Identity, derive_id, instant_iso, verify_agent_certificate_at,
+from . import beacon, cbor, records, social, tls, wire
+from .identity import (Identity, derive_id, instant_iso, verify_agent_certificate_covering,
                        verify_signed_group_ad)
 from . import revocation as revocations
 from .seed import Seed, parse_seed
@@ -42,14 +45,67 @@ JOIN_SLICE_MAX_S = 5.0
 
 
 HINT_RECORDLESS = "wire.recordless"
+#: The AppCard level a member reads (SPEC §6.1a.2 and §9, v0.1.32; AppCard origin and formats,
+#: 2026-11-09): canonical decimal text, read as level N or above. A member at level 2 reads a card's
+#: origin, formats, an ``idp`` host, and a spill reference; an issuer writes them only while every
+#: member of its view is at level 2.
+HINT_APPCARD = "wire.appcard"
+#: The AppCard level this client reads and, by default, advertises.
+APPCARD_LEVEL = 2
+#: The advertisement cache's bounds by default (SPEC §6.3, v0.1.32), Java's ``AdCache`` defaults:
+#: the most advertisements it holds and the most bytes of their encodings. This client takes no
+#: RENDEZVOUS role, so Java's rendezvous multiplier never applies here.
+AD_CACHE_MAX_ENTRIES = 8192
+AD_CACHE_MAX_BYTES = 33_554_432
+#: How often, at most, the peer looks again at its view's AppCard level when no member changed:
+#: often enough to see a member's advertisement lapse within a gossip period of one second.
+APPCARD_GATE_RECHECK_MS = 1000
 #: Recordless states held for entries this replica lacks, at most (PD-L-02), as the Java peer's
 #: ``ReplicatedSpace.MAX_PENDING_STATES``; the oldest is dropped past the bound.
 MAX_PENDING_STATES = 1024
+#: The items of followed streams remembered so each is handed over once, as the gossip bus's dedup memory holds them.
+STREAM_ITEMS_REMEMBERED = 4096
 #: How long a pending recordless state waits for its record before it is dropped (ten minutes).
 PENDING_STATE_TTL_S = 600.0
-#: How many distinct refused states and claims the peer remembers so a re-offer is not
-#: counted again (HLC canonical stamps, 2026-11-08); the oldest is forgotten past the bound.
+#: How many distinct refused states and claims, and how many distinct deferred ones, the peer
+#: remembers so a re-offer counts once (HLC canonical stamps, 2026-11-08; HLC round four,
+#: 2026-11-08); past the bound each memory forgets the least recently offered key, as Java's
+#: do (HLC round five, 2026-11-08, decision E14).
 REFUSED_STAMPS_CAPACITY = 4096
+#: How far a claim's stamp may predate the issue stamp of the entry it answers, as Java's
+#: ``ReplicatedSpace.MAX_CLAIM_PREDATES_ISSUE_MILLIS`` (the HLC drift bound; HLC round six,
+#: 2026-11-08, R6).
+MAX_CLAIM_PREDATES_ISSUE_MILLIS = wire.MAX_HLC_SKEW_MILLIS
+#: The race allowance a contesting claim's stamp gets past the drift bound: Java's default
+#: ``ReplicatedSpace`` settle window, 200 ms (HLC round six, 2026-11-08, R6).
+CONTEST_SETTLE_MILLIS = 200
+#: The fewest claims the claim map holds before ``_prune_claims`` scans it (HLC round six,
+#: 2026-11-08, R10), as Ruby's ``CLAIMS_PRUNE_FLOOR``.
+CLAIMS_PRUNE_FLOOR = 1024
+
+# What the peer does with a verified state or claim after judging its stamps (HLC round
+# four, 2026-11-08, decisions D1 and D4), and, for a refusal, the counter it adds to (HLC
+# round five, 2026-11-08, decision E2).
+_MERGE, _DEFER = "merge", "defer"
+_REFUSE_LOGICAL, _REFUSE_FAR_FUTURE = "stamps_logical_refused", "stamps_far_future_refused"
+
+LOG = logging.getLogger(__name__)
+
+
+def appcard_level_of(text) -> int:
+    """The AppCard level a hint's text states, as Java's ``PeerNode.appCardLevelOf`` reads it:
+    canonical decimal text, so ``2``, ``10``, or a value past every int reads as at least that
+    level; no hint, any other text, a leading zero, and ``0`` read as level 1."""
+    if not isinstance(text, str) or not text or (len(text) > 1 and text[0] == "0"):
+        return 1
+    if any(char < "0" or char > "9" for char in text):
+        return 1
+    return (1 << 31) - 1 if len(text) > 9 else max(1, int(text))
+
+
+def _ad_expires_ms(ad: dict) -> int:
+    from .identity import parse_duration_millis, parse_instant_millis
+    return parse_instant_millis(ad["issued"]) + parse_duration_millis(ad["ttl"])
 
 
 def _is_tree_root(ref: str) -> bool:
@@ -59,6 +115,17 @@ def _is_tree_root(ref: str) -> bool:
         return _cids.codec_of(ref) == _cids.DAG_CBOR
     except Exception:  # noqa: BLE001 - a malformed reference is no tree
         return False
+
+
+def _remember(memory: dict, key: tuple) -> bool:
+    """Marks ``key`` most recently offered in a bounded memory and returns whether it was new;
+    past REFUSED_STAMPS_CAPACITY the least recently offered key goes (HLC round five,
+    2026-11-08, decision E14)."""
+    new = memory.pop(key, None) is None
+    memory[key] = True
+    if len(memory) > REFUSED_STAMPS_CAPACITY:
+        del memory[next(iter(memory))]
+    return new
 
 
 class BootstrapTimeout(TimeoutError):
@@ -77,19 +144,38 @@ class BootstrapTimeout(TimeoutError):
 class Peer:
     """One Python peer attached to one group through one seed connection."""
 
-    def __init__(self, identity: Identity, group: str, clock=None, founder: str | None = None):
+    def __init__(self, identity: Identity, group: str, clock=None, founder: str | None = None, *,
+                 appcard_level: int = APPCARD_LEVEL, ad_cache_max_entries: int = AD_CACHE_MAX_ENTRIES,
+                 ad_cache_max_bytes: int = AD_CACHE_MAX_BYTES,
+                 spill_max_fetch_bytes: int = wire.CARD_SPILL_MAX_FETCH_BYTES):
+        if not 1 <= appcard_level <= APPCARD_LEVEL:
+            raise ValueError(f"this client reads AppCard levels 1 to {APPCARD_LEVEL}: {appcard_level}")
+        if ad_cache_max_entries <= 0 or ad_cache_max_bytes <= 0 or spill_max_fetch_bytes <= 0:
+            raise ValueError("the cache bounds and the spill fetch bound are positive")
         self.identity = identity
         self.group = group
         self._socket = None
         self._lock = threading.Lock()
         self._reader = None
         self.states = {}  # entryId -> decoded EntryStateDto dict
+        # One read, join and write of a state at a time: a fold on the reader thread, and a completion
+        # or a renewal on a caller's, so neither overwrites what the other wrote (core cancel events
+        # review, 2026-11-09)
+        self._state_lock = threading.RLock()
         self.claims = {}  # entryId -> winning SignedClaim dict (lattice merge)
+        self._claims_prune_at = CLAIMS_PRUNE_FLOOR  # the claim map's size that runs _prune_claims
         # Seconds since the epoch; a test pins it to verify time-bound material
         # (agent certificates) against a fixed instant, as Java's TestClock does.
         self.clock = clock or time.time
         self.on_state = None  # optional callback(dto)
+        # optional callback(dto) after a fold withdraws an entry that was present here: a cancel
+        # (core cancel events, 2026-11-09), which a Space announces as EXPIRED
+        self.on_withdrawn = None
         self.on_claim = None  # optional callback(entry_id, signed_claim) after a claim folds
+        # Handlers of the gossip streams a capability follows, by stream id: a pushed delta's bundles ride
+        # pdt:<space>:<name> (PDT 2 phase 7, P2-P-02), each item handed over once
+        self.stream_handlers: dict[str, Callable] = {}
+        self._stream_items: dict[str, None] = {}
         # Layer 4 (SPEC §6, §8): the members heard from, the advertisements
         # the 'ads' stream carried, and the capability frames handlers.
         self.members: dict[str, dict] = {}   # peer id -> its PeerAdvertisement (or {} when only heard)
@@ -99,7 +185,16 @@ class Peer:
         # behind the same seed) is not among them, and an addressed frame to
         # it would be dropped by the seed rather than relayed.
         self.reachable: set[str] = set()
-        self.ads: dict[str, dict] = {}       # ad id -> {"type", "ad", "stored", "issuer"}
+        self.ads: dict[str, dict] = {}       # ad id -> {"type", "ad", "stored", "issuer", "expires"}
+        # SPEC §6.3 (v0.1.32; AppCard origin and formats, 2026-11-09): the cache's two bounds, the
+        # sum of the cached encodings, and the advertisements it refused at either bound.
+        self.ad_cache_max_entries = ad_cache_max_entries
+        self.ad_cache_max_bytes = ad_cache_max_bytes
+        self.ad_cache_bytes = 0
+        self.ads_refused_cache_full = 0
+        # Admission runs on the caller's thread (publish_ad, semantic hits) and the reader's, so the
+        # check against the bounds and the store happen under one lock, as AdCache.admit is synchronized.
+        self._ads_lock = threading.Lock()
         self.pipe_handlers: dict[str, object] = {}  # capability type -> fn(from_peer, payload bytes)
         # The group's revocations (SPEC §5.6, v0.1.13): peer revocations and
         # credential revocations, verified founder-rooted (when the founder is
@@ -114,15 +209,25 @@ class Peer:
         self._founding_ready = threading.Event()
         # ROBUSTNESS.md: late, replayed and unknown frames are the normal case; count, never fail.
         self.frames = wire.FrameFilter()
-        # Verified states and claims this peer refused for a stamp the rule refuses, each
-        # counted once however often it is offered (HLC canonical stamps, 2026-11-08); this
-        # client keeps no strikes, so a count is all the refusal leaves.
-        self.refused_stamps: dict[str, int] = {"states": 0, "claims": 0}
+        # Verified states and claims this peer refused for their stamps, each counted once
+        # however often it is offered, and space deltas that did not decode, each counted
+        # every time; the names follow the Java node's stampsLogicalRefused and
+        # deltasUndecodable (HLC round four, 2026-11-08, decision D5). A hostile far-future
+        # stamp counts apart from a logical counter above the limit, and a deferral counts
+        # once per distinct offer, as Java's stampsFarFutureRefused and
+        # stampsFarFutureDeferred (HLC round five, 2026-11-08, decision E2). This client keeps
+        # no strikes, so a count is all a refusal leaves.
+        self.stamps_logical_refused = 0
+        self.stamps_far_future_refused = 0
+        self.stamps_far_future_deferred = 0
+        self.deltas_undecodable = 0
         self._refused_seen: dict[tuple, bool] = {}
+        self._deferred_seen: dict[tuple, bool] = {}
         self.ignored_kinds: dict[str, int] = {}
         self.malformed_frames = 0
-        # A lost socket is reconnected to the seed and the peer re-introduced and re-pulled,
-        # every reconnect_interval_s for reconnect_window_s; a close() by the owner is final.
+        # A lost socket is reconnected to the seed and the peer re-introduced and re-pulled, with
+        # rounds of dials that back off from reconnect_interval_s to six times it (5, 10, 20, 30 s)
+        # with a random spread, until the owner's close(), which is final (swarm retries).
         self._seed = None
         # The seeds connect_any was given, dialed in order and failed over across on a
         # lost socket (SRAD DB-X-01); a bootstrap also sets _refresh_seeds, which
@@ -145,6 +250,30 @@ class Peer:
         # (SPEC v0.1.17 §9): ``wire.recordless`` says this client accepts a renew, cancel, or
         # complete whose EntryStateDto carries no record (srad/agentspaces-pdt.md §3.9, PD-L-04).
         self.wire_hints: dict[str, str] = {HINT_RECORDLESS: "1"}
+        # ``wire.appcard`` (SPEC §6.1a.2, v0.1.32): this client reads the v0.1.32 AppCard and
+        # AgentCard; level 1 advertises no hint, so a test builds a mixed fleet with it.
+        self.appcard_level = appcard_level
+        if appcard_level > 1:
+            self.wire_hints[HINT_APPCARD] = str(appcard_level)
+        # The cards this peer issues (SPEC §6.1a.2 and §6.1a.5): each full AppCard and AgentCard
+        # by id with its type, the issue instant last signed, the view's AppCard level as the
+        # last look saw it, the roots of parts documents held to the expiry of the last card
+        # that named them, the size each card id last warned at, and the counters under Java's
+        # names (appCardsDowngraded, cardsSpilled, cardsOversizeInline, spillsRefused,
+        # spillsOverLimit).
+        self._cards: dict[str, tuple[str, dict]] = {}
+        self._cards_lock = threading.RLock()  # the card state, shared by callers and the reader thread
+        self._signed_issued: dict[str, int] = {}
+        self._gate_open: bool | None = None
+        self._gate_checked_ms = 0
+        self._spill_holds: dict[str, int] = {}
+        self._warned: dict[str, int] = {}
+        self.spill_max_fetch_bytes = spill_max_fetch_bytes
+        self.app_cards_downgraded = 0
+        self.cards_spilled = 0
+        self.cards_oversize_inline = 0
+        self.spills_refused = 0
+        self.spills_over_limit = 0
         # The pdt facade, when one is built over this peer: it reassembles a dag-cbor payloadRef
         # (a persistent tree, srad/agentspaces-pdt.md PD-E-01) where the content swarm serves a
         # raw artifact root; without one such an entry stays invisible here.
@@ -174,9 +303,15 @@ class Peer:
         # The content swarm attached to this peer (``agentspaces.capabilities.content``):
         # resolves ``b`` references and takes payloads above its escalation bound.
         self.content = None
+        #: The wait after the first round of reconnect dials; each later round doubles it, up to six times it.
         self.reconnect_interval_s = 5.0
+        #: How long the seeds are dialed before a bootstrapped peer reads its beacon document again.
         self.reconnect_window_s = 600.0
         self.reconnects = 0
+        # When the current link was dialed, and how many links in a row ended within the reconnect
+        # interval: such a link counts as a failed round of dials (swarm retries, ROBUSTNESS.md §10.6).
+        self._link_since = 0.0
+        self._quick_drops = 0
         # Fold-driven waits (JS-V-02): a take, a read, or an ordered take waits on the
         # next fold (a state or a claim) rather than polling, and pulls a space at most
         # once per settle window.
@@ -252,6 +387,7 @@ class Peer:
             raise OSError(f"no dialer for {seed}: this client dials tcp and tls")
         sock.settimeout(None)
         self._attested = attested
+        self._link_since = time.monotonic()
         return sock
 
     def _candidate_seeds(self) -> list:
@@ -266,25 +402,33 @@ class Peer:
 
     def _reconnect(self) -> bool:
         """After a lost socket: dials the seed again (every seed of connect_any, the next
-        one first) until the window runs out, then introduces this peer again and pulls
-        what it had pulled before, so a network hiccup costs a few seconds rather than
-        the membership (ROBUSTNESS.md §3.6). A bootstrapped peer re-fetches the beacon
-        document once when the window would expire with nothing reachable."""
+        one first), then introduces this peer again and pulls what it had pulled before, so
+        a network hiccup costs a few seconds rather than the membership (ROBUSTNESS.md §3.6).
+        The rounds back off from reconnect_interval_s to six times it with a random spread,
+        so the clients of a seed that restarts do not all dial it at once, and they go on
+        until the owner closes the peer (swarm retries, ROBUSTNESS.md §10.3 E5). A link
+        that ended within reconnect_interval_s of its dial counts as a failed round, so a
+        seed that accepts each dial and drops it at once gets the same pauses and no dial
+        loop (ROBUSTNESS.md §10.6). A bootstrapped peer reads the beacon document again
+        every reconnect_window_s with nothing reachable, and keeps the seeds it has when
+        the beacon is unreachable too."""
+        if time.monotonic() - self._link_since < self.reconnect_interval_s:
+            self._quick_drops += 1
+            time.sleep(self._reconnect_pause(self._quick_drops))
+        else:
+            self._quick_drops = 0
         deadline = time.monotonic() + self.reconnect_window_s
-        refreshed = False
+        rounds = 0
         while self._running:
             if time.monotonic() >= deadline:
-                if refreshed or self._refresh_seeds is None:
-                    return False
-                refreshed = True
-                try:
-                    seeds = self._expand_seeds(self._refresh_seeds())
-                except Exception:  # noqa: BLE001 - the beacon is unreachable too: give up
-                    return False
-                if not seeds:
-                    return False
-                self._seeds = seeds
                 deadline = time.monotonic() + self.reconnect_window_s
+                if self._refresh_seeds is not None:
+                    try:
+                        seeds = self._expand_seeds(self._refresh_seeds())
+                    except Exception:  # noqa: BLE001 - the beacon is unreachable too: the seeds held stay
+                        seeds = None
+                    if seeds:
+                        self._seeds = seeds
             for seed in self._candidate_seeds():
                 if not self._running:
                     return False
@@ -303,8 +447,15 @@ class Peer:
                 for space in list(self._pulled_spaces):
                     self.pull_space(space)
                 return True
-            time.sleep(self.reconnect_interval_s)
+            rounds += 1
+            time.sleep(self._reconnect_pause(rounds))
         return False
+
+    def _reconnect_pause(self, rounds: int) -> float:
+        """The pause after the ``rounds``-th failed round of dials: reconnect_interval_s doubling
+        to six times it, with a random spread of up to a quarter (swarm retries)."""
+        wait = min(6 * self.reconnect_interval_s, self.reconnect_interval_s * 2 ** min(rounds - 1, 3))
+        return wait * random.uniform(1.0, 1.25)
 
     def bootstrap(self, url: str, *, group_id: str | None = None, allow_plain: bool = False,
                   beacon_peer: str | None = None, timeout: float = 3.0,
@@ -505,6 +656,21 @@ class Peer:
     def _now_ms(self) -> int:
         return int(self.clock() * 1000)
 
+    def counters(self) -> dict[str, int]:
+        """The stamp refusals this peer counted, under the Java node's names (HLC round four,
+        2026-11-08, decision D5; HLC round five, 2026-11-08, decision E2): frames refused for
+        a counter above LOGICAL_LIMIT, frames stamped further past wall + MAX_DRIFT than the
+        skew margin, frames within it, verified states and claims refused for a counter above
+        the limit, those refused for a stamp an hour past the margin, those deferred for a
+        stamp past the margin by less, and space deltas that did not decode."""
+        return {"framesLogicalRefused": self.frames.logical_refused,
+                "framesFarFuture": self.frames.far_future,
+                "framesFarFutureSkewed": self.frames.far_future_skewed,
+                "stampsLogicalRefused": self.stamps_logical_refused,
+                "stampsFarFutureRefused": self.stamps_far_future_refused,
+                "stampsFarFutureDeferred": self.stamps_far_future_deferred,
+                "deltasUndecodable": self.deltas_undecodable}
+
     # ------------------------------------------------------------- protocol
 
     def introduce(self) -> None:
@@ -562,15 +728,180 @@ class Peer:
             self._fold(delta["state"])
         return entry_id
 
-    def publish_ad(self, ad_type: str, ad: dict) -> None:
-        """Publishes an advertisement this peer issued (an AgentCard, an
-        AssetCard) on the 'ads' stream, as DiscoveryService.publish does: the
-        stored form, under the advertisement's id and issue time."""
+    def publish_ad(self, ad_type: str, ad: dict) -> dict:
+        """Publishes an advertisement this peer issued (an AgentCard, an AppCard, an
+        AssetCard) on the 'ads' stream, as DiscoveryService.publish does: the stored form,
+        under the advertisement's id and issue time. Returns the advertisement as signed.
+
+        An AppCard or AgentCard is a full card, and this peer keeps it (SPEC §6.1a.2 and
+        §6.1a.5, v0.1.32; AppCard origin and formats, 2026-11-09): it signs the card without
+        origin, formats, and an ``idp`` host while a member of its view is below AppCard
+        level 2, as a stub whose large parts sit on the content swarm while the card's
+        encoding passes 65,536 bytes, the whole view is at level 2, and a content swarm is
+        attached, and in full otherwise. A change of the view's level reissues every card it
+        shapes at once; ``withdraw_ad`` stops that."""
+        if ad_type in ("AppCard", "AgentCard"):
+            if "spill" in ad:
+                raise ValueError("publish the full card; the peer spills it when it must")
+            if not records.conforms(ad, ad_type):
+                raise ValueError(f"no reader decodes this {ad_type} (SPEC §6.1a): {ad.get('id')}")
+            with self._cards_lock:
+                self._refresh_gate()
+                self._cards[ad["id"]] = (ad_type, ad)
+                return self._issue_card(ad_type, ad, self._gate_open)
+        self._sign_and_send(ad_type, ad)
+        return ad
+
+    def withdraw_ad(self, ad_id: str) -> None:
+        """Stops reissuing a card: the last one signed lapses at its ttl, and a parts document
+        it named is released one ttl after the last card that named it."""
+        with self._cards_lock:
+            self._cards.pop(ad_id, None)
+            self._signed_issued.pop(ad_id, None)
+
+    def _sign_and_send(self, ad_type: str, ad: dict) -> None:
         from .identity import parse_instant_millis
         stored = wire.stored_ad(ad_type, ad, self.identity)
         self.accept_ad(stored)  # our own cache holds it too, as DiscoveryService.publish does
         item_id = f"{ad['id']}:{parse_instant_millis(ad['issued'])}"
         self._send("RUMOR", wire.rumor_body("ads", item_id, 6, cbor.dumps(stored)))
+
+    def _issue_card(self, ad_type: str, card: dict, gate_open: bool) -> dict:
+        """Signs a full card for the view (AppCardPublisher.issue): a strictly newer issue
+        instant than the last one signed, the gate, then the spill."""
+        from .identity import parse_instant_millis
+        issued_ms = parse_instant_millis(card["issued"])
+        last = self._signed_issued.get(card["id"])
+        if last is not None and issued_ms <= last:
+            issued_ms = last + 1  # the cache keeps only a strictly newer version
+            card = {**card, "issued": instant_iso(issued_ms)}
+        self._signed_issued[card["id"]] = issued_ms
+        gated = card
+        if ad_type == "AppCard":
+            gated = wire.app_card_for_view(card, gate_open)
+            if gated != card:
+                self.app_cards_downgraded += 1
+        prepared = self._spill(ad_type, gated, gate_open)
+        self._sign_and_send(ad_type, prepared)
+        return prepared
+
+    def _spill(self, ad_type: str, card: dict, gate_open: bool) -> dict:
+        """CardSpiller.prepare (FR-12, FR-13): the card, or its stub once its parts document is
+        on the content swarm."""
+        size = len(cbor.dumps(card))
+        threshold = wire.CARD_SPILL_THRESHOLD_BYTES
+        parts = wire.non_empty_parts(wire.card_parts(card)) if size > threshold else []
+        # a card whose size sits outside the spill set (a long name or description) has nothing to move
+        spills = bool(parts) and gate_open and self.content is not None
+        self._warn_size(ad_type, card, size, spills)
+        if size <= threshold:
+            return card
+        if not spills:
+            self.cards_oversize_inline += 1
+            return card
+        document = cbor.dumps(wire.card_parts(card))
+        try:
+            root = self.content.put_spill(card["id"], document)
+        except (ValueError, OSError) as refused:
+            LOG.warning("the content swarm refused the parts document of %s (%s); the card travels inline",
+                        card["id"], refused)
+            self.cards_oversize_inline += 1
+            return card
+        self._spill_holds[root] = max(self._spill_holds.get(root, 0), _ad_expires_ms(card))
+        self.cards_spilled += 1
+        return wire.card_stub(card, wire.card_spill(root, len(document), parts))
+
+    def _warn_size(self, ad_type: str, card: dict, size: int, spills: bool) -> None:
+        if size <= wire.CARD_SPILL_WARN_BYTES or self._warned.get(card["id"]) == size:
+            return
+        self._warned[card["id"]] = size
+        kind = f"AppCard (kind {card['kind']})" if ad_type == "AppCard" else ad_type
+        if size <= wire.CARD_SPILL_THRESHOLD_BYTES:
+            fate = "it travels inline until it passes the threshold"
+        elif spills:
+            fate = "it spills its large parts to the content swarm"
+        else:
+            fate = ("it travels inline, since the view is below the AppCard level, no content swarm serves the group,"
+                    " or no field of its spill set holds anything")
+        LOG.warning("%s %s encodes to %d bytes, past the %d-byte warning; the spill threshold is %d bytes, and %s",
+                    kind, card["id"], size, wire.CARD_SPILL_WARN_BYTES, wire.CARD_SPILL_THRESHOLD_BYTES, fate)
+
+    def appcard_gate_open(self) -> bool:
+        """Whether this peer and every member of its view read the AppCard level's fields (FR-6,
+        FR-7). The view is the member table: a member counts from its first frame or
+        advertisement and leaves when its advertisement's lease lapses (SPEC §5.3, leased views);
+        one heard from whose advertisement has not arrived counts as level 1."""
+        if self.appcard_level < APPCARD_LEVEL:
+            return False
+        now = self._now_ms()
+        for ad in list(self.members.values()):
+            if not ad:
+                return False
+            if _ad_expires_ms(ad) <= now:
+                continue
+            if appcard_level_of(ad["resourceHints"].get(HINT_APPCARD)) < APPCARD_LEVEL:
+                return False
+        return True
+
+    def _maintain_cards(self, view_changed: bool) -> None:
+        """Reissues every card the gate shapes when the view's level changes, and releases each
+        spilled root one ttl after the last card that named it (DiscoveryService's tick work)."""
+        with self._cards_lock:
+            now = self._now_ms()
+            if self._cards and (view_changed or now - self._gate_checked_ms >= APPCARD_GATE_RECHECK_MS):
+                self._refresh_gate()
+            for root, until in list(self._spill_holds.items()):
+                if now >= until:
+                    del self._spill_holds[root]
+                    if self.content is not None:
+                        self.content.release(root)
+
+    def _refresh_gate(self) -> None:
+        """Looks at the view's AppCard level; on a change it reissues, at once, every live card
+        whose form the gate decides: one with a gated field, or one past the spill threshold."""
+        now = self._now_ms()
+        self._gate_checked_ms = now
+        gate_open, was = self.appcard_gate_open(), self._gate_open
+        self._gate_open = gate_open
+        if was is None or gate_open == was:
+            return
+        for ad_type, card in list(self._cards.values()):
+            shaped = ad_type == "AppCard" and wire.app_card_for_view(card, False) != card
+            if _ad_expires_ms(card) > now and (shaped or len(cbor.dumps(card)) > wire.CARD_SPILL_THRESHOLD_BYTES):
+                self._issue_card(ad_type, card, gate_open)
+
+    def resolve(self, card: dict, timeout_s: float | None = None) -> dict:
+        """The full card of a stub (SPEC §6.1a.5, FR-15): a card without ``spill`` as it is, and
+        otherwise the stub with its parts document's values in place. A ``size`` above
+        ``spill_max_fetch_bytes`` fails before any fetch (``spills_over_limit``); a document of
+        the wrong length, one that does not decode as the kind's parts record, or one whose
+        non-empty fields are not exactly ``spill.parts`` fails (``spills_refused``); each raises
+        ``ValueError``. No content swarm raises ``LookupError``, a document no holder serves
+        within ``timeout_s`` (the content swarm's 30 s by default) raises ``TimeoutError``, and a fetch that fails for another reason
+        (a sealed root, a piece table this client cannot keep inline) raises ``OSError``, each
+        uncounted. No failure evicts the stub or strikes anyone."""
+        spill = card.get("spill")
+        if spill is None:
+            return card
+        if spill["size"] > self.spill_max_fetch_bytes:
+            self.spills_over_limit += 1
+            raise ValueError(f"the parts document of {card['id']} is {spill['size']} bytes, above the fetch bound "
+                             f"of {self.spill_max_fetch_bytes}")
+        if self.content is None:
+            raise LookupError(f"no content swarm serves this group, so the stub {card['id']} stays a stub")
+        kind = "AgentCard" if "agent" in card else "AppCard"
+        try:
+            document = (self.content.get_spill(spill["root"], spill["size"]) if timeout_s is None
+                        else self.content.get_spill(spill["root"], spill["size"], timeout_s))
+        except ValueError as refused:
+            self.spills_refused += 1
+            raise ValueError(f"the parts document of {card['id']} does not complete its stub: {refused}") from refused
+        parts = records.decode(document, kind + ".Parts")
+        # the parts record and the stub each passed their decode, which holds every rule of the full card
+        if parts is None or wire.non_empty_parts(parts) != list(spill["parts"]):
+            self.spills_refused += 1
+            raise ValueError(f"the parts document of {card['id']} does not complete its stub")
+        return wire.card_complete(card, parts)
 
     def pull_space(self, space: str) -> None:
         """Anti-entropy pull (spec §5.3): offer an empty digest, and the
@@ -625,37 +956,69 @@ class Peer:
         self._send("DIGEST", wire.digest_body({"ads": b""}))
 
     def accept_ad(self, stored) -> dict | None:
-        """Admits a StoredAd as AdCache.accept does: the signature over the
-        canonical bytes under the carried key, the issuer derived from that
-        key, and the TTL not yet passed. Returns the cached entry, or None."""
-        from .identity import derive_id, parse_duration_millis, parse_instant_millis
-        if not isinstance(stored, dict):
+        """Admits a StoredAd as AdCache.accept does: a type tag AdCache knows, the
+        signature over the advertisement's bytes under the carried key, those bytes
+        the record its type tag names in the wire encoding (HLC round six,
+        2026-11-08, owner rulings F1 and F3), the issuer derived from that key, the
+        TTL not yet passed, and room under the cache's two bounds (SPEC §6.3, v0.1.32).
+        Returns the cached entry, or None."""
+        from .identity import derive_id, parse_instant_millis
+        if not records.conforms(stored, "AdCache.StoredAd") or stored["adType"] not in records.AD_TYPES:
             return None
-        ad_bytes, key, signature = stored.get("adBytes"), stored.get("publicKey"), stored.get("signature")
-        if not (isinstance(ad_bytes, bytes) and isinstance(key, bytes) and isinstance(signature, bytes)):
+        ad_bytes, key, signature = stored["adBytes"], stored["publicKey"], stored["signature"]
+        if ad_bytes is None or key is None or signature is None or not Identity.verify(key, ad_bytes, signature):
             return None
-        if not Identity.verify(key, ad_bytes, signature):
+        ad = records.decode(ad_bytes, stored["adType"])
+        if ad is None or ad["issuer"] != derive_id(key):
             return None
-        try:
-            ad = cbor.loads(ad_bytes)
-            if not isinstance(ad, dict) or ad.get("issuer") != derive_id(key):
-                return None
-            expires = parse_instant_millis(ad["issued"]) + parse_duration_millis(ad["ttl"])
-        except (KeyError, ValueError, TypeError):
-            return None
+        expires = _ad_expires_ms(ad)
         if expires <= self._now_ms():
             return None
         entry = {"type": stored.get("adType"), "ad": ad, "stored": stored, "issuer": ad["issuer"],
                  "expires": expires}
-        previous = self.ads.get(ad["id"])
-        if previous is None or parse_instant_millis(previous["ad"]["issued"]) <= parse_instant_millis(ad["issued"]):
+        with self._ads_lock:
+            previous = self.ads.get(ad["id"])
+            newer = previous is None or parse_instant_millis(previous["ad"]["issued"]) < parse_instant_millis(ad["issued"])
+            if not newer:
+                return previous  # the held version stays; nothing grows
+            if not self._fits(ad["id"], len(ad_bytes)):
+                self._evict_expired()
+                if not self._fits(ad["id"], len(ad_bytes)):
+                    # ASF-019 and SPEC §6.3: a flood fills spare headroom but never evicts a live advertisement
+                    self.ads_refused_cache_full += 1
+                    return None
+            held = self.ads.get(ad["id"])
+            self.ad_cache_bytes += len(ad_bytes) - (len(held["stored"]["adBytes"]) if held else 0)
             self.ads[ad["id"]] = entry
-        return self.ads[ad["id"]]
+            return entry
+
+    def _fits(self, ad_id: str, length: int) -> bool:
+        """Whether a newer advertisement of ``length`` bytes fits both bounds, given what the
+        cache holds for its id."""
+        held = self.ads.get(ad_id)
+        if held is None:
+            return len(self.ads) < self.ad_cache_max_entries and self.ad_cache_bytes + length <= self.ad_cache_max_bytes
+        return self.ad_cache_bytes - len(held["stored"]["adBytes"]) + length <= self.ad_cache_max_bytes
+
+    def _evict_expired(self) -> None:
+        """Drops the lapsed advertisements; the caller holds ``_ads_lock``."""
+        now = self._now_ms()
+        for ad_id, entry in list(self.ads.items()):
+            if entry["expires"] <= now:
+                del self.ads[ad_id]
+                self.ad_cache_bytes -= len(entry["stored"]["adBytes"])
 
     def cards(self) -> list[dict]:
         """The live AgentCards the ads stream carried."""
         now = self._now_ms()
         return [e["ad"] for e in self.ads.values() if e["type"] == "AgentCard" and e["expires"] > now]
+
+    def app_cards(self) -> list[dict]:
+        """The live AppCards the ads stream carried, stubs as they stand: filter them with
+        ``wire.from_origin`` and ``wire.handles``, which read the fields a stub keeps, and
+        ``resolve`` one before reading its reads, actions, views, or ui."""
+        now = self._now_ms()
+        return [e["ad"] for e in self.ads.values() if e["type"] == "AppCard" and e["expires"] > now]
 
     def send_pipe(self, to: str, capability: str, payload: bytes, via: list | None = None) -> None:
         """One capability frame to a member (CapabilityPipes.send): a
@@ -690,6 +1053,20 @@ class Peer:
             self._send("RELAY_FRAME", wire.relay_frame_body(to, inner), to=relay)
 
     # ------------------------------------------------------------- payloads
+
+    def value_of(self, dto: dict) -> tuple:
+        """``(True, value)`` with the value an entry's payload holds, or ``(False, None)``
+        while the payload is on its way (``payload_of``) or when its bytes are outside the
+        wire encoding. The record signature covers those bytes, so such an entry still
+        replicates, and every read skips its value (HLC round six, 2026-11-08, owner ruling
+        F3)."""
+        raw = self.payload_of(dto)
+        if raw is None:
+            return False, None
+        try:
+            return True, cbor.loads(raw)
+        except ValueError:
+            return False, None
 
     def payload_of(self, dto: dict) -> bytes | None:
         """The payload bytes of an entry's record: inline, or resolved from a block
@@ -744,18 +1121,17 @@ class Peer:
 
     def _accept_peer_ad(self, payload: bytes) -> None:
         """A 'peers' stream item: PeerNode.SignedPeerAd. The advertisement is
-        kept under its issuer when the signature and the derivation hold."""
-        from .identity import derive_id
-        try:
-            signed = cbor.loads(payload)
-            ad_bytes, key, signature = signed["adBytes"], signed["publicKey"], signed["signature"]
-            if not Identity.verify(key, ad_bytes, signature):
-                return
-            ad = cbor.loads(ad_bytes)
-            if isinstance(ad, dict) and ad.get("issuer") == derive_id(key) and ad["issuer"] != self.identity.peer_id:
-                self.members[ad["issuer"]] = ad
-        except (KeyError, TypeError, ValueError):
+        kept under its issuer when the signature and the derivation hold and no
+        newer one of that issuer is held."""
+        from .identity import parse_instant_millis
+        ad = wire.decode_signed_peer_ad(payload)
+        if ad is None or ad["issuer"] == self.identity.peer_id:
             return
+        held = self.members.get(ad["issuer"])
+        if held and parse_instant_millis(held["issued"]) > parse_instant_millis(ad["issued"]):
+            return  # a reordered older advertisement never replaces the hints a newer one states
+        self.members[ad["issuer"]] = ad
+        self._maintain_cards(view_changed=True)
 
     def find(self, type_name: str):
         """Returns decoded values of known live entries of one schema type."""
@@ -763,9 +1139,9 @@ class Peer:
         for dto in self.states.values():
             record = dto.get("record") or {}
             if record.get("type") == type_name and not dto.get("completed"):
-                payload = self.payload_of(dto)
-                if payload is not None:
-                    results.append(cbor.loads(payload))
+                readable, value = self.value_of(dto)
+                if readable:
+                    results.append(value)
         return results
 
     # ------------------------------------------------------------- internals
@@ -800,18 +1176,7 @@ class Peer:
                     # Corrupt or hostile prefix: the stream cannot be
                     # resynchronized (ASF-016). Drop the connection.
                     raise OSError(f"bad frame length {length}")
-                frame = self._read_exact(length)
-                try:
-                    decoded = wire.decode_frame_detailed(frame, attested=self._attested)
-                    env = decoded[0] if decoded is not None else None
-                    if env is None:
-                        self.malformed_frames += 1
-                    elif self._accepts(env):
-                        if decoded[1] == "attested":
-                            self.attested_frames += 1
-                        self._handle(env)
-                except Exception:  # noqa: BLE001 - one hostile frame must not
-                    self.malformed_frames += 1  # kill the reader (ASF-015); the frame is dropped
+                self._receive(self._read_exact(length))
             except OSError:
                 # The socket closed or failed. Closed by the owner: done. Otherwise reconnect
                 # to the seed and carry on; the fleet's leases cover the gap either way.
@@ -824,6 +1189,22 @@ class Peer:
                         pass
                 if not self._running or self._seed is None or not self._reconnect():
                     return
+
+    def _receive(self, frame: bytes) -> None:
+        """One frame off the connection: decoded, verified, filtered and handled, or dropped
+        and counted as malformed. No frame raises out of here, so one hostile frame cannot
+        kill the reader (ASF-015)."""
+        try:
+            decoded = wire.decode_frame_detailed(frame, attested=self._attested)
+            env = decoded[0] if decoded is not None else None
+            if env is None:
+                self.malformed_frames += 1
+            elif self._accepts(env):
+                if decoded[1] == "attested":
+                    self.attested_frames += 1
+                self._handle(env)
+        except Exception:  # noqa: BLE001 - one hostile frame must not kill the reader
+            self.malformed_frames += 1
 
     def _accepts(self, env) -> bool:
         """The reader filter: a verified envelope for our group that is
@@ -849,6 +1230,8 @@ class Peer:
         if not self.frames.admit(env, self._now_ms()):
             return  # stale, far ahead, or a replay: dropped and counted, nothing more
         wire.hlc_observe(self.identity.peer_id, env.get("stamp"), self._now_ms())
+        if self._cards or self._spill_holds:
+            self._maintain_cards(view_changed=False)
         kind = env.get("kind")
         body = env.get("body") or b""
         sender = env.get("from")
@@ -856,7 +1239,9 @@ class Peer:
             # A verified frame is a member heard from (the frame's signer), and
             # one our socket reaches; a frame a relay carried for its origin
             # says nothing about reaching that origin.
-            self.members.setdefault(sender, {})
+            if sender not in self.members:
+                self.members[sender] = {}
+                self._maintain_cards(view_changed=True)
             if not relayed:
                 self.reachable.add(sender)
             if not relayed and self._seed is not None and env.get("to") == self.identity.peer_id \
@@ -866,86 +1251,93 @@ class Peer:
                 self.seed_peer = sender
                 self.resource_hints["relay.via"] = sender
                 self.introduce()
-        if kind == "PING":
-            ping = cbor.loads(body)
-            self._send("ACK", wire.ack_body(ping.get("nonce", 0)))
-        elif kind == "PIPE_DATA":
-            frame = cbor.loads(body)
-            if isinstance(frame, dict) and frame.get("capability") == wire.RELAY_SIGNAL_CAPABILITY:
-                signal = cbor.loads(frame.get("payload") or b"\xf6")
-                if isinstance(signal, dict):
-                    self.relay_signals.append(signal)
-                    del self.relay_signals[:-64]
-                return
-            handler = self.pipe_handlers.get(frame.get("capability")) if isinstance(frame, dict) else None
-            if handler is not None:
-                handler(sender, frame.get("payload") or b"")
-        elif kind == "RELAY_FRAME":
-            relay = cbor.loads(body)
-            if not isinstance(relay, dict) or relay.get("target") != self.identity.peer_id:
-                return  # a dial-only peer forwards nothing: it holds no connection to forward on
-            inner = wire.decode_frame(relay.get("frame") or b"")
-            if inner is not None and inner.get("kind") != "RELAY_FRAME" and self._accepts(inner):
-                self._handle(inner, relayed=True)
-        elif kind == "BLOCK_WANT":
-            want = cbor.loads(body)
-            data = self.blocks.get(want.get("cid")) if isinstance(want, dict) else None
-            if data is not None:
-                self.send_addressed("BLOCK", wire.block_body(want["cid"], data), sender)
-        elif kind == "BLOCK":
-            block = cbor.loads(body)
-            if isinstance(block, dict) and isinstance(block.get("bytes"), bytes) \
-                    and block.get("cid") in self._block_asked and wire.block_cid(block["bytes"]) == block["cid"]:
-                self.blocks[block["cid"]] = block["bytes"]
-                self._wake_fold_waiters()
-        elif kind == wire.KIND_GROUP_AD:
-            self._on_group_ad(body)
-        elif kind == "RUMOR":
-            rumor = cbor.loads(body)
-            if isinstance(rumor, dict) and rumor.get("streamId") in revocations.STREAMS:
-                self.revocations.accept(rumor["streamId"], rumor.get("payload"), self._now_ms())
-            elif isinstance(rumor, dict) and rumor.get("streamId") == "peers":
-                self._accept_peer_ad(rumor.get("payload") or b"")
-            elif isinstance(rumor, dict) and rumor.get("streamId") == "ads":
-                self.accept_ad(cbor.loads(rumor.get("payload") or b"\xf6"))
-            elif isinstance(rumor, dict) and str(
-                    rumor.get("streamId", "")).startswith("space:"):
-                delta = cbor.loads(rumor.get("payload") or b"\xf6")
-                if isinstance(delta, dict):
-                    # Claim before state: a completion authenticates against the
-                    # holder's claim, which must be folded first.
-                    if delta.get("claimEntry") and isinstance(delta.get("claim"), dict):
-                        self._fold_claim(delta["claimEntry"], delta["claim"])
-                    if isinstance(delta.get("state"), dict):
-                        self._name_recordless(delta["state"], rumor.get("itemId"))
-                        self._fold(delta["state"])
-        elif kind == "PULL_RESP":
-            resp = cbor.loads(body)
-            for stream, delta_bytes in (resp.get("deltas") or {}).items():
-                if stream in revocations.STREAMS and delta_bytes:
-                    for signed in cbor.loads(delta_bytes) or []:
-                        self.revocations.accept_signed(stream, signed, self._now_ms())
-                    continue
-                if stream == "ads" and delta_bytes:
-                    delta = cbor.loads(delta_bytes)
-                    for stored in (delta.get("ads") or []) if isinstance(delta, dict) else []:
-                        self.accept_ad(stored)
-                    continue
-                if str(stream).startswith("space:") and delta_bytes:
-                    sync = cbor.loads(delta_bytes)
-                    # Claims before states, as above.
-                    for entry_id, signed in (sync.get("claims") or {}).items():
-                        if isinstance(signed, dict):
-                            self._fold_claim(entry_id, signed)
-                    for dto in (sync.get("states") or []):
-                        if isinstance(dto, dict):
-                            self._fold(dto)
-        else:
+        if kind not in wire.BODY_RECORDS:
             # A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are
             # never sent to it, but a misconfigured peer could), or one it does not act on (the
             # seed's own CHANNEL_HELLO: this client signs every frame it sends, so the seed's
             # acceptance of bare frames changes nothing here): ignored, counted, never fatal.
             self.ignored_kinds[str(kind)] = self.ignored_kinds.get(str(kind), 0) + 1
+            return
+        decoded = wire.decode_body(kind, body)
+        if decoded is None:
+            # HLC round six, 2026-11-08 (owner rulings F1 and F3): a body outside the wire
+            # encoding or its record makes the frame undecodable; nobody is struck for it.
+            self.malformed_frames += 1
+            return
+        if kind == "PING":
+            self._send("ACK", wire.ack_body(decoded["nonce"]))
+        elif kind == "PIPE_DATA":
+            if decoded["capability"] == wire.RELAY_SIGNAL_CAPABILITY:
+                signal = records.decode(decoded["payload"], "PeerNode.RelaySignal")
+                if signal is not None:
+                    self.relay_signals.append(signal)
+                    del self.relay_signals[:-64]
+                return
+            handler = self.pipe_handlers.get(decoded["capability"])
+            if handler is not None:
+                handler(sender, decoded["payload"] or b"")
+        elif kind == "RELAY_FRAME":
+            if decoded["target"] != self.identity.peer_id:
+                return  # a dial-only peer forwards nothing: it holds no connection to forward on
+            inner = wire.decode_frame(decoded["frame"] or b"")
+            if inner is not None and inner.get("kind") != "RELAY_FRAME" and self._accepts(inner):
+                self._handle(inner, relayed=True)
+        elif kind == "BLOCK_WANT":
+            data = self.blocks.get(decoded["cid"])
+            if data is not None:
+                self.send_addressed("BLOCK", wire.block_body(decoded["cid"], data), sender)
+        elif kind == "BLOCK":
+            block = decoded
+            if isinstance(block["bytes"], bytes) and block["cid"] in self._block_asked \
+                    and wire.block_cid(block["bytes"]) == block["cid"]:
+                self.blocks[block["cid"]] = block["bytes"]
+                self._wake_fold_waiters()
+        elif kind == wire.KIND_GROUP_AD:
+            self._on_group_ad(decoded)
+        elif kind == "RUMOR":
+            rumor = decoded
+            if rumor["streamId"] in revocations.STREAMS:
+                self.revocations.accept(rumor["streamId"], rumor["payload"], self._now_ms())
+            elif rumor["streamId"] == "peers":
+                self._accept_peer_ad(rumor["payload"])
+            elif rumor["streamId"] == "ads":
+                self.accept_ad(records.decode(rumor["payload"], "AdCache.StoredAd"))
+            elif rumor["streamId"] in self.stream_handlers:
+                self._on_stream_item(sender, rumor)
+            elif str(rumor["streamId"]).startswith("space:"):
+                self._prune_claims()
+                delta = wire.decode_delta(rumor["payload"])
+                if delta is None:
+                    self.deltas_undecodable += 1  # HLC round four, 2026-11-08, decision D5
+                    return
+                # Claim before state: a completion authenticates against the
+                # holder's claim, which must be folded first.
+                if delta.get("claimEntry") and delta.get("claim") is not None:
+                    self._fold_claim(delta["claimEntry"], delta["claim"])
+                if delta.get("state") is not None:
+                    self._name_recordless(delta["state"], rumor.get("itemId"))
+                    self._fold(delta["state"])
+        elif kind == "PULL_RESP":
+            for stream, delta_bytes in (decoded["deltas"] or {}).items():
+                if stream in revocations.STREAMS and delta_bytes:
+                    self.revocations.accept_delta(stream, delta_bytes, self._now_ms())
+                    continue
+                if stream == "ads" and delta_bytes:
+                    delta = records.decode(delta_bytes, "AdCache.Delta")
+                    for stored in (delta["ads"] or []) if delta is not None else []:
+                        self.accept_ad(stored)
+                    continue
+                if str(stream).startswith("space:") and delta_bytes:
+                    self._prune_claims()
+                    sync = wire.decode_sync_delta(delta_bytes)
+                    if sync is None:
+                        self.deltas_undecodable += 1  # HLC round four, 2026-11-08, decision D5
+                        continue
+                    # Claims before states, as above.
+                    for entry_id, signed in (sync.get("claims") or {}).items():
+                        self._fold_claim(entry_id, signed)
+                    for dto in (sync.get("states") or []):
+                        self._fold(dto)
 
     @staticmethod
     def _name_recordless(state: dict, item_id) -> None:
@@ -957,7 +1349,7 @@ class Peer:
         if len(parts) >= 2 and parts[0] in ("r", "d", "x", "c"):
             state["entryId"] = parts[1]
 
-    def _on_group_ad(self, body: bytes) -> None:
+    def _on_group_ad(self, signed: dict) -> None:
         """A GROUP_AD answer (spec §9): accepted only while a join-by-GroupID
         is pending and only when the body passes the four checks of §5.1 and
         derives to exactly the wanted group. Anything else is ignored, so a
@@ -965,68 +1357,110 @@ class Peer:
         and never changes what this peer joins."""
         if self._founding_ready.is_set():
             return  # already joined on a verified document
-        signed = cbor.loads(body)
         if verify_signed_group_ad(signed) != self.group:
             return
         self.founding = signed
         self._founding_ready.set()
 
     def _fold(self, dto: dict) -> None:
+        if dto.get("leaseStamp") is None or dto.get("leaseValue") is None:
+            # HLC round five, 2026-11-08 (decision E7): such a state decodes, but a lease
+            # register holds nothing without its stamp and value, so the peer drops it before
+            # any judgement, with or without its record, as Java's mergeState and Ruby's
+            # fold_state do: it merges nothing, waits for nothing, and counts nothing.
+            return
         if dto.get("record") is None:
             self._fold_recordless(dto)
             return
         record = dto.get("record")
         entry_id = record.get("entryId") if isinstance(record, dict) else None
-        if not entry_id or not self._verify_state(dto, record):
+        if not entry_id or not _dots_bound_to_issuer(dto, record):
+            # ASF-025, as Java's ReplicatedSpace.dotsBoundToIssuer: only the entry's writer
+            # mints its dots, so a dot naming another replica is fabricated provenance. The
+            # peer drops such a state before verification and counts nothing (HLC round six,
+            # 2026-11-08, vector delta-13); a recordless state meets the rule under the record
+            # this replica holds, since it comes back here with that record.
+            return
+        if not self._verify_state(dto, record):
             return  # unauthenticated record or forged mutable state: drop it
-        # HLC canonical stamps, 2026-11-08: after verification, as Java's ReplicatedSpace
-        # judges it, the peer refuses a state whose stamps the rule refuses and counts it
-        # once per distinct state, so the state never reaches the lease register.
-        if not self._stamps_acceptable(dto):
-            self._count_refused("states", entry_id, dto)
+        if self._refused_for_revocation(dto, record):
+            # Authentic, but its actor is revoked here (SPEC §5.6): what is already held
+            # stays as held, this state is not merged, and its stamps count nothing, since
+            # the peer judges revocation before them (HLC round five, 2026-11-08, decision E6).
+            return
+        # HLC round four, 2026-11-08 (decisions D1, D4, D5): after verification, as Java's
+        # ReplicatedSpace judges it, the peer refuses a state whose record, lease or signing
+        # stamp the rule refuses, or whose record or lease stamp runs more than an hour past
+        # the skew margin, and counts it once per distinct signed state; it defers a state
+        # stamped past the margin by less until its wall catches up. HLC round five,
+        # 2026-11-08 (decisions E2 and E5): the peer judges each offer afresh against its wall,
+        # so a refused far-future state merges once the wall catches up, and the memories only
+        # keep a re-offer from counting twice.
+        # HLC round six, 2026-11-08 (owner ruling F4): an agent's signedAt meets the same
+        # far-future rule as the record and lease stamps, where the certificate check dropped
+        # it unverified and uncounted past the drift bound.
+        stamps = (record.get("issued"), dto.get("leaseStamp"), dto.get("signedAt"))
+        verdict = self._stamp_verdict(stamps, stamps)
+        key = ("state", entry_id, str(record.get("issued")),
+               hashlib.sha256(self._state_view(dto, record)).digest())
+        if verdict == _DEFER:
+            self._count_deferred(key)
+            return
+        if verdict != _MERGE:
+            self._count_refused(key, verdict)
             return
         pending = self.pending_states.pop(entry_id, None)
         self._pending_since.pop(entry_id, None)
-        if self._refused_for_revocation(dto, record):
-            # Authentic, but its actor is revoked here (SPEC §5.6): what is
-            # already held stays as held, and this state is not merged.
-            return
         # ASF-017: states JOIN, mirroring the Java CRDT — dot sets union, the
         # lease is last-writer-wins by HLC stamp, and completed is monotone.
         # A replayed early state (validly signed by its author) can therefore
         # never shrink the sets, roll back the lease, or undo a completion.
-        previous = self.states.get(entry_id)
-        merged = self._join(previous, dto) if previous is not None else dto
-        self.states[entry_id] = merged
+        with self._state_lock:
+            previous = self.states.get(entry_id)
+            merged = self._join(previous, dto) if previous is not None else dto
+            self.states[entry_id] = merged
         if self.on_state is not None:
             self.on_state(merged)
+        if (self.on_withdrawn is not None and previous is not None and present(previous)
+                and not present(merged) and not merged.get("completed")):
+            self.on_withdrawn(merged)
         self._wake_fold_waiters()
         if pending is not None:
             self._fold_recordless(pending)
 
-    @staticmethod
-    def _stamps_acceptable(dto: dict) -> bool:
-        """True when the stamps of a verified state pass the rule (HLC canonical stamps,
-        2026-11-08): the record's issue stamp and the lease stamp, when present, meet
-        ``wire.acceptable_hlc``, and the signing stamp, when present, meets the canonical
-        grammar alone (``wire.parse_hlc``), since Java never judges signedAt against
-        LOGICAL_LIMIT."""
-        signed_at = dto.get("signedAt")
-        return (wire.acceptable_hlc(dto["record"].get("issued")) is not None
-                and (dto.get("leaseStamp") is None or wire.acceptable_hlc(dto["leaseStamp"]) is not None)
-                and (signed_at is None or wire.parse_hlc(signed_at) is not None))
+    def _stamp_verdict(self, stamps: tuple, timed: tuple) -> str:
+        """What the peer does with a verified state or claim for its stamps (HLC round four,
+        2026-11-08). ``_REFUSE_LOGICAL`` when one of ``stamps`` the rule refuses
+        (``wire.acceptable_hlc``, decision D1); otherwise ``_REFUSE_FAR_FUTURE`` when one of
+        ``timed`` runs more than FAR_FUTURE_HOSTILE_MILLIS past wall + MAX_HLC_SKEW_MILLIS +
+        FAR_FUTURE_SKEW_MARGIN_MILLIS, and ``_DEFER`` when one runs past that line by less
+        (decision D4); ``_MERGE`` otherwise. An absent stamp passes. The peer judges the
+        logical limit first, as Java does (HLC round five, 2026-11-08, decisions E2 and E6)."""
+        if any(stamp is not None and wire.acceptable_hlc(stamp) is None for stamp in stamps):
+            return _REFUSE_LOGICAL
+        line = self._now_ms() + wire.MAX_HLC_SKEW_MILLIS + wire.FAR_FUTURE_SKEW_MARGIN_MILLIS
+        ahead = max((wire.hlc_physical(stamp) - line for stamp in timed if stamp is not None), default=0)
+        if ahead > wire.FAR_FUTURE_HOSTILE_MILLIS:
+            return _REFUSE_FAR_FUTURE
+        return _DEFER if ahead > 0 else _MERGE
 
-    def _count_refused(self, kind: str, entry_id: str, offered: dict) -> None:
-        """Counts a verified state or claim refused for its stamps once per distinct one
-        (HLC canonical stamps, 2026-11-08), as Java's ReplicatedSpace counts it: a re-offer
-        by gossip or anti-entropy is the same refusal again."""
-        key = (kind, entry_id, hashlib.sha256(cbor.dumps(offered)).digest())
-        if key in self._refused_seen:
-            return
-        self._refused_seen[key] = True
-        if len(self._refused_seen) > REFUSED_STAMPS_CAPACITY:
-            del self._refused_seen[next(iter(self._refused_seen))]
-        self.refused_stamps[kind] += 1
+    def _count_refused(self, key: tuple, counter: str) -> None:
+        """Counts a refused verified state or claim in ``counter`` (``_REFUSE_LOGICAL`` or
+        ``_REFUSE_FAR_FUTURE``) once per distinct signed one (HLC round four, 2026-11-08,
+        decision D5), as Java's ReplicatedSpace counts it. ``key`` holds signed content alone
+        (the entry id, the issue stamp and the signed state view, or the entry id and the
+        signed claim), so a re-offer by gossip or anti-entropy, with whatever unsigned fields
+        beside it, is the same refusal again. The memory decides nothing: the caller judged
+        the offer afresh before it got here (HLC round five, 2026-11-08, decision E5)."""
+        if _remember(self._refused_seen, key):
+            setattr(self, counter, getattr(self, counter) + 1)
+
+    def _count_deferred(self, key: tuple) -> None:
+        """Counts a verified state or claim deferred for a stamp past the far-future margin
+        once per distinct signed one, keyed as ``_count_refused`` keys it (HLC round five,
+        2026-11-08, decision E2)."""
+        if _remember(self._deferred_seen, key):
+            self.stamps_far_future_deferred += 1
 
     def _expire_pending_states(self, now: float | None = None) -> None:
         """Drops pending recordless states older than ``PENDING_STATE_TTL_S`` (PD-L-02)."""
@@ -1070,11 +1504,10 @@ class Peer:
         merged = dict(previous)
         merged["adds"] = _union_dots(previous.get("adds"), incoming.get("adds"))
         merged["removes"] = _union_dots(previous.get("removes"), incoming.get("removes"))
-        # Both lease stamps passed the stamp rule or are absent; an absent one loses, and
-        # the rest compare as Java orders them (HLC canonical stamps, 2026-11-08).
-        incoming_stamp, previous_stamp = incoming.get("leaseStamp"), previous.get("leaseStamp")
-        if incoming_stamp is not None and (previous_stamp is None or wire.hlc_tuple(incoming_stamp)
-                                           > wire.hlc_tuple(previous_stamp)):
+        # Both lease stamps passed the stamp rule and compare as Java orders them (HLC
+        # canonical stamps, 2026-11-08); a state without one never gets here (HLC round five,
+        # 2026-11-08, decision E7).
+        if wire.hlc_tuple(incoming.get("leaseStamp")) > wire.hlc_tuple(previous.get("leaseStamp")):
             merged["leaseStamp"] = incoming.get("leaseStamp")
             merged["leaseValue"] = incoming.get("leaseValue")
         merged["completed"] = bool(previous.get("completed")) or bool(
@@ -1094,10 +1527,9 @@ class Peer:
         issuer_key = dto.get("issuerPublicKey")
         if not isinstance(issuer_key, (bytes, bytearray)) or len(issuer_key) != 32:
             return False
-        now_ms = self._now_ms()
         # The record: peer-signed, or agent-signed under a peer certificate
         # (TECH-SPEC §7.2's two-key rule, QA4 A4-7), judged at its issue stamp.
-        if not wire.verify_record(record, bytes(issuer_key), dto.get("agentCertificate"), now_ms):
+        if not wire.verify_record(record, bytes(issuer_key), dto.get("agentCertificate")):
             return False
         state_sig = dto.get("stateSig")
         if not isinstance(state_sig, (bytes, bytearray)):
@@ -1111,7 +1543,7 @@ class Peer:
             claim = signed.get("claim") or {}
             if (claim.get("entryId") != record.get("entryId")
                     or claim.get("spaceId") != record.get("spaceId")
-                    or not wire.verify_claim_proof(signed, now_ms)):
+                    or not wire.verify_claim_proof(signed)):
                 return False
             signer_key = signed.get("holderKey")
             party = claim.get("holder")
@@ -1123,23 +1555,30 @@ class Peer:
         if not isinstance(signer_key, (bytes, bytearray)) or len(signer_key) != 32:
             return False
         signer, signed_at = dto.get("signer"), dto.get("signedAt")
-        view = cbor.dumps(wire.state_sign_view(
-            record.get("spaceId"), record.get("entryId"), dto.get("adds") or [],
-            dto.get("removes") or [], dto.get("leaseStamp"), dto.get("leaseValue"),
-            bool(dto.get("completed")), signer, signed_at))
+        view = self._state_view(dto, record)
         if signer is not None:
+            # HLC round six, 2026-11-08 (owner ruling F4): the certificate bounds signedAt by its
+            # own validity window alone, as it bounds a record's or a claim's stamp, and the
+            # far-future rule judges how far signedAt leads after verification (``_fold``).
             certificate = dto.get("stateCertificate")
             try:
                 signed_ms = wire.hlc_physical(signed_at)
             except (TypeError, ValueError):
                 return False
             return (signer == party and isinstance(certificate, dict)
-                    and verify_agent_certificate_at(certificate, bytes(signer_key), party,
-                                                    signed_ms, now_ms)
+                    and verify_agent_certificate_covering(certificate, bytes(signer_key), party, signed_ms)
                     and Identity.verify(bytes(certificate["agentPublicKey"]), view, bytes(state_sig)))
         if party_attested:
             return False  # A6: an attested party's transitions must be agent-signed
         return Identity.verify(bytes(signer_key), view, bytes(state_sig))
+
+    @staticmethod
+    def _state_view(dto: dict, record: dict) -> bytes:
+        """The bytes a state's signature covers (StateSignView, SPEC §11a.4)."""
+        return cbor.dumps(wire.state_sign_view(
+            record.get("spaceId"), record.get("entryId"), dto.get("adds") or [],
+            dto.get("removes") or [], dto.get("leaseStamp"), dto.get("leaseValue"),
+            bool(dto.get("completed")), dto.get("signer"), dto.get("signedAt")))
 
     def _refused_for_revocation(self, dto: dict, record: dict) -> bool:
         """SPEC §5.6's freeze rule at merge, for every incoming state: the
@@ -1160,11 +1599,9 @@ class Peer:
         issuer = record.get("issuer")
         certificate = dto.get("agentCertificate") or {}
         state_certificate = dto.get("stateCertificate") or {}
-        try:
-            lease_ms = wire.hlc_physical(dto.get("leaseStamp"))
-        except (TypeError, ValueError):
-            lease_ms = None  # an unknown time: refused under any revocation
-        at = self._signing_ms(dto, lease_ms)
+        # A merged state carries a lease stamp that decoded (HLC round five, 2026-11-08,
+        # decision E7).
+        at = self._signing_ms(dto, wire.hlc_physical(dto["leaseStamp"]))
         return issuer is not None and (
             self.revocations.refuses(issuer, certificate.get("agentPublicKey"), at)
             or (dto.get("signer") is not None and self.revocations.refuses(
@@ -1178,46 +1615,65 @@ class Peer:
             return fallback
 
     def _fold_claim(self, entry_id: str, signed: dict) -> None:
-        claim = signed.get("claim")
-        holder_key = signed.get("holderKey")
-        if not isinstance(claim, dict) or not isinstance(holder_key, bytes):
+        claim = signed["claim"]
+        # The delta's decode refused a claim whose fields are of another kind, a bid that is no
+        # finite double among them (ASF-033; HLC round six, 2026-11-08, owner ruling F1). The
+        # peer drops a claim transplanted under a foreign map key (ASF-002).
+        if claim["entryId"] != entry_id:
             return
-        # Validate the signed bindings and numeric fields before the lattice
-        # sees them: the peer drops a claim transplanted under a foreign map
-        # key (ASF-002), and a NaN bid cannot win every comparison by making
-        # the total order lie (ASF-033).
-        if claim.get("entryId") != entry_id:
-            return
-        epoch = claim.get("epoch")
-        bid = claim.get("bid", 0.0)
-        expires = claim.get("expiresAtMillis")
-        if (not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0
-                or not isinstance(expires, int) or isinstance(expires, bool)
-                or not isinstance(bid, (int, float)) or bid != bid
-                or bid in (float("inf"), float("-inf"))):
-            return
+        epoch = claim["epoch"]
+        expires = claim["expiresAtMillis"]
         # The proof: peer-signed, or agent-signed under a peer certificate
         # (TECH-SPEC §7.6's two-key rule, QA4 A4-7 phase 3).
-        if not wire.verify_claim_proof(signed, self._now_ms()):
+        if not wire.verify_claim_proof(signed):
             return
-        # HLC canonical stamps, 2026-11-08: after verification the peer refuses a claim
-        # whose stamp the rule refuses and counts it once per distinct claim, so the stamp
-        # never reaches the lattice, and a claim signed over non-canonical text cannot
-        # displace an honest claim that every implementation verifies.
-        if wire.acceptable_hlc(claim.get("stamp")) is None:
-            self._count_refused("claims", entry_id, claim)
-            return
-        # SPEC §5.6 v0.1.13 (review M-1): a revoked holder takes nothing, whatever
-        # the claim's stamp, since a renewal keeps it.
+        # SPEC §5.6 v0.1.13 (review M-1): a revoked holder takes nothing, whatever the
+        # claim's stamp, since a renewal keeps it. The peer judges revocation before the
+        # stamp, so a revoked holder's claim counts nothing (HLC round five, 2026-11-08,
+        # decision E6).
         certificate = signed.get("holderCertificate") or {}
         if self.revocations.refuses(claim.get("holder"), certificate.get("agentPublicKey"), None):
             return
+        # HLC round four, 2026-11-08 (decisions D4, D5): after verification the peer refuses
+        # a claim whose stamp the rule refuses or runs more than an hour past the skew margin
+        # and counts it once per distinct signed claim, so the stamp never reaches the
+        # lattice; it defers a claim stamped past the margin by less, so an honest taker
+        # whose clock a hostile stamp dragged ahead takes once this wall catches up. A claim
+        # over non-canonical text never decodes (decision D3). HLC round five, 2026-11-08
+        # (decisions E2, E5 and E13): the peer judges each offer afresh, refusals and deferrals
+        # count apart, and the key is the claim as its signature covers it.
+        stamp = claim.get("stamp")
+        verdict = self._stamp_verdict((stamp,), (stamp,))
+        key = ("claim", entry_id, hashlib.sha256(cbor.dumps(claim)).digest())
+        if verdict not in (_MERGE, _DEFER):
+            self._count_refused(key, verdict)
+            return
         # ASF-004, mirroring ReplicatedSpace: bound what a remote claim may
         # assert before the lattice (where higher epochs win by design) sees it.
+        # Judged before the deferral, as Java's mergeClaim judges it, so a claim
+        # these bounds refuse counts no deferral (HLC round five, 2026-11-08,
+        # decision E2).
         current = self._claim_of(entry_id) or {}
         observed = int(current.get("epoch", 0))
+        now = self._now_ms()
         if (epoch > observed + wire.MAX_CLAIM_EPOCH_JUMP
-                or expires > self._now_ms() + wire.MAX_CLAIM_HOLD_MILLIS):
+                or expires > now + wire.MAX_CLAIM_HOLD_MILLIS):
+            return
+        # HLC round six, 2026-11-08 (R6), as Java's mergeClaim judges them after the bounds
+        # above and before the deferral: a claim cannot predate the entry it answers by more
+        # than the drift bound (spec §7.4/§11), and a claim contesting another holder's claim
+        # with a stamp older than the drift bound and one settle window is a queue-jump, since
+        # LEASE_RACE picks the lowest stamp and an honest race settles within the window.
+        # Java strikes the holder for each and counts neither; this peer keeps no strikes.
+        stamped = wire.hlc_physical(stamp)
+        held = self.states.get(entry_id)
+        if held is not None and stamped < wire.hlc_physical(held["record"]["issued"]) - MAX_CLAIM_PREDATES_ISSUE_MILLIS:
+            return
+        if (current and current["holder"] != claim["holder"]
+                and stamped < now - wire.MAX_HLC_SKEW_MILLIS - CONTEST_SETTLE_MILLIS):
+            return
+        if verdict == _DEFER:
+            self._count_deferred(key)
             return
         self.claims[entry_id] = wire.merge_claims(self.claims.get(entry_id), signed)
         if self.on_claim is not None:
@@ -1226,6 +1682,25 @@ class Peer:
 
     # ----------------------------------------------------------- take/complete
 
+    def _prune_claims(self) -> None:
+        """Drops each claim on an entry this replica does not hold once the claim's expiry
+        passes (HLC round six, 2026-11-08, R10), as Java's ``dropOrphanedClaims`` drops it in
+        its sweep. A claim folds before its entry's state, since a completion authenticates
+        against it, so a claim may come for an entry that never follows; kept, every such
+        claim stayed for good. This client runs no periodic work, so the peer prunes before it
+        folds a space delta, never inside one, and a completion still finds the claim it
+        travels with. It scans once the map has doubled since the last scan, as Ruby's
+        ``prune_claims`` does, so the work stays proportional to the claims folded. A live
+        claim stays, and a partner that holds the entry offers its claim again with the
+        state."""
+        if len(self.claims) < self._claims_prune_at:
+            return
+        now = self._now_ms()
+        for entry_id, signed in list(self.claims.items()):
+            if entry_id not in self.states and now >= signed["claim"]["expiresAtMillis"]:
+                self.claims.pop(entry_id, None)
+        self._claims_prune_at = max(2 * len(self.claims), CLAIMS_PRUNE_FLOOR)
+
     def _claim_of(self, entry_id: str):
         signed = self.claims.get(entry_id)
         return signed["claim"] if signed else None
@@ -1233,9 +1708,9 @@ class Peer:
     def _available(self, type_name: str, now_ms: int):
         for entry_id, dto in self.states.items():
             record = dto.get("record") or {}
-            if record.get("type") != type_name or dto.get("completed"):
-                continue
-            lease = record.get("lease") or {}
+            if record.get("type") != type_name or not present(dto):
+                continue  # completed, or withdrawn by a cancel (core cancel events, 2026-11-09)
+            lease = lease_of(dto)
             if int(lease.get("expiresAtMillis", 0)) <= now_ms:
                 continue
             claim = self._claim_of(entry_id)
@@ -1273,10 +1748,9 @@ class Peer:
                 record = dto.get("record") or {}
                 if record.get("spaceId") != space_id:
                     continue  # the same type in another space is not this take's
-                raw = self.payload_of(dto)
-                if raw is None:
-                    continue  # its block or artifact is still on its way
-                payload = cbor.loads(raw)
+                readable, payload = self.value_of(dto)
+                if not readable:
+                    continue  # its block or artifact is still on its way, or its bytes are unreadable
                 if matches is not None and not matches(payload, record.get("tags") or {}):
                     continue
                 price = float(bid(payload)) if callable(bid) else float(bid)
@@ -1288,8 +1762,8 @@ class Peer:
                 current = self._claim_of(entry_id)
                 if current and int(current.get("expiresAtMillis", 0)) > now_ms:
                     continue
-                if (self.states.get(entry_id) or {}).get("completed"):
-                    continue
+                if not present(self.states.get(entry_id) or {}):
+                    continue  # completed or withdrawn meanwhile (core cancel events, 2026-11-09)
                 epoch = int(current["epoch"]) + 1 if current else 1
                 claim = wire.take_claim(entry_id, space_id, epoch,
                                         wire.hlc_now(holder, now_ms), holder,
@@ -1305,9 +1779,11 @@ class Peer:
                 self.pull_space_paced(space, settle_seconds)
                 self.await_fold(min(settle_seconds, 0.3))
                 winner = self._claim_of(entry_id)
+                # core cancel events, 2026-11-09: an entry completed or withdrawn during the
+                # settle window is nobody's, so a cancel that folded meanwhile leaves the take empty
                 if winner and winner.get("holder") == holder \
                         and int(winner.get("epoch")) == epoch \
-                        and not (self.states.get(entry_id) or {}).get("completed"):
+                        and present(self.states.get(entry_id) or {}):
                     return entry_id
             if not claimed:
                 # Nothing to claim: sleep until a fold (an entry, a lapsed claim's
@@ -1321,11 +1797,16 @@ class Peer:
         claim, so honest replicas can authenticate the completion (SPEC §11a).
         A completion the holder did not sign is rejected. A claim taken as an
         agent (``take_entry(agent=...)``) must be completed as that agent, whose
-        signed state is what receivers require (A6, v0.1.13)."""
-        dto = dict(self.states[entry_id])
-        dto["completed"] = True
-        dto = wire.sign_state(dto, self.identity, agent, self._now_ms())
-        self.states[entry_id] = dto
+        signed state is what receivers require (A6, v0.1.13). An entry this replica
+        holds completed or withdrawn is held by nobody, as Java's ``complete``
+        refuses it (core cancel events, 2026-11-09)."""
+        with self._state_lock:
+            dto = dict(self.states[entry_id])
+            if not present(dto):
+                raise ValueError(f"{entry_id} is not held here: it is completed or withdrawn")
+            dto["completed"] = True
+            dto = wire.sign_state(dto, self.identity, agent, self._now_ms())
+            self.states[entry_id] = dto
         proof = self.claims.get(entry_id)
         self._send("RUMOR", wire.rumor_body(
             f"space:{space}", f"d:{entry_id}", 6,
@@ -1340,22 +1821,98 @@ class Peer:
         and expiry, re-signed by the issuer, as the agent when it wrote as one.
         Only the issuer renews: ``agent`` must be the record's issuer, and
         without one the issuer must be one of this peer's agent names."""
-        dto = dict(self.states[entry_id])
-        record = dto.get("record") or {}
-        issuer = str(record.get("issuer"))
-        if agent is not None and agent.agent_id != issuer:
-            raise ValueError(f"{entry_id} was written by {issuer}, not {agent.agent_id}")
-        if agent is None and not issuer.startswith(self.identity.peer_id + "/"):
-            raise ValueError(f"{entry_id} was written by {issuer}, not by this peer")
-        now_ms = self._now_ms()
-        dto["leaseStamp"] = wire.hlc_now(record.get("issuer"), now_ms)
-        dto["leaseValue"] = {"holder": record.get("issuer"),
-                             "expiresAtMillis": now_ms + lease_millis, "kind": "WRITE"}
-        dto = wire.sign_state(dto, self.identity, agent, now_ms)
-        self.states[entry_id] = dto
+        with self._state_lock:
+            dto = dict(self.states[entry_id])
+            record = dto.get("record") or {}
+            issuer = str(record.get("issuer"))
+            if agent is not None and agent.agent_id != issuer:
+                raise ValueError(f"{entry_id} was written by {issuer}, not {agent.agent_id}")
+            if agent is None and not issuer.startswith(self.identity.peer_id + "/"):
+                raise ValueError(f"{entry_id} was written by {issuer}, not by this peer")
+            now_ms = self._now_ms()
+            dto["leaseStamp"] = wire.hlc_now(record.get("issuer"), now_ms)
+            dto["leaseValue"] = {"holder": record.get("issuer"),
+                                 "expiresAtMillis": now_ms + lease_millis, "kind": "WRITE"}
+            dto = wire.sign_state(dto, self.identity, agent, now_ms)
+            self.states[entry_id] = dto
         self._send("RUMOR", wire.rumor_body(
             f"space:{space}", f"r:{entry_id}:{now_ms}", 6,
             cbor.dumps({"state": dto, "claimEntry": None, "claim": None})))
+
+    def on_stream(self, stream_id: str, handler: Callable) -> Callable:
+        """Hands each item of a gossip stream to ``handler(sender, item_id, payload)`` once, as Java's
+        ``GossipBus.onStream`` does (PDT 2 phase 7, P2-P-02); returns the call that stops it. One handler a stream."""
+        if stream_id in self.stream_handlers:
+            raise ValueError(f"stream {stream_id} has a handler on this peer already")
+        self.stream_handlers[stream_id] = handler
+        return lambda: self.stream_handlers.pop(stream_id, None)
+
+    def _on_stream_item(self, sender, rumor: dict) -> None:
+        key = f"{rumor['streamId']}|{rumor['itemId']}"
+        if key in self._stream_items:
+            return  # a copy of an item already handed over
+        self._stream_items[key] = None
+        while len(self._stream_items) > STREAM_ITEMS_REMEMBERED:
+            del self._stream_items[next(iter(self._stream_items))]
+        handler = self.stream_handlers.get(rumor["streamId"])
+        if handler is not None:
+            handler(sender, rumor["itemId"], rumor["payload"])
+
+    def cancel_entry(self, space: str, entry_id: str, agent=None) -> None:
+        """Cancels this peer's write of an entry, as Java's ``EntryHandle.cancel`` and the TypeScript
+        ``cancelEntry`` do (PDT 2 phase 7, P2-X-05): a state whose removes cover its adds, re-signed by
+        the issuer, so every replica drops the entry and its watches hear EXPIRED (core cancel events,
+        2026-11-09). Only the issuer cancels, as only the issuer renews. An entry this replica holds
+        completed or withdrawn stays as it is and nothing goes out: an issuer's signature over a
+        completed state verifies nowhere (SPEC §11a.4)."""
+        with self._state_lock:
+            previous = self.states.get(entry_id)
+            if previous is None:
+                raise ValueError(f"{entry_id} is not held here")
+            issuer = str((previous.get("record") or {}).get("issuer"))
+            if agent is not None and agent.agent_id != issuer:
+                raise ValueError(f"{entry_id} was written by {issuer}, not {agent.agent_id}")
+            if agent is None and not issuer.startswith(self.identity.peer_id + "/"):
+                raise ValueError(f"{entry_id} was written by {issuer}, not by this peer")
+            if not present(previous):
+                return
+            now_ms = self._now_ms()
+            dto = dict(previous)
+            dto["removes"] = _union_dots(previous.get("removes"), previous.get("adds"))
+            dto = wire.sign_state(dto, self.identity, agent, now_ms)
+            self.states[entry_id] = dto
+        if self.on_withdrawn is not None:
+            self.on_withdrawn(dto)
+        self._send("RUMOR", wire.rumor_body(
+            f"space:{space}", f"x:{entry_id}:{now_ms}", 6,
+            cbor.dumps({"state": dto, "claimEntry": None, "claim": None})))
+
+
+def _dots_bound_to_issuer(dto: dict, record: dict) -> bool:
+    """Whether every dot in a received state's adds and removes names the peer of its record's
+    issuer as its replica (ASF-025; HLC round six, 2026-11-08). The record's decode holds the
+    issuer to Java's AgentId grammar, so its peer is the text before the slash."""
+    peer = str(record.get("issuer") or "").partition("/")[0]
+    return all(isinstance(dot, dict) and dot.get("replica") == peer
+               for dot in (dto.get("adds") or []) + (dto.get("removes") or []))
+
+
+def lease_of(dto: dict) -> dict:
+    """The entry's current lease: the state's lease register, which supersedes the lease its record was
+    written with (SPEC §7.3), as Java's ``EntryState`` and the TypeScript client read it. A renewal moves
+    the register, so reads, takes and the sweep follow it (lease renewals, 2026-11-09)."""
+    return dto.get("leaseValue") or (dto.get("record") or {}).get("lease") or {}
+
+
+def present(dto: dict) -> bool:
+    """Whether the entry of ``dto`` is present, as Java's ``EntryState.present`` judges it: uncompleted,
+    with an add dot no remove covers. A cancel's removes cover the adds, so a withdrawn entry is
+    absent from reads and takes at once (core cancel events, 2026-11-09)."""
+    if dto.get("completed"):
+        return False
+    removed = {(dot.get("replica"), dot.get("counter")) for dot in dto.get("removes") or [] if isinstance(dot, dict)}
+    return any((dot.get("replica"), dot.get("counter")) not in removed
+               for dot in dto.get("adds") or [] if isinstance(dot, dict))
 
 
 def _union_dots(a, b) -> list:

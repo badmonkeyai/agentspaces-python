@@ -51,8 +51,8 @@ class NetPeer(Peer):
     """A peer of a ``Network``: sends are delivered in-process, and a rumor of
     its own folds here as well (gossip hands it back to us)."""
 
-    def __init__(self, network: Network, group: str, clock=None):
-        super().__init__(Identity.generate(), group, clock=clock)
+    def __init__(self, network: Network, group: str, clock=None, **options):
+        super().__init__(Identity.generate(), group, clock=clock, **options)
         self.network = network
         self._running = True
         self._socket = object()

@@ -27,6 +27,8 @@ A dial-only client reaches holders it has seen on its socket directly and
 every other holder through its seed when the seed holds the RELAY role
 (``Peer.send_pipe``); a space with the capability attached escalates a
 payload above ``escalate_above`` to an artifact (SPEC §7.1, group E).
+``put_spill``, ``get_spill``, and ``release`` carry the parts documents of
+large cards (SPEC §6.1a.5, AppCard origin and formats, 2026-11-09).
 """
 
 from __future__ import annotations
@@ -40,7 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .. import cbor
+from .. import cbor, wire
+from ..peer import lease_of, present
 from ..space import duration_millis
 
 TYPE = "aspace:cap/content-swarm"
@@ -60,7 +63,14 @@ PIECE_WANT, PIECE, HAVE, CANCEL, REJECT, MANIFEST_WANT, MANIFEST = 1, 2, 3, 4, 5
 REASON_NOT_HELD, REASON_OVER_BUDGET, REASON_POLICY, REASON_UNKNOWN_ROOT = 1, 2, 3, 4
 
 SEALING_NONE, SEALING_GROUP_KEY = "none", "group-key"
+
+# The card spill (SPEC §6.1a.5): a parts document's media type, and how long a reader waits for
+# one before the fetch fails and is cancelled (Java's ContentSpillStore default).
+SPILL_MEDIA_TYPE = "application/cbor"
+SPILL_FETCH_TIMEOUT_S = 30.0
 HASHING_PLAIN, HASHING_SEALED = "plain", "sealed"
+#: A manifest's layout (PD-X-09): the flat piece table, which an absent layout means, or a blob tree.
+LAYOUT_PIECES, LAYOUT_TREE = "pieces", "tree"
 
 _B32 = "abcdefghijklmnopqrstuvwxyz234567"
 
@@ -145,7 +155,12 @@ def manifest(root: str, size: int, piece_size: int, table: bytes | None, origin:
 
 
 def manifest_violation(m: dict) -> str | None:
-    """The first broken invariant of a manifest, or None (SPEC annex G)."""
+    """The first broken invariant of a manifest, or None (SPEC annex G). A ``layout: tree`` manifest
+    names a blob tree, whose dag-cbor root names every piece, so it may carry no piece table and its
+    table, when it has one, is not over its root (P2-X-01, as the owner ruled in the PDT 2 follow-ups
+    of 2026-11-09, F3); a flat manifest carries exactly one of the table and the table reference."""
+    # imported here: the PDT package imports this module for its tree exchange
+    from ..pdt import cids
     try:
         if m.get("v") != VERSION:
             return f"unsupported manifest version {m.get('v')}"
@@ -155,20 +170,29 @@ def manifest_violation(m: dict) -> str | None:
         size = int(m["size"])
         if size < 0 or int(m["pieces"]) != pieces_of(size, ps):
             return "pieces does not match ceil(size / pieceSize)"
+        layout = m.get("layout")
+        tree = layout == LAYOUT_TREE
         table, ref = m.get("table"), m.get("tableRef")
-        if (table is None) == (ref is None):
+        if table is not None and ref is not None:
+            return ("at most one of table and tableRef may be present" if tree
+                    else "exactly one of table and tableRef must be present")
+        if table is None and ref is None and not tree:
             return "exactly one of table and tableRef must be present"
         if table is not None:
             if int(m["pieces"]) > INLINE_TABLE_PIECES:
                 return "inline table above the inline bound"
             if len(table) != int(m["pieces"]) * HASH_BYTES:
                 return "table length does not match pieces"
-            if content_root(table) != m["root"]:
+            if not tree and content_root(table) != m["root"]:
                 return "table does not hash to the root"
         if m.get("sealing") not in (SEALING_NONE, SEALING_GROUP_KEY):
             return "unknown sealing"
         if m.get("hashing") not in (HASHING_PLAIN, HASHING_SEALED):
             return "unknown hashing"
+        if layout is not None and layout not in (LAYOUT_PIECES, LAYOUT_TREE):
+            return f"unknown layout {layout}"
+        if tree and not (cids.is_cid(m["root"]) and cids.codec_of(m["root"]) == cids.DAG_CBOR):
+            return "a tree manifest's root is a dag-cbor CID"
         if not is_root(m.get("root")):
             return "root is not a content root"
         return None
@@ -479,9 +503,13 @@ class Fetch:
     TIMEOUTS_BEFORE_DROP = 3
     DROP_S = 60.0
 
-    def __init__(self, content: "Content", root: str):
+    def __init__(self, content: "Content", root: str, expected_size: int | None = None):
         self.content = content
         self.root = root
+        # The length a caller expects (a stub's spill.size): a manifest of another length fails
+        # the fetch before any piece is asked for (AppCard origin and formats, 2026-11-09).
+        self.expected_size = expected_size
+        self.wrong_size: int | None = None
         self.manifest: dict | None = None
         self.table: bytes | None = None
         self.verified: set[int] = set()
@@ -536,7 +564,13 @@ class Fetch:
 
     def start(self, m: dict, table: bytes) -> None:
         with self._lock:
-            if self.manifest is not None:
+            if self.manifest is not None or self.done.is_set():
+                return
+            if self.expected_size is not None and int(m["size"]) != self.expected_size:
+                self.wrong_size = int(m["size"])
+                self.failure = f"the manifest states {m['size']} bytes; the caller expects {self.expected_size}"
+                self._note(self.failure)
+                self.done.set()
                 return
             self.manifest, self.table = m, table
             self.content.store.open(m)
@@ -875,9 +909,11 @@ class Content:
         found = []
         for dto in list(self.peer.states.values()):
             record = dto.get("record") or {}
-            if record.get("type") != type_name or dto.get("completed") or not self.space._mine(dto):
+            # PDT 2 phase 7 gate: a cancelled record is gone, as Java's EntryState.present judges it
+            if record.get("type") != type_name or not present(dto) or not self.space._mine(dto):
                 continue
-            if int((record.get("lease") or {}).get("expiresAtMillis", 0)) <= now:
+            # PDT 2 phase 7 gate: the lease register, which a holder's renewal at half-life moves (SPEC §7.3)
+            if int(lease_of(dto).get("expiresAtMillis", 0)) <= now:
                 continue
             if root is not None and (record.get("tags") or {}).get("root") != root:
                 continue
@@ -985,16 +1021,75 @@ class Content:
     def pin(self, root): self.store.pin(root)
     def unpin(self, root): self.store.unpin(root)
 
+    @property
+    def running(self) -> bool:
+        """Whether ``run`` drives the ticks on its thread."""
+        return self._running
+
+    # ---- the card spill (SPEC §6.1a.5; AppCard origin and formats, 2026-11-09)
+
+    def put_spill(self, name: str, document: bytes) -> str:
+        """Publishes a card's parts document: an artifact in 65,536-byte pieces, manifest
+        ``name`` the card's id, media type ``application/cbor``, sealing ``none``. Returns its
+        root; the same bytes give the same root. Raises ``ValueError`` for a document of more
+        than 64 pieces, whose table this client cannot keep inline."""
+        return self.publish(document, name=name, media_type=SPILL_MEDIA_TYPE, piece_size=wire.CARD_SPILL_PIECE_SIZE)["root"]
+
+    def get_spill(self, root: str, size: int, timeout_s: float = SPILL_FETCH_TIMEOUT_S) -> bytes:
+        """Fetches a parts document of ``size`` bytes from every holder, each piece verified
+        against the root. A manifest of another length fails before any piece is asked for and
+        raises ``ValueError``, as does an artifact of another length that a fetch begun by
+        another caller brought; a fetch another caller began under a length the artifact does
+        not have starts again under this one. A fetch that has not completed by ``timeout_s`` is cancelled,
+        which frees its slot, and raises ``TimeoutError``; any other failure raises ``OSError``.
+        Without ``run`` the wait drives the fetch itself."""
+        f = self.fetch(root, expected_size=size)
+        deadline = time.monotonic() + timeout_s
+        while not f.done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                f.cancel()
+                with self._lock:
+                    if self.fetches.get(root) is f:
+                        del self.fetches[root]
+                raise TimeoutError(f"no holder served {root} within {timeout_s} s")
+            if not self._running:
+                self._drive(f)
+            f.done.wait(min(remaining, 0.05))
+        if f.wrong_size == size:
+            # the fetch began under another caller's misstated length, and the artifact has this one's:
+            # fetch again under this caller's length within the same deadline; the failed fetch has left
+            # ``fetches`` (``_drive`` drops a finished one), and a fresh one never fails at this length
+            return self.get_spill(root, size, max(0.0, deadline - time.monotonic()))
+        if f.wrong_size is not None:
+            raise ValueError(f"the artifact {root} is {f.wrong_size} bytes; the stub states {size}")
+        if not f.complete:
+            raise OSError(f"the fetch of {root} failed: {f.failure}")
+        data = f.read_bytes()
+        if len(data) != size:
+            raise ValueError(f"the artifact {root} is {len(data)} bytes; the stub states {size}")
+        return data
+
+    def release(self, root: str) -> None:
+        """Stops holding a root this peer published: unpins it, stops refreshing its holding,
+        which then lapses, and forgets its pieces."""
+        self.store.unpin(root)
+        self.holder_state.pop(root, None)
+        self.store.forget(root)
+
     # ---- fetch
 
-    def fetch(self, root: str) -> Fetch:
+    def fetch(self, root: str, expected_size: int | None = None) -> Fetch:
+        """Starts or joins the fetch of a root. With ``expected_size`` a new fetch refuses a
+        manifest of another length before it asks for a piece; a fetch already running keeps
+        the options it began with."""
         if not is_root(root):
             raise ValueError(f"not a content root: {root}")
         with self._lock:
             existing = self.fetches.get(root)
             if existing is not None:
                 return existing
-            f = Fetch(self, root)
+            f = Fetch(self, root, expected_size)
             self.fetches[root] = f
         self._drive(f)
         return f
@@ -1023,6 +1118,11 @@ class Content:
                     for h in self.holdings(f.root):
                         if h["holder"] != self.self_id:
                             self.send(h["holder"], manifest_want(f.root))
+                return
+            if m.get("layout") == LAYOUT_TREE:
+                f.failure = "the manifest names a blob tree, which the tree exchange fetches"
+                f._note(f.failure)
+                f.done.set()
                 return
             if m.get("table") is None:
                 f.failure = "the manifest's table is a block; this client keeps tables inline"
@@ -1095,7 +1195,7 @@ class Content:
         if not isinstance(msg, dict):
             return
         t = msg.get("t")
-        if t in (8, 9, 10, 11) or (t == REJECT and msg.get("index") == -1):
+        if t in (8, 9, 10, 11, 12) or (t == REJECT and msg.get("index") == -1):
             if self.trees is not None:
                 self.trees.on_frame(sender, msg)
             return

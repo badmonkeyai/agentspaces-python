@@ -57,7 +57,8 @@ class Located:
 class BlobTree:
     """The interior of a blob: build, open, seek, and the chunk list."""
 
-    def __init__(self, store, root: str, size: int, height: int, written_bytes: int, written_nodes: int, chunks):
+    def __init__(self, store, root: str, size: int, height: int, written_bytes: int, written_nodes: int, chunks,
+                 loader=None):
         self.store = store
         self.root = root
         self.size = size
@@ -65,6 +66,17 @@ class BlobTree:
         self.written_bytes = written_bytes
         self.written_nodes = written_nodes
         self._chunks = chunks
+        #: Loads what the store lacks, so a verified window of a lazy reader fetches only its own groups (P2-B-03).
+        self.loader = loader
+
+    def fetch(self, cid: str) -> bytes:
+        """A node's bytes from the store, else through the loader; ``NodeUnavailable`` when neither has it."""
+        data = self.store.get(cid)
+        if data is None and self.loader is not None:
+            data = self.loader.load(cid)
+        if data is None:
+            raise nodes.NodeUnavailable(cid, [], f"node {cid} is not in the store")
+        return data
 
     @staticmethod
     def group(level: list[Entry]) -> list[list[Entry]]:
@@ -108,15 +120,17 @@ class BlobTree:
         return BlobTree(store, level[0].cid, size, height, written, written_nodes, list(chunks))
 
     @staticmethod
-    def open(store, root: str) -> "BlobTree":
+    def open(store, root: str, loader=None) -> "BlobTree":
         parsed = cids.parse(root)
         data = store.get(root)
+        if data is None and loader is not None:
+            data = loader.load(root)
         if data is None:
             raise NodeFormatError("blob root is not in the store", root)
         if parsed.codec == cids.RAW:
-            return BlobTree(store, root, len(data), 0, 0, 0, [] if not data else [Entry(root, len(data))])
+            return BlobTree(store, root, len(data), 0, 0, 0, [] if not data else [Entry(root, len(data))], loader)
         node = BlobTree._decode_b(root, data)
-        return BlobTree(store, root, sum(node["z"]), node["h"], 0, 0, None)
+        return BlobTree(store, root, sum(node["z"]), node["h"], 0, 0, None, loader)
 
     @staticmethod
     def _decode_b(cid: str, data: bytes) -> dict:
@@ -132,6 +146,8 @@ class BlobTree:
 
     def _load(self, cid: str, under: int) -> dict:
         data = self.store.get(cid)
+        if data is None and self.loader is not None:
+            data = self.loader.load(cid)
         if data is None:
             raise NodeFormatError("blob node is not in the store", cid)
         node = self._decode_b(cid, data)
@@ -176,20 +192,36 @@ class BlobTree:
 
     def chunk(self, entry: Entry) -> bytes:
         data = self.store.get(entry.cid)
+        if data is None and self.loader is not None:
+            data = self.loader.load(entry.cid)
         if data is None:
             raise NodeFormatError("chunk is not in the store", entry.cid)
         if len(data) != entry.length:
             raise NodeFormatError(f"chunk of {len(data)} bytes where the tree claims {entry.length}", entry.cid)
         return data
 
+    def chunk_at(self, located: Located) -> bytes:
+        return self.chunk(Entry(located.cid, located.length))
+
+    def chunks_in(self, start: int, length: int) -> list[Located]:
+        """The chunks that cover ``[start, start + length)``, loading only the path to each (PDT 2 phase 7, P2-B-03)."""
+        out, pos = [], start
+        while pos < start + length:
+            located = self.seek(pos)
+            out.append(located)
+            pos = located.start + located.length
+        return out
+
 
 class PBlob:
-    """A persistent byte sequence: read, append, splice, and ``of`` a file or stream."""
+    """A persistent byte sequence: read, append, splice, and ``of`` a file or stream. A blob a ref loaded carries the
+    claim of its head, ``(identity, outboard root)`` (PDT 2 phase 7, P2-B-01), for ``open_verified``."""
 
-    def __init__(self, store, tree: BlobTree, written_bytes: int = 0):
+    def __init__(self, store, tree: BlobTree, written_bytes: int = 0, claim: tuple[str, str] | None = None):
         self.store = store
         self.tree = tree
         self.written_bytes = written_bytes
+        self.claim = claim
 
     # ---- construction
 
@@ -228,8 +260,23 @@ class PBlob:
         return PBlob(store, tree, written + tree.written_bytes)
 
     @staticmethod
-    def load(store, root: str) -> "PBlob":
-        return PBlob(store, BlobTree.open(store, root))
+    def load(store, root: str, loader=None, claim: tuple[str, str] | None = None) -> "PBlob":
+        return PBlob(store, BlobTree.open(store, root, loader), claim=claim)
+
+    def identity(self) -> str:
+        """The BLAKE3 identity of the content, computed from it (P2-B-01): the CIDv1 ``raw`` over multihash 0x1e."""
+        from .bao import identity_of
+        return identity_of(self.read_all())
+
+    def open_verified(self, offset: int, length: int, claim: tuple[str, str] | None = None):
+        """A reader of ``length`` bytes from ``offset`` that delivers each 16 KiB chunk group only once it verifies
+        against the identity through the Bao outboard (P2-B-03), under ``claim`` or the claim of the head that named
+        this blob; ``OSError`` at open when the outboard does not chain to the identity."""
+        from .bao import VerifiedWindow
+        claim = claim or self.claim
+        if claim is None:
+            raise ValueError(f"blob {self.root()} carries no identity and outboard to verify against (pdt.blake3, pdt.bao)")
+        return VerifiedWindow(self.tree, claim, offset, length)
 
     # ---- reads
 

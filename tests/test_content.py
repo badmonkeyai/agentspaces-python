@@ -27,7 +27,8 @@ from agentspaces.capabilities import content as c
 from agentspaces.identity import Identity
 from agentspaces.peer import Peer
 from agentspaces.space import Space, Template, entry
-from fleet import Network, NetPeer
+from fleet import Clock, Network, NetPeer
+from test_hlc_logical_limit import T
 
 GOLDEN = json.loads((pathlib.Path(__file__).parent / "golden.json").read_text())
 GROUP = "zPythonContent"
@@ -97,8 +98,8 @@ def test_have_runs_round_trip_at_every_size():
 
 # -------------------------------------------------------------------- swarm
 
-def _node(network, store=None, **options):
-    peer = NetPeer(network, GROUP)
+def _node(network, store=None, peer=None, **options):
+    peer = peer or NetPeer(network, GROUP)
     space = Space(peer, "content")
     content = Content(Pipes(peer), space, store or MemoryStore(), **options)
     return peer, space, content
@@ -116,6 +117,26 @@ def _run(nodes, rounds=20):
     for _ in range(rounds):
         for _peer, _space, content in nodes:
             content.tick()
+
+
+def test_a_holding_lives_to_its_renewed_lease_and_a_withdrawn_holding_is_gone():
+    """PDT 2 phase 7 gate: a reader judges a holding or a manifest as Java's ``EntryState`` does, by its present dots
+    and its lease register. A renewal moves the register past the record's first lease (SPEC §7.3), as every holder
+    renews at half-life, and a cancel's removes withdraw it, as Java cancels the holding a new one replaces. A reader
+    that checked ``completed`` and the record's lease alone kept a withdrawn holder and lost a renewed one."""
+    clock = Clock(T)
+    network = Network()
+    (pa, _sa, a), (pb, _sb, b) = [_node(network, peer=NetPeer(network, GROUP, clock=clock)) for _ in range(2)]
+    for peer in (pa, pb):
+        peer.introduce()
+    root = a.publish(b"held" * 100)["root"]
+    (entry_id,) = [i for i, dto in pb.states.items() if dto["record"]["type"] == c.HOLDING_TYPE]
+    clock.advance(60_000)
+    pa.renew_entry("content", entry_id, 120_000)
+    clock.advance(60_001)  # past the holding's first lease of two minutes, inside the renewed one
+    assert [h["holder"] for h in b.holdings(root)] == [a.self_id]
+    pa.cancel_entry("content", entry_id)
+    assert b.holdings(root) == []
 
 
 def test_two_peers_fetch_a_published_artifact_from_the_publisher_and_each_other():
@@ -136,6 +157,52 @@ def test_two_peers_fetch_a_published_artifact_from_the_publisher_and_each_other(
     assert b.describe(manifest["root"])["completeHolders"] == 3
     assert [m["root"] for m in cc.list_manifests()] == [manifest["root"]]
     assert b.fetch(manifest["root"]).complete  # already held: complete at once
+
+
+# ------------------------------------------------------------------ tree manifests (PDT 2 follow-ups, 2026-11-09, F3)
+
+def test_a_tree_manifest_needs_no_piece_table_and_names_a_dag_cbor_root():
+    tree = cbor.loads(_hex("content_manifest_tree_cbor"))
+    assert c.manifest_violation(tree) is None, "a tree manifest's table is not over its root, as Java reads it"
+    tableless = {**tree, "table": None}
+    assert c.manifest_violation(tableless) is None
+    assert c.manifest_violation({**tableless, "layout": "pieces"}) == "exactly one of table and tableRef must be present"
+    assert c.manifest_violation({k: v for k, v in tableless.items() if k != "layout"}) \
+        == "exactly one of table and tableRef must be present"
+    assert c.manifest_violation({**tree, "tableRef": wire.block_cid(b"t")}) \
+        == "at most one of table and tableRef may be present"
+    flat_root = GOLDEN["content_root_cidv1"]
+    assert c.manifest_violation({**tableless, "root": flat_root}) == "a tree manifest's root is a dag-cbor CID"
+    assert c.manifest_violation({**tableless, "root": "broot"}) == "a tree manifest's root is a dag-cbor CID"
+    flat = cbor.loads(_hex("content_manifest_inline_cbor"))
+    assert c.manifest_violation({**flat, "layout": "pieces"}) is None
+    assert c.manifest_violation({**flat, "layout": "blocks"}) == "unknown layout blocks"
+
+
+def test_a_tree_manifest_never_sends_a_flat_fetch_after_a_table():
+    nodes = _fleet(3, piece_size=PIECE, seed=11)
+    (_pa, _sa, publisher), (_pb, _sb, b), (pm, _sm, mallory) = nodes
+    data = bytes((i * 7 + 3) & 0xFF for i in range(2 * PIECE + 9))
+    honest = publisher.publish(data, replicate=False)
+    # a hostile member writes a table-less tree manifest for the flat root
+    hostile = {**honest, "table": None, "origin": pm.identity.peer_id, "layout": "tree"}
+    mallory._write(c.MANIFEST_TYPE, hostile, "1h", c.manifest_tags(hostile))
+    _run(nodes, 2)
+    assert b.manifest_of(honest["root"]) is None, "no member reads the hostile manifest"
+    assert [m["root"] for m in b.list_manifests()] == []
+    fetched = b.fetch(honest["root"])
+    _run(nodes)
+    assert fetched.wait(5), fetched.trace
+    assert fetched.read_bytes() == data
+    # a tree manifest's own root fetches by the tree exchange and never by a piece table
+    tree = {**cbor.loads(_hex("content_manifest_tree_cbor")), "table": None}
+    publisher._write(c.MANIFEST_TYPE, tree, "1h", c.manifest_tags(tree))
+    _run(nodes, 2)
+    assert b.describe(tree["root"])["manifest"]["layout"] == "tree"
+    assert tree["root"] in [m["root"] for m in b.list_manifests()]
+    flat = b.fetch(tree["root"])
+    _run(nodes, 2)
+    assert flat.done.is_set() and flat.failure == "the manifest names a blob tree, which the tree exchange fetches"
 
 
 def test_a_file_store_resumes_what_it_holds_and_a_holder_republishes(tmp_path):

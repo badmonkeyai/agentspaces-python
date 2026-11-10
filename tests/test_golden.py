@@ -190,7 +190,7 @@ def test_subordinate_agent_certificate_and_record_match_java():
     assert cbor.dumps(dto) == _hex("entry_state_with_certificate_cbor")
     assert cbor.dumps({"state": dto, "claimEntry": None, "claim": None}) \
         == _hex("delta_with_certificate_cbor")
-    assert wire.verify_record(record, identity.public_raw, agent.certificate, now_ms)
+    assert wire.verify_record(record, identity.public_raw, agent.certificate)
 
     # SPEC §11a.4 v0.1.13 (A6): that state is peer-signed on an agent-attested
     # entry, so a peer refuses it; the agent-signed state (the agent signs its
@@ -382,9 +382,9 @@ def test_agent_signed_claims_match_java():
     assert wire.claim_delta("11111111-2222-3333-4444-555555555555", signed) \
         == _hex("claim_delta_with_certificate_cbor")
     now_ms = parse_instant_millis(GOLDEN["certificate_verify_at"])
-    assert wire.verify_claim_proof(signed, now_ms)
+    assert wire.verify_claim_proof(signed)
     assert not wire.verify_claim_proof({**signed, "holderCertificate": None} | {
-        "signature": signed["signature"]}, now_ms)  # agent signature without its certificate
+        "signature": signed["signature"]})  # agent signature without its certificate
 
 
 def test_claim_lattice_order_matches_the_java_merge():
@@ -415,7 +415,7 @@ def test_a_record_sealed_under_epoch_two_names_its_epoch():
                           record["payload"], record["issuer"], record["issued"], 2)
     assert cbor.dumps(view) == _hex("sign_view_key_epoch_cbor")
     assert cbor.dumps(wire.sign_view_of(record)) == _hex("sign_view_key_epoch_cbor")
-    assert wire.verify_record(record, identity.public_raw, None, 0)
+    assert wire.verify_record(record, identity.public_raw, None)
     assert GOLDEN["content_key_aad_epoch_2"] == \
         f"{GOLDEN['space_id']}|{record['entryId']}|2"
     # A record without an epoch signs the v0.1.12 view, byte for byte.
@@ -606,7 +606,7 @@ def test_a_recordless_renew_matches_java_merges_over_a_held_record_and_waits_oth
     assert unnamed["entryId"] == ENTRY
 
     # the hint rides on this peer's advertisement
-    assert waiting.wire_hints == {"wire.recordless": "1"}
+    assert waiting.wire_hints == {"wire.recordless": "1", "wire.appcard": "2"}
 
 
 def test_a_completion_without_its_claim_is_refused():
@@ -616,17 +616,24 @@ def test_a_completion_without_its_claim_is_refused():
     assert peer.states[ENTRY]["completed"] is False
 
 
-def test_a_state_signed_outside_its_window_or_beyond_the_drift_ceiling_is_refused():
-    for name, offset in (("adv_agent_state_out_of_window_delta", -3_600_000),
-                         ("adv_agent_state_drift_delta", 600_000 + 60_000)):
-        state = cbor.loads(_hex(name))["state"]
-        assert state["signedAt"] == _stamp(offset), name
-        peer = _peer_at(GOLDEN["certificate_verify_at"])
-        peer._fold(state)
-        assert peer.states == {}, name
-    # The drift vector is inside the window: a receiver whose clock has caught up accepts it.
-    caught_up = _peer_at(wire.hlc_physical(GOLDEN["hlc_encoded"]) + 60_000)
-    caught_up._fold(cbor.loads(_hex("adv_agent_state_drift_delta"))["state"])
+def test_a_state_signed_outside_its_window_is_refused_and_one_signed_ahead_waits():
+    state = cbor.loads(_hex("adv_agent_state_out_of_window_delta"))["state"]
+    assert state["signedAt"] == _stamp(-3_600_000)
+    peer = _peer_at(GOLDEN["certificate_verify_at"])
+    peer._fold(state)
+    assert peer.states == {}
+    # HLC round six, 2026-11-08 (owner ruling F4): a state's signedAt meets the far-future
+    # rule, so this vector, signed 11 minutes ahead (past the drift bound and the 5 s margin,
+    # within the hour after them), waits unmerged and counts once as deferred. The golden
+    # file labels it "refused"; its owner should read "deferred".
+    drift = cbor.loads(_hex("adv_agent_state_drift_delta"))["state"]
+    assert drift["signedAt"] == _stamp(600_000 + 60_000)
+    peer = _peer_at(GOLDEN["certificate_verify_at"])
+    peer._fold(drift)
+    peer._fold(drift)
+    assert peer.states == {} and {k: v for k, v in peer.counters().items() if v} == {"stampsFarFutureDeferred": 1}
+    caught_up = _peer_at(parse_instant_millis(GOLDEN["certificate_verify_at"]) + 60_000)
+    caught_up._fold(drift)
     assert set(caught_up.states) == {ENTRY}
 
 
@@ -634,7 +641,7 @@ def test_an_out_of_window_agent_claim_is_refused():
     peer = _peer_at(GOLDEN["certificate_verify_at"])
     delta = cbor.loads(_hex("adv_claim_cert_out_of_window_delta"))
     assert delta["claim"]["claim"]["stamp"] == _stamp(-3_600_000)
-    assert not wire.verify_claim_proof(delta["claim"], parse_instant_millis(GOLDEN["certificate_verify_at"]))
+    assert not wire.verify_claim_proof(delta["claim"])
     peer._fold_claim(delta["claimEntry"], delta["claim"])
     assert peer.claims == {}
     control = cbor.loads(_hex("claim_delta_with_certificate_cbor"))
@@ -649,8 +656,8 @@ def test_a_relabelled_key_epoch_never_verifies():
     assert relabelled["keyEpoch"] == 3 and relabelled["sig"] == genuine["sig"]
     assert {k: v for k, v in relabelled.items() if k != "keyEpoch"} == \
         {k: v for k, v in genuine.items() if k != "keyEpoch"}
-    assert wire.verify_record(genuine, identity.public_raw, None, 0)
-    assert not wire.verify_record(relabelled, identity.public_raw, None, 0)
+    assert wire.verify_record(genuine, identity.public_raw, None)
+    assert not wire.verify_record(relabelled, identity.public_raw, None)
     assert cbor.loads(_hex("delta_key_epoch_cbor"))["state"]["record"] == genuine
     peer = _peer_at(GOLDEN["certificate_verify_at"])
     peer._fold(cbor.loads(_hex("adv_key_epoch_relabelled_delta"))["state"])
@@ -705,7 +712,7 @@ def test_a_cross_issuer_revocation_is_refused():
 def test_a_record_under_a_renewed_certificate_matches_java_and_is_judged_at_signing_time():
     # SPEC §4.2 v0.1.13: the renewing agent re-issues at half-life; the record's
     # certificate is the one covering its stamp, judged there by receivers.
-    from agentspaces.identity import verify_agent_certificate_at
+    from agentspaces.identity import verify_agent_certificate_covering
     identity = _identity()
     verify_at = parse_instant_millis(GOLDEN["certificate_verify_at"])
     signed_at = parse_instant_millis(GOLDEN["renewed_certificate_signed_at"])
@@ -743,9 +750,9 @@ def test_a_record_under_a_renewed_certificate_matches_java_and_is_judged_at_sign
 
     long_after = signed_at + 30 * 3600 * 1000
     first = cbor.loads(_hex("agent_certificate_cbor"))
-    assert verify_agent_certificate_at(renewed, identity.public_raw, python, signed_at, long_after)
+    assert verify_agent_certificate_covering(renewed, identity.public_raw, python, signed_at)
     assert not verify_agent_certificate(renewed, identity.public_raw, python, long_after)
-    assert not verify_agent_certificate_at(first, identity.public_raw, python, signed_at, signed_at)
+    assert not verify_agent_certificate_covering(first, identity.public_raw, python, signed_at)
     peer = _peer_at(GOLDEN["renewed_certificate_signed_at"])
     peer._fold(cbor.loads(_hex("delta_renewed_certificate_cbor"))["state"])
     assert set(peer.states) == {entry}

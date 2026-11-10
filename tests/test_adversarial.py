@@ -48,16 +48,22 @@ def _peer() -> Peer:
 @pytest.mark.parametrize("name", [
     "adv_claim_bad_signature_delta",
     "adv_claim_transplanted_delta",
-    "adv_claim_nan_bid_delta",
-    "adv_claim_epoch_zero_delta",
     "adv_claim_epoch_jump_delta",
     "adv_claim_eternal_delta",
 ])
 def test_hostile_claims_never_enter_the_lattice(name):
     peer = _peer()
-    delta = cbor.loads(_hex(name))
+    delta = wire.decode_delta(_hex(name))
     peer._fold_claim(delta["claimEntry"], delta["claim"])
     assert peer.claims == {}
+
+
+@pytest.mark.parametrize("name", ["adv_claim_nan_bid_delta", "adv_claim_epoch_zero_delta"])
+def test_a_claim_javas_take_claim_refuses_never_decodes(name):
+    # Java's TakeClaim refuses a NaN bid and an epoch of zero, so the delta never decodes and
+    # the peer counts it undecodable (HLC round five, 2026-11-08, conformance rows on typed
+    # claim fields).
+    assert wire.decode_delta(_hex(name)) is None
 
 
 def test_deep_nesting_is_refused_bounded():

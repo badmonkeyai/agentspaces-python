@@ -211,6 +211,17 @@ def test_the_tree_message_vectors_encode_byte_for_byte():
     assert cbor.dumps(swarm.reject(tw["root"], tree.TREE_INDEX, swarm.REASON_POLICY))[:10]
 
 
+def test_a_sealed_nodes_that_carries_deltas_is_refused():
+    # PDT 2 phase 4 measures (owner default of 2026-11-09, srad/agentspaces-pdt2.md §10.14): frames travel in
+    # plaintext answers only, and every port refuses a sealed answer that carries them
+    sealed = tree.nodes_message(7, None, b"\x01\x02\x03", 0, None)
+    assert tree.violation(sealed) is None
+    chunk = cbor.loads(_hex("content_nodes_cbor"))["nodes"][0]
+    frame = {"cid": cids.of(chunk, cids.RAW), "base": cids.of(chunk, cids.RAW), "dcz": b"d"}
+    assert tree.violation(dict(sealed, deltas=[frame])) == "a sealed NODES carries no deltas"
+    assert tree.violation(dict(sealed, deltas=[])) == "a sealed NODES carries no deltas"
+
+
 def test_the_tree_layout_manifest_vector_decodes_and_reencodes():
     m = cbor.loads(_hex("content_manifest_tree_cbor"))
     assert m["layout"] == "tree"
@@ -274,4 +285,4 @@ def test_the_sealed_node_vector_walks_as_an_envelope_and_opens_under_the_test_ke
     with pytest.raises(nodes.NodeFormatError):
         nodes.decode(bytes.fromhex("a1616b6173"))  # reserved kind s
     with pytest.raises(nodes.NodeFormatError):
-        nodes.decode(bytes.fromhex("a1616b627272"))  # reserved kind rr
+        nodes.decode(bytes.fromhex("a1616b62746d"))  # reserved kind tm (PDT 2 phase 0, P2-F-04; rr has a schema now)

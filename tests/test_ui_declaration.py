@@ -27,8 +27,8 @@ from agentspaces.agents import _ui_declaration, ui_component, space_take
 
 GOLDEN = json.loads((pathlib.Path(__file__).parent / "golden.json").read_text())
 
-SHARED_OBJECT = "https://badmonkey.ai/ns/apps/v1/SharedObject"
-CHAT_MESSAGE = "https://badmonkey.ai/ns/apps/v1/ChatMessage"
+SHARED_ITEM = "https://example.org/ns/demo/v1/SharedItem"
+MESSAGE = "https://example.org/ns/demo/v1/Message"
 
 
 class Task:
@@ -36,10 +36,11 @@ class Task:
         self.topic = topic
 
 
-@ui_component(catalog="bma-widgets", component="ObjectShare", entry=SHARED_OBJECT, controls=("research",))
+@ui_component(catalog="example-widgets", component="ItemPanel", id="share", entry=SHARED_ITEM, controls=("research",))
 class Desk:
     @space_take(space="tasks")
-    @ui_component(catalog="bma-widgets", component="ChatInput", id="ask", entry=CHAT_MESSAGE, role="control", reads=False, writes=True)
+    @ui_component(catalog="example-widgets", component="MessageInput", id="ask", entry=MESSAGE, role="control", reads=False,
+                  writes=True)
     def research(self, task: Task):
         return None
 
@@ -60,12 +61,12 @@ def test_the_decorators_derive_the_declaration_in_java_field_order():
     ui = _ui_declaration(Desk(), _methods(Desk()), actions)
     assert list(ui.keys()) == ["protocol", "version", "components", "entries", "catalogIds"]
     assert ui["protocol"] == "a2ui" and ui["version"] == "v0.9.1"
-    assert [c["id"] for c in ui["components"]] == ["ObjectShare", "ask"]
+    assert [c["id"] for c in ui["components"]] == ["share", "ask"]
     assert list(ui["components"][0].keys()) == ["id", "catalogId", "component", "entry", "controls", "role"]
     assert ui["components"][0]["controls"] == ["research"]
     assert ui["components"][1]["role"] == "control"
-    assert ui["entries"] == {"reads": [SHARED_OBJECT], "writes": [CHAT_MESSAGE]}
-    assert ui["catalogIds"] == ["bma-widgets"]
+    assert ui["entries"] == {"reads": [SHARED_ITEM], "writes": [MESSAGE]}
+    assert ui["catalogIds"] == ["example-widgets"]
     assert _ui_declaration(Plain(), _methods(Plain()), actions) is None
 
 
@@ -74,7 +75,6 @@ def test_a_control_that_is_not_an_action_is_refused():
         _ui_declaration(Desk(), _methods(Desk()), [])
 
 
-@pytest.mark.skipif("agent_card_ui_cbor" not in GOLDEN, reason="the ui card vector is not synced yet")
 def test_the_golden_card_with_a_declaration_round_trips_byte_for_byte():
     raw = bytes.fromhex(GOLDEN["agent_card_ui_cbor"])
     card = cbor.loads(raw)
@@ -85,6 +85,9 @@ def test_the_golden_card_with_a_declaration_round_trips_byte_for_byte():
         [wire.ui_component(c["id"], c["catalogId"], c["component"], c["entry"], c["controls"], c["role"]) for c in ui["components"]],
         ui["entries"]["reads"], ui["entries"]["writes"])
     assert cbor.dumps(rebuilt) == cbor.dumps(ui), "the Python builder encodes the Java declaration byte for byte"
+    desk = Desk()
+    assert cbor.dumps(_ui_declaration(desk, _methods(desk), card["actions"])) == cbor.dumps(ui), \
+        "the decorators derive the golden declaration"
     without = dict(card)
     del without["ui"]
     assert "ui" not in cbor.loads(cbor.dumps(without))

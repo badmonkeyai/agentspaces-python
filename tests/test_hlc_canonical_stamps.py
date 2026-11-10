@@ -28,16 +28,18 @@ B. A frame stamped past the receiver's wall + MAX_DRIFT but within a five-second
    margin of it is dropped and counted apart, and strikes nobody.
 
 The peer also counts a refused state or claim after verification and once per distinct
-one, judges a frame's stamp in SPEC §9's order, leaves signedAt unjudged against the
-limit as Java does, and compares nodes and holders by UTF-16 code units as Java's
-String.compareTo does."""
+one, judges a frame's stamp in SPEC §9's order, and compares nodes and holders by UTF-16
+code units as Java's String.compareTo does. Round four (HLC round four, 2026-11-08) makes a
+space delta holding a stamp outside the grammar undecodable, as Java's codec makes it,
+judges signedAt like every other stamp, and counts under the Java node's names; the tests
+below follow it, and test_hlc_round_four.py pins the rest."""
 
 import pytest
 
 from agentspaces import wire
 from agentspaces.identity import Identity
-from test_hlc_logical_limit import (DRIFT, LIMIT, LONG_MAX, T, CapturingPeer, Wire, _at,
-                                    _claim, _frame, _with_issued, _with_lease_stamp,
+from test_hlc_logical_limit import (DRIFT, GROUP, LIMIT, LONG_MAX, T, CapturingPeer, Wire, _at,
+                                    _claim, _counted, _frame, _with_issued, _with_lease_stamp,
                                     _with_signed_at, _write)
 
 MARGIN = 5_000
@@ -79,8 +81,9 @@ def test_the_logical_limit_belongs_to_the_merge_rule_and_the_syntax_reads_past_i
     assert wire.acceptable_hlc(f"{T}:{LIMIT + 1}:n") is None
 
 
-def test_a_signing_time_is_read_without_judging_the_limit_as_java_does():
-    # Java judges a state's signedAt by HlcTimestamp.parse alone, never isAcceptable.
+def test_reading_a_signing_time_leaves_the_limit_to_the_merge_points():
+    # HLC round four, 2026-11-08 (decision D1): the fold judges signedAt against the limit;
+    # reading its time for the certificate check judges the grammar alone.
     assert wire.hlc_physical(f"{T}:{LIMIT + 1}:n") == T
     for refused in (f"{T}:007:n", f"0{T}:0:n", f"{T}:0:a\x00b"):
         with pytest.raises(ValueError):
@@ -93,9 +96,11 @@ def test_a_signing_time_is_read_without_judging_the_limit_as_java_does():
 def test_the_peer_drops_and_counts_a_frame_stamped_outside_the_grammar(name):
     peer = CapturingPeer(clock=_at(T))
     other = Identity.generate()
-    peer._handle(_frame(other, "PING", wire.ping_body(1), peer.identity.peer_id, NON_CANONICAL[name]))
+    env = wire.envelope(GROUP, "PING", other.peer_id, NON_CANONICAL[name], wire.ping_body(1),
+                        peer.identity.peer_id)
+    peer._receive(wire.encode_frame(env, other))
     assert peer.sent == []
-    assert peer.frames.malformed_stamps == 1
+    assert peer.malformed_frames == 1
     assert other.peer_id not in peer.members
     assert wire.hlc_now(peer.identity.peer_id, T) == f"{T}:0:{peer.identity.peer_id}"
 
@@ -105,7 +110,7 @@ def test_the_peer_drops_and_counts_a_frame_stamped_outside_the_grammar(name):
 def test_the_filter_judges_a_stale_frame_before_its_counter():
     frames = wire.FrameFilter()
     assert not frames.admit({"from": "a", "stamp": f"{T - wire.MAX_FRAME_AGE_MILLIS - 1}:{LIMIT + 1}:a"}, T)
-    assert (frames.stale, frames.logical_over_limit) == (1, 0)
+    assert (frames.stale, frames.logical_refused) == (1, 0)
 
 
 def test_the_filter_judges_a_replay_before_its_counter():
@@ -113,19 +118,22 @@ def test_the_filter_judges_a_replay_before_its_counter():
     hostile = {"from": "a", "stamp": f"{T}:{LIMIT + 1}:a"}
     assert not frames.admit(hostile, T)
     assert not frames.admit(hostile, T)
-    assert (frames.logical_over_limit, frames.replayed) == (1, 1)
+    assert (frames.logical_refused, frames.replayed) == (1, 1)
 
 
 def test_the_filter_judges_a_far_future_frame_before_its_counter():
     frames = wire.FrameFilter()
     assert not frames.admit({"from": "a", "stamp": f"{T + DRIFT + MARGIN + 1}:{LIMIT + 1}:a"}, T)
-    assert (frames.ahead, frames.logical_over_limit) == (1, 0)
+    assert (frames.far_future, frames.logical_refused) == (1, 0)
 
 
-def test_the_filter_parses_before_any_time_check():
+def test_the_filter_never_judges_a_stamp_that_did_not_decode():
+    # HLC round five, 2026-11-08 (decision E9): such a frame never decodes, so the filter
+    # refuses to judge it and counts nothing.
     frames = wire.FrameFilter()
-    assert not frames.admit({"from": "a", "stamp": f"0{T - wire.MAX_FRAME_AGE_MILLIS - 1}:0:a"}, T)
-    assert (frames.malformed_stamps, frames.stale) == (1, 0)
+    with pytest.raises(ValueError):
+        frames.admit({"from": "a", "stamp": f"0{T - wire.MAX_FRAME_AGE_MILLIS - 1}:0:a"}, T)
+    assert frames.stale == 0
 
 
 # (B) the far-future margin ---------------------------------------------------------------
@@ -139,9 +147,9 @@ def test_a_frame_within_the_margin_is_dropped_and_counted_apart_from_far_future_
     assert frames.admit({"from": "a", "stamp": f"{T + DRIFT}:0:a"}, T)
     assert not frames.admit({"from": "a", "stamp": f"{T + DRIFT + 1}:0:a"}, T)
     assert not frames.admit({"from": "a", "stamp": f"{T + DRIFT + MARGIN}:0:a"}, T)
-    assert (frames.ahead_within_margin, frames.ahead) == (2, 0)
+    assert (frames.far_future_skewed, frames.far_future) == (2, 0)
     assert not frames.admit({"from": "a", "stamp": f"{T + DRIFT + MARGIN + 1}:0:a"}, T)
-    assert (frames.ahead_within_margin, frames.ahead) == (2, 1)
+    assert (frames.far_future_skewed, frames.far_future) == (2, 1)
 
 
 def test_an_honest_peer_dragged_to_the_ceiling_loses_frames_to_a_receiver_running_behind():
@@ -157,7 +165,7 @@ def test_an_honest_peer_dragged_to_the_ceiling_loses_frames_to_a_receiver_runnin
     behind = CapturingPeer(clock=_at(T - 3_000))
     behind._handle(_frame(honest.identity, "PING", wire.ping_body(2), behind.identity.peer_id, dragged))
     assert behind.sent == []
-    assert (behind.frames.ahead_within_margin, behind.frames.ahead) == (1, 0)
+    assert (behind.frames.far_future_skewed, behind.frames.far_future) == (1, 0)
     assert wire.hlc_now(behind.identity.peer_id, T - 3_000) == f"{T - 3_000}:0:{behind.identity.peer_id}"
 
 
@@ -168,20 +176,24 @@ def _forged(state: dict) -> dict:
     return dict(state, record=record)
 
 
-def test_a_state_with_a_non_canonical_issue_stamp_is_refused_and_counted_once():
+def test_a_state_with_a_non_canonical_issue_stamp_is_undecodable_on_every_offer():
     host = Identity.generate()
     honest = _write(host, T)
     receiver = CapturingPeer(clock=_at(T))
     link = Wire(host, receiver)
+    # HLC round four, 2026-11-08 (decisions D3, D5): Java's codec refuses the delta before
+    # any signature check and counts each one; this peer does the same.
     hostile = _with_issued(honest, host, f"{T}:007:{host.agent('w')}")
     link.rumor(hostile)
     link.pull_resp([hostile], {})
     link.rumor(hostile)
     assert receiver.states == {}
-    assert receiver.refused_stamps["states"] == 1
-    # A second distinct hostile state counts again.
-    link.rumor(_with_issued(honest, host, f"{T}:{LIMIT + 1}:{host.agent('w')}"))
-    assert receiver.refused_stamps["states"] == 2
+    assert _counted(receiver) == {"deltasUndecodable": 3}
+    # A verified state with a counter above the limit is refused once however often offered.
+    above = _with_issued(honest, host, f"{T}:{LIMIT + 1}:{host.agent('w')}")
+    link.rumor(above)
+    link.rumor(above)
+    assert _counted(receiver) == {"deltasUndecodable": 3, "stampsLogicalRefused": 1}
 
 
 def test_a_forged_state_with_a_hostile_stamp_is_dropped_uncounted():
@@ -190,43 +202,43 @@ def test_a_forged_state_with_a_hostile_stamp_is_dropped_uncounted():
     link = Wire(host, receiver)
     link.rumor(_forged(_with_issued(_write(host, T), host, f"{T}:{LIMIT + 1}:{host.agent('w')}")))
     assert receiver.states == {}
-    assert receiver.refused_stamps["states"] == 0
+    assert _counted(receiver) == {}
 
 
-def test_a_signing_stamp_past_the_limit_folds_and_one_outside_the_grammar_never_verifies():
+def test_a_signing_stamp_outside_the_grammar_never_decodes_and_one_past_the_limit_is_refused():
     host = Identity.generate()
     agent = host.renewing_subordinate("w", "PT24H", clock=_at(T))
     write = _write(host, T, agent=agent)
     receiver = CapturingPeer(clock=_at(T))
     link = Wire(host, receiver)
-    # The certificate is judged at the signing time, which "007" does not give.
     link.rumor(_with_signed_at(write, agent, f"{T}:007:{agent.agent_id}"))
     assert receiver.states == {}
-    assert receiver.refused_stamps["states"] == 0
-    # Java reads a signing time without judging LOGICAL_LIMIT, and so does this peer.
+    assert _counted(receiver) == {"deltasUndecodable": 1}
+    # HLC round four, 2026-11-08 (decision D1): signedAt is judged like every other stamp.
     link.rumor(_with_signed_at(write, agent, f"{T}:{LIMIT + 1}:{agent.agent_id}"))
-    assert set(receiver.states) == {write["record"]["entryId"]}
-    assert receiver.refused_stamps["states"] == 0
+    assert receiver.states == {}
+    assert _counted(receiver) == {"deltasUndecodable": 1, "stampsLogicalRefused": 1}
 
 
 def test_a_recordless_renewal_with_a_hostile_lease_stamp_waits_uncounted_then_is_refused_once():
     host = Identity.generate()
     write = _write(host, T)
     entry_id = write["record"]["entryId"]
-    hostile = _with_lease_stamp(write, host, f"{T + 1}:00:{host.agent('w')}", T)
-    recordless = {k: v for k, v in hostile.items() if k not in ("record", "issuerPublicKey")}
+    hostile = _with_lease_stamp(write, host, f"{T + 1}:{LIMIT + 1}:{host.agent('w')}", T)
+    # A recordless state omits its record and writes its issuer key null, as Java writes it.
+    recordless = dict({k: v for k, v in hostile.items() if k != "record"}, issuerPublicKey=None)
     receiver = CapturingPeer(clock=_at(T))
     link = Wire(host, receiver)
     link.rumor(dict(recordless, entryId=entry_id))
     assert set(receiver.pending_states) == {entry_id}
-    assert receiver.refused_stamps["states"] == 0
+    assert _counted(receiver) == {}
     # The record arrives: the pending renewal now verifies and the peer refuses it.
     link.rumor(write)
     assert receiver.states[entry_id]["leaseStamp"] == write["leaseStamp"]
     assert receiver.pending_states == {}
-    assert receiver.refused_stamps["states"] == 1
+    assert _counted(receiver) == {"stampsLogicalRefused": 1}
     link.rumor(dict(recordless, entryId=entry_id))
-    assert receiver.refused_stamps["states"] == 1
+    assert _counted(receiver) == {"stampsLogicalRefused": 1}
 
 
 def _rival_claim(state: dict, rival: Identity, stamp: str) -> dict:
@@ -245,12 +257,13 @@ def test_a_claim_signed_over_a_non_canonical_stamp_cannot_replace_an_honest_clai
     link.rumor(write)
     honest = _claim(write, host, f"{T}:5:{host.agent('w')}", T)
     link.rumor(claim=(entry_id, honest))
-    # "0T:0" would read as T:0, which sorts before T:5 and wins the lattice.
+    # "0T:0" would read as T:0, which sorts before T:5 and wins the lattice; it never
+    # decodes (HLC round four, 2026-11-08, decision D3).
     hostile = _rival_claim(write, mallory, f"0{T}:0:{mallory.agent('w')}")
     link.rumor(claim=(entry_id, hostile))
     link.pull_resp([], {entry_id: hostile})
     assert receiver.claims[entry_id] == honest
-    assert receiver.refused_stamps["claims"] == 1
+    assert _counted(receiver) == {"deltasUndecodable": 2}
 
 
 def test_a_forged_claim_with_a_hostile_stamp_is_dropped_uncounted():
@@ -263,7 +276,7 @@ def test_a_forged_claim_with_a_hostile_stamp_is_dropped_uncounted():
     forged = dict(_claim(write, host, f"{T}:{LIMIT + 1}:{host.agent('w')}", T), signature=bytes(64))
     link.rumor(claim=(entry_id, forged))
     assert receiver.claims == {}
-    assert receiver.refused_stamps["claims"] == 0
+    assert _counted(receiver) == {}
 
 
 # UTF-16 code unit order, as Java's String.compareTo -------------------------------------

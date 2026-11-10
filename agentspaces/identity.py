@@ -239,11 +239,6 @@ def parse_duration_millis(iso: str) -> int:
     return millis
 
 
-# How far a signing time may lead the receiver's clock (the HLC drift
-# ceiling, HybridLogicalClock.MAX_DRIFT_MILLIS): a later stamp is refused.
-MAX_DRIFT_MILLIS = 10 * 60 * 1000
-
-
 def agent_certificate(agent: str, agent_public_raw: bytes, issued_iso: str,
                       ttl_iso: str, peer_signature=None,
                       encryption_public_raw=None) -> dict:
@@ -276,20 +271,24 @@ def certificate_covers(certificate: dict, signing_ms: int) -> bool:
     return issued <= signing_ms < issued + parse_duration_millis(certificate.get("ttl"))
 
 
-def verify_agent_certificate_at(certificate, peer_public_raw: bytes,
-                                expected_agent: str, signing_ms: int,
-                                receiver_now_ms: int) -> bool:
-    """AgentCertificates.verifyAt (SPEC §4.2, v0.1.13): a certificate is
-    judged at the signing time of what it certifies (a record's issue stamp,
-    a claim's stamp, a state's ``signedAt``), not at receipt. The window must
-    cover the signing time, the signing time may lead the receiver's clock by
-    at most the HLC drift ceiling, and every check of
-    ``verify_agent_certificate`` must pass at that time. An agent's history
-    therefore stays verifiable after its certificate lapses."""
+# How far a signing time may lead the receiver's clock when the certificate check bounds it
+# (HybridLogicalClock.MAX_DRIFT_MILLIS, the HLC clamp).
+MAX_DRIFT_MILLIS = 10 * 60 * 1000
+
+
+def verify_agent_certificate_covering(certificate, peer_public_raw: bytes,
+                                      expected_agent: str, signing_ms: int) -> bool:
+    """AgentCertificates.verifyCovering (SPEC §4.2, v0.1.13): a certificate is
+    judged at the signing time of what it certifies, not at receipt. The window
+    must cover the signing time, and every check of ``verify_agent_certificate``
+    must pass at that time, so an agent's history stays verifiable after its
+    certificate lapses. A record's issue stamp and a claim's stamp are judged
+    so: the certificate sets no bound on how far they lead the receiver's
+    clock, and the far-future rule judges them after verification, as for
+    peer-signed ones (HLC round five, 2026-11-08, decision E4)."""
     try:
         if (not isinstance(certificate, dict)
-                or not certificate_covers(certificate, signing_ms)
-                or signing_ms > receiver_now_ms + MAX_DRIFT_MILLIS):
+                or not certificate_covers(certificate, signing_ms)):
             return False
     except (KeyError, TypeError, ValueError):
         return False
@@ -341,6 +340,13 @@ def verify_agent_certificate(certificate, peer_public_raw: bytes,
                                bytes(signature))
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def is_local_name(name) -> bool:
+    """Whether ``name`` is an agent's local name: non-empty text with no slash, as Java's
+    AgentId requires, and no colon, since an agent signs stamps whose node is its id and a
+    stamp's node holds no colon (HLC round six, 2026-11-08, R5)."""
+    return isinstance(name, str) and name != "" and "/" not in name and ":" not in name
 
 
 def instant_iso(millis: int) -> str:
@@ -450,7 +456,11 @@ class Identity:
         return self._private.sign(message)
 
     def agent(self, local_name: str) -> str:
-        """The AgentID string form: '<peerId>/<localName>'."""
+        """The AgentID string form: '<peerId>/<localName>'. ValueError for a local name
+        outside Java's AgentId grammar (``is_local_name``), which no receiver decodes (HLC
+        round six, 2026-11-08, R5)."""
+        if not is_local_name(local_name):
+            raise ValueError(f"an agent's local name is non-empty text with no '/' and no ':': {local_name!r}")
         return f"{self.peer_id}/{local_name}"
 
     def subordinate(self, local_name: str, issued_iso: str,

@@ -26,6 +26,8 @@ from agentspaces.capabilities import Content, MemoryStore, Pipes
 from agentspaces.pdt import NodeStore, PMap, Pdt, cids
 from agentspaces.pdt.refs import LATER_HLC, PREF_TYPE
 from agentspaces.space import Space
+from agentspaces import cbor
+from agentspaces.peer import Peer
 from fleet import Network, NetPeer
 
 GROUP = "zPythonPdt"
@@ -161,7 +163,6 @@ def test_a_swap_on_one_peer_derefs_on_the_other_with_an_inline_delta():
     facts.swap(lambda m: m.assoc_many({f"k{i}": "v" * 200 for i in range(300)}))
     head = next(d for d in pb.states.values() if (d.get("record") or {}).get("type") == PREF_TYPE
                 and (d["record"].get("tags") or {}).get("root") == facts.deref().root())
-    from agentspaces import cbor
     assert "nodes" not in cbor.loads(head["record"]["payload"])
     value = b.map_ref("facts").deref()
     assert value.count() == 302 and value.get("k7") == "v" * 200
@@ -300,12 +301,28 @@ def test_a_lazy_follower_loads_nodes_on_access_only():
     assert value.count() == 2000
 
 
+def test_a_lazy_follower_loads_the_nodes_of_an_inline_head_from_its_issuer():
+    # PDT 2 phase 8, P2-O-03: a head whose delta rode inline has no holding, and in linear mode the take removed the
+    # head before it, so no followed root has a holder; a lazy read asks the heads' issuers for the unchanged nodes, as
+    # the Java reader prefers the issuer (PD-S-06)
+    _network, nodes = _fleet(2, follow="lazy", mode={"big": "linear"})
+    (pa, _ca, a), (pb, _cb, b) = nodes
+    big = a.map_ref("big")
+    big.swap(lambda m: m.assoc_many({f"k{i}": "v" * 300 for i in range(2000)}))
+    small = big.swap(lambda m: m.assoc("k1", "changed"))
+    assert not _ca.holdings(small.root()), "the inline head writes no holding"
+    value = b.map_ref("big").deref()
+    assert value.root() == small.root()
+    assert value.get("k77") == "v" * 300
+    assert value.get("k1") == "changed"
+
+
 # ------------------------------------------------------------------ the record-free renew (PD-L-02, PD-L-04)
 
 def test_a_recordless_state_merges_when_the_record_is_held_and_waits_otherwise():
     _network, nodes = _fleet(2)
     (pa, _ca, a), (pb, _cb, b) = nodes
-    assert pa.wire_hints == {"wire.recordless": "1"}
+    assert pa.wire_hints == {"wire.recordless": "1", "wire.appcard": "2"}
     entry_id = a.map_ref("facts").swap(lambda m: m.assoc("k", 1)) and next(
         e for e, d in pa.states.items() if (d.get("record") or {}).get("type") == PREF_TYPE)
     pa.renew_entry("pdt", entry_id, 1_200_000)
@@ -330,3 +347,29 @@ def test_a_recordless_state_merges_when_the_record_is_held_and_waits_otherwise()
     unnamed = {k: v for k, v in recordless.items() if k != "entryId"}
     pa._name_recordless(unnamed, f"r:{entry_id}:123")
     assert unnamed["entryId"] == entry_id
+
+
+# ------------------------------------------------------------------ the ref space's past heads (PDT 2 phase 2)
+
+class PullingPeer(NetPeer):
+    """A peer whose anti-entropy pull goes out as a connected Peer's does, recording each digest it sends."""
+    pull_space = Peer.pull_space
+
+    def __init__(self, network, group):
+        super().__init__(network, group)
+        self.digests = []
+
+    def _send(self, kind, body, to=None):
+        if kind == "DIGEST":
+            self.digests.append(set(cbor.loads(body)["digests"]))
+        super()._send(kind, body, to)
+
+
+def test_a_facade_asks_for_its_ref_space_past_heads_when_it_starts():
+    # PDT 2 phase 2 (§10.6 open item): the facade pulls its ref space when it starts, as the TypeScript and
+    # Ruby facades do, so a late reader's seed answers with the heads written before it came, and no
+    # program pulls the space by hand
+    peer = PullingPeer(Network(), GROUP)
+    Pdt(Content(Pipes(peer), Space(peer, "content"), MemoryStore(), seed=1), Space(peer, "refs"), NodeStore(), seed=1)
+    assert any("space:refs" in digest for digest in peer.digests)
+    assert "refs" in peer._pulled_spaces, "the peer pulls the space again after a reconnect"

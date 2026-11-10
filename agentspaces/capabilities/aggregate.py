@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .. import cbor, wire
+from .. import cbor, records, wire
 
 TYPE = "aspace:cap/aggregate"
 MODES = ("avg", "sum", "count", "min", "max")
@@ -284,11 +284,10 @@ class Aggregate:
             ex[1] = value
 
     def _on_frame(self, sender: str, payload: bytes) -> None:
-        try:
-            frame = cbor.loads(payload)
-        except ValueError:
-            return
-        if not isinstance(frame, dict):
+        # HLC round seven, 2026-11-08: a frame decodes as Java's fromWire reads it, under its
+        # annex I schema and the canonical-bytes rule, or it is dropped unheard
+        frame = records.decode(payload, "PushSumAggregate.Frame")
+        if frame is None:
             return
         self.exchanged = True
         share, extremum, roster = frame.get("share"), frame.get("extremum"), frame.get("roster")
@@ -298,20 +297,12 @@ class Aggregate:
             if heard is not None:
                 self._received[heard] = self._received.get(heard, 0) + 1
             if isinstance(share, dict) and isinstance(share.get("epochId"), str):
-                value, weight = _number(share.get("value")), _number(share.get("weight"))
+                value, weight = share["value"], share["weight"]
                 if math.isfinite(value) and math.isfinite(weight) and weight >= 0.0:
                     e = self._epochs.setdefault(share["epochId"], [0.0, 0.0])
                     e[0] += value
                     e[1] += weight
             elif isinstance(extremum, dict) and isinstance(extremum.get("epochId"), str):
-                self._merge_extremum(extremum["epochId"], bool(extremum.get("max")), _number(extremum.get("value")))
-            elif isinstance(roster, dict) and isinstance(roster.get("epochId"), str):
-                members = self._rosters.setdefault(roster["epochId"], set())
-                for m in roster.get("members") or []:
-                    members.add(int(m))
-
-
-def _number(value) -> float:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    return math.nan
+                self._merge_extremum(extremum["epochId"], extremum["max"], extremum["value"])
+            elif isinstance(roster, dict) and isinstance(roster.get("epochId"), str) and roster["members"] is not None:
+                self._rosters.setdefault(roster["epochId"], set()).update(roster["members"])

@@ -86,6 +86,34 @@ def of_digest(digest: bytes, codec: int) -> str:
     return "b" + base32_lower(bytes([0x01, codec, SHA2_256, DIGEST_LENGTH]) + digest)
 
 
+#: The multihash of BLAKE3 (PDT 2, P2-B-01): a blob's identity is the CIDv1 ``raw`` over it, never a node's link.
+BLAKE3 = 0x1E
+
+
+def identity(digest: bytes) -> str:
+    """The identity CID of a blob's 32-byte BLAKE3 hash (srad/agentspaces-pdt2.md §3.5, P2-B-01)."""
+    if len(digest) != DIGEST_LENGTH:
+        raise ValueError(f"a BLAKE3 identity names a 32-byte hash, got {len(digest)} bytes")
+    return "b" + base32_lower(bytes([0x01, RAW, BLAKE3, DIGEST_LENGTH]) + digest)
+
+
+def identity_digest(text) -> bytes | None:
+    """The BLAKE3 hash an identity names, or None when the text is no identity in its canonical form."""
+    if not isinstance(text, str) or len(text) != TEXT_LENGTH or text[0] != "b":
+        return None
+    try:
+        raw = base32_decode(text[1:])
+    except ValueError:
+        return None
+    if raw[:4] != bytes([0x01, RAW, BLAKE3, DIGEST_LENGTH]) or len(raw) != BINARY_LENGTH:
+        return None
+    return raw[4:]
+
+
+def is_identity(text) -> bool:
+    return identity_digest(text) is not None
+
+
 def from_binary(binary: bytes) -> str:
     """The text form of a binary CID, validated."""
     if len(binary) != BINARY_LENGTH:
