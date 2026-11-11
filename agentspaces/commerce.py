@@ -8,6 +8,8 @@ bindings use (``checkout_hash``, ``transaction_id``)."""
 import base64
 import hashlib
 
+from .cbor import utf16_units
+
 CAPABILITY_COMMERCE = "aspace:cap/commerce"
 SPACE_COMMERCE = "commerce"
 ROLES = ("merchant", "shopper", "payment")
@@ -27,7 +29,7 @@ def item(sku: str, title: str, quantity: int, unit_price: int) -> dict:
 def cart(items, total: int, currency: str) -> dict:
     if len(items) > 64:
         raise ValueError("a cart carries at most 64 items")
-    if len(currency) != 3:
+    if utf16_units(currency) != 3:  # Java's String.length, in UTF-16 code units
         raise ValueError("the currency is an ISO 4217 code: " + currency)
     return {"items": list(items), "total": int(total), "currency": currency}
 

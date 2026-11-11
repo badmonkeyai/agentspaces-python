@@ -97,12 +97,16 @@ def schema_of(type_or_obj) -> str:
 def to_payload(value) -> dict:
     """The wire payload of an entry value: a dataclass's fields, or a dict. A
     dataclass may carry ``__agentspaces_wire_names__ = {"from_": "from"}`` for
-    a wire key Python cannot spell as a field name."""
+    a wire key Python cannot spell as a field name, and
+    ``__agentspaces_omit_none__`` for the fields left out while None, as Java's
+    ``@JsonInclude(NON_NULL)`` leaves them (the version 2 fields of the open A2UI
+    records)."""
     if isinstance(value, dict):
         return value
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         renames = getattr(type(value), "__agentspaces_wire_names__", {})
-        return {renames.get(k, k): v for k, v in dataclasses.asdict(value).items()}
+        omit = getattr(type(value), "__agentspaces_omit_none__", ())
+        return {renames.get(k, k): v for k, v in dataclasses.asdict(value).items() if not (k in omit and v is None)}
     raise TypeError(f"cannot encode {type(value).__name__} as an entry payload")
 
 

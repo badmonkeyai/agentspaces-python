@@ -97,5 +97,5 @@ def test_a_text_past_the_node_bound_is_refused_on_the_way_into_a_map():
     """The phase 6 review's T1: a text whose t node would pass 1 MiB is refused when it enters a map."""
     runs = [TextRun(f"replica-{i:024d}", 0, None, TextRun.RIGHT, 1, False, "x") for i in range(40_000)]
     wide = PText.of(TextLeaf(runs), "alice")
-    with pytest.raises(ValueError, match="node bound"):
+    with pytest.raises(ValueError, match="node bound; split it into smaller texts"):
         PMap.empty(NodeStore()).assoc("doc", wide)

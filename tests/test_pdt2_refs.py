@@ -24,7 +24,7 @@ import pytest
 
 from agentspaces import cbor
 from agentspaces.capabilities import Content, MemoryStore, Pipes
-from agentspaces.pdt import DbReader, NodeStore, Pdt, PVector, cids, nodes, refs
+from agentspaces.pdt import DbReader, NodeStore, Pdt, PMap, PVector, cids, nodes, refs
 from agentspaces.pdt.ancestry import ANCESTRY_ATTR, ancestry_cid, read_ancestry
 from agentspaces.pdt.kinds import VgNode
 from agentspaces.pdt.refs import CANCEL_GRACE_MS, PREF_TYPE, decode_pref, pref_record, pref_violation
@@ -95,7 +95,7 @@ def test_a_db_ref_derefs_to_a_lazy_reader_of_the_head_another_port_wrote():
     assert isinstance(db, DbReader) and db.max_eid == 126
     local = DbReader(root, refs.StoreLoader(a.store))
     assert db.entity(42) == local.entity(42) and list(db.datoms("eavt", 7)) == list(local.datoms("eavt", 7))
-    with pytest.raises(ValueError, match="DataScript writes"):
+    with pytest.raises(ValueError, match="writes none; write db refs with DataScript through agentspaces-datascript"):
         graph.swap(lambda d: d)
 
 
@@ -169,7 +169,7 @@ def test_a_base_walk_reads_the_chain_past_versions_whose_entries_are_gone():
     assert [h["root"] for h in _heads(pb, "facts")] == [roots[2]], "the writer cancelled its superseded heads"
     reader = b.map_ref("facts")
     assert reader.deref().get("k") == 2
-    walk, ends_at_first = reader._walk(roots[2], fetch=True)
+    walk, ends_at_first = reader._walk(roots[2], [pa.identity.peer_id])
     assert walk == roots[::-1] and ends_at_first, "the chain gives the bases the memory never saw"
     assert b.stats()["chainNodesRead"] >= 2
 
@@ -189,10 +189,51 @@ def test_a_vg_node_nobody_holds_is_asked_for_again_only_after_a_backoff():
     original = b.trees.load
     b.trees.load = lambda cid, **kw: asked.append(cid) or original(cid, **kw)
     for _ in range(3):
-        walk, ends = reader._walk(root, fetch=True)
+        walk, ends = reader._walk(root, [pa.identity.peer_id])
         assert walk == [root, "a base nobody saw"] and not ends
     assert asked == [ghost], "one ask, then the backoff"
     assert b.stats()["chainNodesMissed"] == 1
     reader.chain_misses[ghost][1] = 0.0  # the backoff ends
-    reader._walk(root, fetch=True)
+    reader._walk(root, [pa.identity.peer_id])
     assert asked == [ghost, ghost] and reader.chain_misses[ghost][0] == 2
+
+
+def test_a_walk_asks_the_heads_writers_first_and_then_the_writer_of_every_version_it_knows():
+    """Chain walk sources (srad/agentspaces-pdt2.md §10.20): a tree session takes at most ``max_sessions`` sources, the
+    preferred ones first, so the walk lists the heads' writers first and then the writer of every version this reader
+    knows, as Java's Refs.chainSources does. It listed the writers of the versions it knew in the order it met them,
+    and the session took the last of them first, so the writers met before and after the heads filled the session,
+    the walk never asked the one head writer that held a head's vg node, and the merge had no base."""
+    _clock, _network, [(_pa, _ca, a), (_pb, _cb, b), (_pe, _ce, e), (_pf, _cf, f), (_pr, _cr, r)] = _fleet(5)
+    reader = r.map_ref("facts")
+    r.load_timeout = 0.5
+    r.trees.max_sessions = 2
+    base = PMap.empty(r.store).assoc("k", "base")
+    p, q = base.assoc("p", "b"), base.assoc("q", "b")
+    roots = {"base": base.root(), "p": p.root(), "q": q.root(), "x": p.assoc("x", "a").root(), "y": q.assoc("y", "b").root()}
+
+    def vg(holders, root, bases, links, step):
+        data = VgNode(root, bases, holders[0].space_agent_id(), f"{T + step}:0:golden", [nodes.Link(c) for c in links])
+        for holder in holders:
+            holder.store.put(data.encode())
+        return cids.of(data.encode())
+    vg_base = vg([b, a], roots["base"], (), [], 0)
+    vg_p = vg([b, a], roots["p"], (roots["base"],), [vg_base], 1)
+    vg_q = vg([b], roots["q"], (roots["base"],), [vg_base], 1)
+    def version(writer, name, step):
+        root = PMap.empty(r.store).assoc(name, step).root()
+        reader.known[root] = refs.Head(root, (), 1, 1, refs.KIND_MAP, refs.MODE_MULTI, writer.space_agent_id(),
+                                       (T + step, 0, "n"), f"e-{name}", T + 600_000)
+    # the reader meets a version of e, which holds none of the chain, then the heads x, by a over p, and y, by b over
+    # q, and never the entries of p, q or the base; a alone holds x's vg node, and b alone y's
+    version(e, "e", 1)
+    heads = []
+    for step, (writer, name, under, link) in enumerate([(a, "x", "p", vg_p), (b, "y", "q", vg_q)], start=2):
+        head = refs.Head(roots[name], (roots[under],), step, 2, refs.KIND_MAP, refs.MODE_MULTI, writer.space_agent_id(),
+                         (T + step, 0, "n"), f"e-{name}", T + 600_000)
+        reader.known[head.root] = head
+        reader.ancestry[head.root] = vg([writer], head.root, (roots[under],), [link], step)
+        heads.append(head)
+    version(f, "f", 4)  # then a version of f, which holds none of the chain either
+    assert reader._common_base(heads) == roots["base"]
+    assert r.stats()["chainNodesMissed"] == 0

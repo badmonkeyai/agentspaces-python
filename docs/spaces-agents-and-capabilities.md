@@ -55,8 +55,7 @@ consumes, produces, space bindings, declared actions, the agent certificate)
 published on the `ads` stream on bind. `vote.propose`, `vote.cast`, and
 `vote.decision` are the procedural forms; the tally rule is Java's.
 
-The return conventions are the Java binder's (ISSUE-WorkflowVerbs,
-ISSUE-Motion): `None` writes nothing; `Tagged(value, {"region": "eu"})` is
+The return conventions are the Java binder's: `None` writes nothing; `Tagged(value, {"region": "eu"})` is
 written with its tags; a list or tuple is the fork, each element written on
 its own after the take completes; a `Motion(proposal_id, question, options,
 quorum, space=None)` opens a vote once per proposal id in its space or the
@@ -77,13 +76,13 @@ five kinds: `WRITTEN`, `TAKEN`, `COMPLETED`, `EXPIRED` (the write lease
 lapsed while the entry was open: a leased entry as a timer), and
 `REAPPEARED` (a take claim lapsed), the last two judged by a sweep on the
 clock, once per entry and lapse. `Space.notify(template, callback, lease)`
-is the leased push subscription of the Java space (JS-V-01): it lapses on
+is the leased push subscription of the Java space: it lapses on
 the peer's clock unless `renew()`ed, and the binder renews a notify's, a
 propose's, and a join part's at half-lease while the agent is bound. Takes
 and `read(timeout=...)` wake on folds rather than polling: at most one
-anti-entropy pull per settle window, none while folds arrive (JS-V-02).
+anti-entropy pull per settle window, none while folds arrive.
 The decorators and `Part` take `filters=["priority>=3", "region in eu,us"]`,
-the portable grammar of SPEC §7.2, beside the `where` matchers (JS-V-03).
+the portable grammar of SPEC §7.2, beside the `where` matchers.
 A `Contribution(epoch, value)` return
 starts the epoch on the binder's aggregate, and `produces=[...]` on a take or
 notify names the card's produced types when the return annotation does not. Maps a signature covers (`tags`, `costHints`,
@@ -97,12 +96,12 @@ Java's `String.hashCode` so the vectors agree, `query`, `remote_query` over
 the query pipe, and answers to other members' queries), and `remote`
 (`actions` from the cards the `ads` stream carried, `invoke` through the
 task space with the shared-fields correlation), and `OrderedLog` (the Raft
-client of `aspace:cap/ordered-log`, JS-V-05: `take` submits a signed
+client of `aspace:cap/ordered-log`: `take` submits a signed
 `ClientSubmit` claim command to the leader the advertisements name, or to any
 reachable member that forwards it under its leader hint, and holds the entry
 once the committed claim folds back from the space; the Raft frame union and
 the ClientSubmit are pinned by the golden `raft_*` vectors), and `connect`
-(the agent side of the connector protocol, JS-C-14: `DataQuery`,
+(the agent side of the connector protocol: `DataQuery`,
 `DataResult`, `AssetChange`, `AssetInvocation`, and `AssetInvocationResult`
 as `@entry` dataclasses in Java record order, pinned by the golden
 `data_query_cbor`, `data_result_cbor`, `asset_change_cbor`,
@@ -117,17 +116,17 @@ card's issuer writes, the same `invocation_id` on a retry so the target runs
 once; `asset_cards(peer, asset=None)` and `invoke_ops(card)` over the ads
 stream; a result counts only from the named `trusted_connectors`, the
 caller's own `trust(issuer_peer, asset)` rule, or, for an invocation, the
-card's issuer; readers drop fields they do not know, JS-F-06; the connector
+card's issuer; readers drop fields they do not know; the connector
 runtime itself stays in Java and TypeScript). MAJORITY_GOSSIP
 is `vote.cast_preference` and `vote.leader` over the aggregate's push-sum
-shares (JS-V-04), the epochs Java's `VoteCapability` names. A dial-only peer
+shares, the epochs Java's `VoteCapability` names. A dial-only peer
 sends frames to its seed directly and to every other member through it: the
 seed carries a `RELAY_FRAME` when it holds the `RELAY` role (SPEC §5.4), and
-the peer's `relay.via` hint tells members to reach it the same way back. Not here: the Raft voter (JS-F-18), so reduces and
+the peer's `relay.via` hint tells members to reach it the same way back. Not here: the Raft voter, so reduces and
 the fleet-wide LEASED and ORDERED join modes; the gossip-learning exchange
 (its payload is encoded and golden-pinned); and every transport but tcp and
 tls (the client skips `ws`, `wss`, `http`, `https`, `webrtc`, and `dtls`
-endpoints, JS-N-05 as amended on 2026-11-03).
+endpoints).
 
 **TLS.** A `tls://host:port` seed, or `peer.connect(host, port, scheme="tls")`,
 dials TLS 1.3 and presents a channel certificate: a fresh P-256 key in a
@@ -153,9 +152,10 @@ each dial.
 `CouncilFleet` coordinator: tasks taken, the council ballot cast, the epoch
 contributed to, the semantic query answered, the remote action served.
 `tests/test_layer34.py`, `tests/test_layer4.py`, `tests/test_verbs.py`,
-`tests/test_verbs_residency.py` (JS-V-01, JS-V-02, JS-V-04, the mixed-scheme
-fleet), `tests/test_ordered.py` (JS-V-05 against a simulated log), and
-`tests/test_connect.py` (JS-C-14 against a simulated connector: the golden
+`tests/test_verbs_residency.py` (the leased notify, the settle window, the
+aggregate's shares, the mixed-scheme fleet), `tests/test_ordered.py` (the
+Raft client against a simulated log), and `tests/test_connect.py` (the
+connector protocol against a simulated connector: the golden
 bytes, a query answered and the identical one served from the space, a
 result accepted only from a trusted connector, an invocation answered only
 by the card's issuer, a retry that never runs the target again) prove each
@@ -207,11 +207,11 @@ spill when it publishes:
 ```python
 from agentspaces import wire
 
-origin = wire.app_card_origin("realm", "example-realm/example-app", "",
-                             {"realm.reads": "Item,Order", "realm.format": "1",
+origin = wire.app_card_origin("realm", "example-realm/example-app", "1.0.0",
+                             {"realm.reads": "Item,Order", "realm.format": "yaml@89faba629f66e715421ba0f1b535142e4d2ef3aa",
                               "realm.namespace": "urn:realm:example-realm#"})
 card = wire.app_card(peer.group, peer.identity, "example-app", issued, kind="fed", shape="static",
-                     url="https://apps.example.org/example-app.html", origin=origin,
+                     url="app://example-realm/example-app", origin=origin,
                      formats=["text/html"], host=wire.app_card_host("https://apps.example.org", published_at_iso=issued))
 issued_card = peer.publish_ad("AppCard", card)       # the card as signed
 found = [a for a in peer.app_cards() if wire.from_origin(a, "realm", "example-realm/*")]
@@ -236,7 +236,7 @@ an entry of that type into `data_use_space`, and writes nothing without one.
 ## Values that change: persistent data trees
 
 `agentspaces.pdt` is the Python port of the persistent data trees
-(srad/agentspaces-pdt.md, PD-C-04): content-addressed values whose every
+(SPEC annex H): content-addressed values whose every
 version shares the nodes it did not change, so a member that holds one
 version fetches only the delta of the next. The layouts match the Java
 build byte for byte, and `tests/test_pdt_vectors.py` proves it against every
@@ -246,11 +246,11 @@ build byte for byte, and `tests/test_pdt_vectors.py` proves it against every
   in any order has one root. `get`, `assoc`, `dissoc`, `update`,
   `update_in`, iteration, `count`, `diff`, `merge3`, equality by root.
   A value that is itself a `dict` is embedded in the order you built it,
-  while the Java codec sorts a map's keys (ISSUE-CanonicalMaps), so put a
+  while the Java codec sorts a map's keys, so put a
   nested dict in canonical order (`cbor.canonical_map`, or build it with its
   keys sorted shorter-first then bytewise) when its root must equal Java's;
   scalars, strings, byte strings, and lists need nothing.
-- Escalated space payloads (PD-E-01, PD-E-03): a `payloadRef` whose CID is
+- Escalated space payloads: a `payloadRef` whose CID is
   dag-cbor names a persistent tree a Java writer escalated into; the peer
   hands it to the facade (`Pdt.payload`), which reassembles the bytes once
   the tree is here and starts one tree fetch otherwise, so an entry of an
@@ -299,7 +299,7 @@ renews its live heads at half-life and cancels each superseded head of its
 own two seconds after a newer head replaced it (`Peer.cancel_entry`), unless
 a fork still walks through it. The peer
 advertises the `wire.recordless` hint and accepts a renew, cancel, or
-complete without its record (SRAD §3.9). `tests/test_pdt_swarm.py` runs two
+complete without its record. `tests/test_pdt_swarm.py` runs two
 peers in process: a delta fetch with a held base receives exactly the
 delta, a swap derefs on the other peer from the inline delta, and a 100-key
 concurrent swap converges on both; `tests/workers/pdt_worker.py` is the
@@ -307,7 +307,7 @@ peer a Java cross-language test drives over tcp.
 
 ### PDT 2: feature level 2
 
-The client reads every PDT 2 form (srad/agentspaces-pdt2.md, P2-C-01), so its
+The client reads every PDT 2 form, so its
 content-swarm advertisement carries `pdt = "2"` beside `trees = "1"`. It
 sends a level-2 form only to a member whose advertisement carries level 2.
 

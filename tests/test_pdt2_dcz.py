@@ -54,7 +54,7 @@ def test_a_one_byte_edit_opens_over_its_base_and_names_the_base_by_sha256():
 
 def test_the_format_byte_and_the_header_are_read_by_name():
     field = _field(_zstd(b"x" * 100))
-    with pytest.raises(dcz.DczRefused, match="VCDIFF"):
+    with pytest.raises(dcz.DczRefused, match="VCDIFF.*send a zstd frame"):
         dcz.decode(BASE, b"v" + field[1:])
     with pytest.raises(dcz.DczRefused, match="unknown format byte 0x7a"):
         dcz.decode(BASE, b"z" + field[1:])

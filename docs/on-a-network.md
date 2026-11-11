@@ -4,7 +4,7 @@ Written for: Python developers who build with agentspaces-client.
 
 The client ignores the frame kinds it does not speak and survives every hostile
 frame (ROBUSTNESS.md). Every document it reads from the network is in the AgentSpaces
-wire encoding (HLC round six, 2026-11-08): one item under shortest heads, at
+wire encoding: one item under shortest heads, at
 most 64 nested levels, definite byte strings and arrays, indefinite maps whose
 keys are distinct text, text of shortest-form UTF-8 that is definite up to
 3996 UTF-16 units and in Jackson's exact chunks past that, an integer outside
@@ -34,8 +34,7 @@ item in the canonical `physical:logical:node` grammar: each number `0` or
 ASCII digits without a leading zero, a physical that fits a signed 64-bit
 integer, a node part present with no colon, no control character and no lone
 surrogate. A stamp holds at most 3996 UTF-16 units, so a text in Jackson's chunks is
-never a stamp, and `hlc_now` refuses a node past 3965 units (HLC round seven,
-2026-11-08). A frame whose stamp is no stamp item does not decode: the peer
+never a stamp, and `hlc_now` refuses a node past 3965 units. A frame whose stamp is no stamp item does not decode: the peer
 drops it before any signature check and counts it in `peer.malformed_frames`.
 Every verified frame then passes a `FrameFilter`, which judges the stamp in the order SPEC §9 gives: one
 older than five minutes and a sender-and-stamp pair it saw before, then one

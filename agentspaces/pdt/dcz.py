@@ -57,7 +57,8 @@ def decode(base: bytes, field: bytes) -> bytes:
     if len(field) < HEADER_BYTES + _MIN_ZSTD_BYTES:
         raise DczRefused(f"a field of {len(field)} bytes holds no format byte, RFC 9842 header, and zstd frame")
     if field[0] == VCDIFF:
-        raise DczRefused("a VCDIFF frame (format byte 'v', P2-Z-05), which this release does not read")
+        raise DczRefused("a VCDIFF frame (format byte 'v'), which this release does not read;"
+                         " send a zstd frame (format byte 'd') or the whole node")
     if field[0] != ZSTD:
         raise DczRefused(f"unknown format byte 0x{field[0]:02x}; this release reads 'd' (zstd)")
     if field[1:1 + len(DCZ_MAGIC)] != DCZ_MAGIC:

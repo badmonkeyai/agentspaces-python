@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"progress-m-1","key":"main","inReplyTo":"m-1","agent":"workbench","state":"working","steps":[{"label":"read q3-expenses.csv","kind":"read","ref":"data/q3-expenses.csv","at":"2026-11-10T09:00:00Z"},{"label":"summarise","kind":"tool","ref":"","at":"2026-11-10T09:00:02Z"}],"at":"2026-11-10T09:00:02Z"}

@@ -1,0 +1,1 @@
+{"schemaVersion":2,"id":"m-1-reply","key":"main","from":{"kind":"agent","name":"workbench","peer":"peer-7"},"text":"Spend rose **four percent**.","attachments":[],"inReplyTo":"m-1","at":"2026-11-10T09:00:00Z","format":"text/markdown","cites":[{"file":"file-q3","path":"data/q3-expenses.csv","name":"q3-expenses.csv"}]}

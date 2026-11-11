@@ -285,7 +285,7 @@ def test_two_level2_members_reconcile_their_held_roots(expected):
 
 def test_a_member_sends_no_sketch_to_a_member_it_reads_at_level_1():
     _content, trees, _store, sent = _wire({"old": {"trees": "1"}})
-    with pytest.raises(ValueError, match="level 1"):
+    with pytest.raises(ValueError, match=r"level 1.*check reads_level_two\(holder\) before reconcile_held"):
         trees.reconcile_held("old")
     assert sent == []
 

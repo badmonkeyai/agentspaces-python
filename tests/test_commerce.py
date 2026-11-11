@@ -44,3 +44,18 @@ def test_the_golden_vectors_round_trip_byte_for_byte():
     assert cbor.dumps(order(o["id"], o["mandate"], o["status"], o["fulfillment"], o["permalink"], o["at"])) == raw
     cap = cbor.loads(_vector("capability_commerce_cbor"))
     assert cap["capabilityType"] == "aspace:cap/commerce" and cap["parameters"]["role"] == "merchant"
+
+
+@pytest.mark.parametrize("currency, held", [
+    ("USD", True),
+    ("\U0001F600€", True),       # two code points, three UTF-16 units: Java's length() is 3
+    ("\U0001F600" * 3, False),        # three code points, six units
+    ("US", False),
+    ("éE", True),               # a combining sequence: three code points, three units
+])
+def test_a_currency_is_three_utf16_units_as_java_and_typescript_count(currency, held):
+    if held:
+        assert cart([], 0, currency)["currency"] == currency
+    else:
+        with pytest.raises(ValueError, match="ISO 4217"):
+            cart([], 0, currency)

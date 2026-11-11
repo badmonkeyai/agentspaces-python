@@ -7,7 +7,7 @@ image of the Java codec's Jackson CBOR (indefinite maps in field order,
 definite arrays and byte strings, shortest heads, float64 doubles, explicit
 nulls), and decodes nothing else. `records.py` holds the protocol records this
 client reads, with their fields in Java's order, the capability pipe payloads
-included (HLC round seven, 2026-11-08), and checks every one it decodes from
+included, and checks every one it decodes from
 the network. `identity.py` holds Ed25519 identity, the self-certifying
 derivations (PeerID, GroupID, SpaceID), and the founding-document half of
 spec §4.4/§5.1: `found_group` mirrors Java `GroupFounding.found`, and

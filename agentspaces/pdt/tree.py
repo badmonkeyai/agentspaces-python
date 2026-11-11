@@ -509,8 +509,9 @@ class TreeFetch:
             for root in self.trees.followed_roots():
                 for h in self.trees.holders(root):
                     candidates.append((h["holder"], h.get("via")))
-        for p in self.prefer:
-            candidates.insert(0, (p, None))
+        # the preferred sources come first, in their order, so the session's limit cuts the least preferred
+        # (chain walk sources, srad/agentspaces-pdt2.md §10.20)
+        candidates[:0] = [(p, None) for p in self.prefer]
         me = self.trees.self_id
         for peer, via in candidates:
             if peer == me or peer in self.sources:
@@ -1356,7 +1357,8 @@ class Trees:
         session's ``outcome`` is ``(have, need)``: the roots this peer holds that the holder lacks, and the roots the
         holder holds that this peer lacks. A member read at level 1 gets no sketch (P2-F-05)."""
         if not self.reads_level_two(holder):
-            raise ValueError(f"{holder} is read at level 1: a sketch goes only to a member at level 2 (P2-F-05)")
+            raise ValueError(f"{holder} is read at level 1, and a sketch goes only to a member at level 2;"
+                             " check reads_level_two(holder) before reconcile_held")
         req = self.next_req()
         session = sync.SketchSession(holder, req, self.reconcile_set(),
                                      lambda sketch: self.send(holder, tree_want(req, "", [], sync.MAX_SKETCH_BYTES, sketch)),

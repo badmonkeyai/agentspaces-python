@@ -2,13 +2,13 @@
 
 Written for: Python developers who build with agentspaces-client.
 
-A peer that knows a beacon's URL joins through the beacon document (the
-discovery SRAD §3.5, DB-X-01): `agentspaces/beacon.py` fetches it (https
+A peer that knows a beacon's URL joins through the beacon document:
+`agentspaces/beacon.py` fetches it (https
 unless `allow_plain`, at most 64 KiB), verifies its Ed25519 signature over the
 canonical bytes under a key hashing to its `issuer` (and requires the pinned
 `beacon_peer` when given), refusing a signed document unless it arrives as
 exactly its canonical JSON with its signature and key in padded standard
-base64 (HLC round seven, 2026-11-08), selects the group, verifies the founding
+base64, selects the group, verifies the founding
 advertisement with the same four checks `join_by_group_id` applies, and dials
 the group's `tcp` seeds in priority order. The verified founding is kept on
 `peer.founding` and the founder is known for revocations.
@@ -43,8 +43,7 @@ expire with nothing reachable. `connect(host, port)` is unchanged underneath.
 peer.connect_any([("seed-a.corp.example", 7500), ("seed-b.corp.example", 7500)])
 ```
 
-A group for friends is joined with an invite key (SRAD §3.8, appendix F,
-DB-X-07) in either rendering, `aspace-inv1-<code>-<secret>[-<delegation>][@host]`
+A group for friends is joined with an invite key in either rendering, `aspace-inv1-<code>-<secret>[-<delegation>][@host]`
 or `https://<host>/j/<code>#<secret>[.<delegation>]`. `agentspaces/social.py`
 derives from the secret, by HKDF-SHA256 under `aspace-inv1`, the invite
 signing key, the content key (epoch 0), and the lookup code; `join_invite`

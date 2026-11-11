@@ -175,7 +175,7 @@ class TextNode(TreeNode):
         try:
             self.node = from_wire(value).encode()
         except NodeFormatError as too_large:
-            raise ValueError(f"a text value whose t node exceeds the 1 MiB node bound (PD-N-04): {too_large}") from None
+            raise ValueError(f"a text value whose t node exceeds the 1 MiB node bound; split it into smaller texts: {too_large}") from None
 
     def encode(self, flusher: Flusher) -> bytes:
         return self.node
@@ -206,7 +206,7 @@ def is_link_item(item: bytes) -> bool:
 def check_key(key: bytes) -> None:
     if is_link_item(key):
         raise ValueError("a key must not be a bare link item (CBOR tag 42 over a CID): "
-                         "a link item in a map node names a spilled node (PD-N-05); hold a CID as text")
+                         "a link item in a map node names a spilled node; hold a CID as text")
 
 
 def ref_of(item: bytes):
@@ -261,7 +261,7 @@ def spill(item: bytes, ctx: Ctx):
     """Applies PD-N-05 to one encoded value: inline bytes, or the new spill node."""
     if is_link_item(item):
         raise ValueError("a value must not be a bare link item (CBOR tag 42 over a CID): "
-                         "a link item in a value slot names a spilled node (PD-N-05); hold a CID as text")
+                         "a link item in a value slot names a spilled node; hold a CID as text")
     if len(item) <= VALUE_LIMIT:
         return item
     if not ctx.level_one:
@@ -278,7 +278,8 @@ def spill(item: bytes, ctx: Ctx):
             return BlobNode(item[_header_length(info):])
     if len(item) > MAX_X_VALUE:
         raise ValueError(f"a value of {len(item)} CBOR bytes exceeds the {MAX_X_VALUE} bytes an x node can hold "
-                         "under the 1 MiB node bound (PD-N-04)")
+                         "under the 1 MiB node bound; store a value this large as a byte string, which becomes a blob,"
+                         " or split it into a map or a vector")
     return XNode(item)
 
 

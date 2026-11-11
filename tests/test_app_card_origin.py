@@ -64,11 +64,15 @@ def test_the_origin_and_formats_vector_decodes_and_its_origin_rebuilds_byte_for_
     card = records.decode(raw, "AppCard")
     assert card is not None and list(card)[-2:] == ["origin", "formats"], "origin, then formats, after host"
     origin = card["origin"]
-    # the attrs keys travel in the SPEC §9.1 order of a map<String,String>: the shorter key first
-    assert list(origin["attrs"]) == ["realm.reads", "realm.format", "realm.namespace"]
-    rebuilt = wire.app_card_origin("realm", "example-realm/example-app", "",
-                                   {"realm.namespace": "urn:realm:example-realm#", "realm.format": "1",
-                                    "realm.reads": "Item,Order"})
+    # the attrs keys travel in the SPEC §9.1 order of a map<String,String>: the shorter key first, then bytewise
+    assert list(origin["attrs"]) == ["realm.reads", "realm.commit", "realm.digest", "realm.format", "realm.namespace"]
+    # the realm values of SPEC v0.1.33 (REALM.md §5 revision 4): the realm's semver, the form and the
+    # specification commit, the realm's commit, the import document's digest, and the app link as url
+    assert card["url"] == "app://example-realm/example-app"
+    rebuilt = wire.app_card_origin("realm", "example-realm/example-app", "1.0.0",
+                                   {"realm.namespace": "urn:realm:example-realm#", "realm.format": "yaml@89faba629f66e715421ba0f1b535142e4d2ef3aa",
+                                    "realm.digest": "sha256:ae7219d1e1e24b382d3ffc38aeb92052628db2d0f55d5dc75b3a72fd19965637",
+                                    "realm.commit": "0123456789abcdef0123456789abcdef01234567", "realm.reads": "Item,Order"})
     assert cbor.dumps(rebuilt) == cbor.dumps(origin)
     assert wire.app_card_formats(["Text/HTML", "application/geo+json", "text/html", "urn:realm:example-realm#"]) \
         == card["formats"], "media types lower-cased, the repeat dropped, the issuer's order kept"

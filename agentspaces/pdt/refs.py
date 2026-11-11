@@ -731,15 +731,15 @@ class Ref:
                 acc = acc.merge3(base, later_value, resolver)
         return acc
 
-    def _walk(self, root: str, fetch: bool = False) -> tuple[list[str], bool]:
+    def _walk(self, root: str, sources: list[str] | None = None) -> tuple[list[str], bool]:
         """The roots reachable from ``root`` over base links, breadth first and the root itself
         first, as Refs.java's ancestors lists them: a root first reached at step 64 joins the
         walk and the walk does not follow its bases. With them, whether the walk ends at first
         versions within the bound: every root it reaches is a version this reader knows, and
         every version at step 64 has no base (HLC round five, 2026-11-08, decision E16).
         A version reads its bases from the live entries seen and, when no entry of it was seen,
-        from its vg node (PDT 2 phase 7, P2-V-02); with ``fetch`` a vg node the store lacks is
-        fetched by ``NODE_WANT``, as a merge does, and the tick reads only the nodes it holds."""
+        from its vg node (PDT 2 phase 7, P2-V-02); with ``sources`` a vg node the store lacks is
+        fetched from them by ``NODE_WANT``, as a merge does, and the tick reads only the nodes it holds."""
         seen: dict[str, None] = {}
         complete = True
         frontier = [(root, 0)]
@@ -748,28 +748,28 @@ class Ref:
             if cid in seen:
                 continue
             seen[cid] = None
-            bases = self._bases(cid, fetch)
+            bases = self._bases(cid, sources)
             if bases is None:
                 complete = False
                 continue
             if depth >= MAX_BASE_STEPS:
                 complete = complete and not bases
                 continue
-            self._learn_parents(cid, bases, fetch)
+            self._learn_parents(cid, bases, sources)
             for b in bases:
                 if b not in seen:
                     frontier.append((b, depth + 1))
         return list(seen), complete
 
-    def _bases(self, root: str, fetch: bool) -> tuple | None:
+    def _bases(self, root: str, sources: list[str] | None) -> tuple | None:
         """A version's bases: from the entries seen, else from its vg node; None when neither describes it."""
         version = self.known.get(root)
         if version is not None:
             return version.base
-        node = self._chain_node(root, fetch)
+        node = self._chain_node(root, sources)
         return None if node is None else node.bases
 
-    def _chain_node(self, root: str, fetch: bool) -> VgNode | None:
+    def _chain_node(self, root: str, sources: list[str] | None) -> VgNode | None:
         """The vg node of a version, read before or now through the CID its head or a child's link named. A node that
         does not hash to its CID or names another root leaves the version without ancestry (P2-V-02)."""
         node = self.chain.get(root)
@@ -778,7 +778,7 @@ class Ref:
         cid = self.ancestry.get(root)
         if cid is None:
             return None
-        data = self._chain_bytes(cid, fetch)
+        data = self._chain_bytes(cid, sources)
         if data is None:
             return None
         try:
@@ -792,21 +792,20 @@ class Ref:
         self.pdt.chain_nodes_read += 1
         return node
 
-    def _chain_bytes(self, cid: str, fetch: bool) -> bytes | None:
-        """A vg node from the store, else, with ``fetch``, by ``NODE_WANT`` from the heads' issuers and the holders.
+    def _chain_bytes(self, cid: str, sources: list[str] | None) -> bytes | None:
+        """A vg node from the store, else, with ``sources``, by ``NODE_WANT`` from them first and then the holders.
         A node whose fetch failed is asked for again only after a backoff that doubles with each failure, with a
         random spread (swarm retries, ROBUSTNESS.md §10.2), so a head that names a node nobody holds costs each merge
         no load timeout."""
         data = self.store.get(cid)
-        if data is not None or not fetch:
+        if data is not None or sources is None:
             return data
         miss = self.chain_misses.get(cid)
         now = time.monotonic()
         if miss is not None and now < miss[1]:
             return None
-        issuers = list(dict.fromkeys(h.issuer.split("/", 1)[0] for h in self.known.values()))
         try:
-            data = self.pdt.trees.load(cid, prefer=issuers, timeout=self.pdt.load_timeout)
+            data = self.pdt.trees.load(cid, prefer=sources, timeout=self.pdt.load_timeout)
         except nodes.NodeUnavailable:
             self.pdt.chain_nodes_missed += 1
             miss = self.chain_misses.setdefault(cid, [0, 0.0])
@@ -819,15 +818,15 @@ class Ref:
         self.chain_misses.pop(cid, None)
         return data
 
-    def _learn_parents(self, root: str, bases: tuple, fetch: bool) -> None:
+    def _learn_parents(self, root: str, bases: tuple, sources: list[str] | None) -> None:
         """Learns which vg node describes each base no entry seen describes: the version's vg node links one per base."""
         if all(b in self.known or b in self.ancestry or b in self.chain for b in bases):
             return
-        child = self._chain_node(root, fetch)
+        child = self._chain_node(root, sources)
         if child is None:
             return
         for link in child.previous:
-            data = self._chain_bytes(link.cid, fetch)
+            data = self._chain_bytes(link.cid, sources)
             if data is None or not cids.verifies(link.cid, data):
                 continue
             try:
@@ -840,6 +839,12 @@ class Ref:
                     self.chain[parent.root] = parent
                     self.pdt.chain_nodes_read += 1
 
+    def _chain_sources(self, heads: list[Head]) -> list[str]:
+        """The peers a walk asks for the vg nodes its store lacks (P2-V-02): the heads' issuers first, then the writer of
+        every version this reader knows, as Java's Refs.chainSources lists them. A head's writer may lack the vg node of
+        its base, which the base's own writer then alone holds (chain walk sources, srad/agentspaces-pdt2.md §10.20)."""
+        return list(dict.fromkeys(h.issuer.split("/", 1)[0] for h in [*heads, *self.known.values()]))
+
     def _common_base(self, heads: list[Head]) -> str | None:
         """The lowest common base of the heads (PD-R-06): the first root in the latest head's
         walk that every other walk reaches, fetched when the store lacks it. When the walks
@@ -848,7 +853,8 @@ class Ref:
         2026-11-08, decision E16); otherwise there is none."""
         if all(not h.base for h in heads):
             return EMPTY_BASE
-        walked = [self._walk(h.root, fetch=True) for h in heads]
+        sources = self._chain_sources(heads)
+        walked = [self._walk(h.root, sources) for h in heads]
         walks = [w for w, _ in walked]
         others = [set(w) for w in walks[:-1]]
         for candidate in walks[-1]:
@@ -871,7 +877,8 @@ class Ref:
     def swap(self, f: Callable):
         """Applies ``f`` to the current value and publishes the result as a new head (PD-R-03, PD-R-04)."""
         if self.kind.name == KIND_DB:
-            raise ValueError("this client reads a db ref and DataScript writes it (agentspaces-datascript, P2-D-03)")
+            raise ValueError("this client reads a db ref and writes none;"
+                             " write db refs with DataScript through agentspaces-datascript")
         if self.mode == MODE_LINEAR:
             return self._swap_linear(f)
         with self._lock:
