@@ -613,8 +613,16 @@ class Peer:
         every answer that fails (§9), and only then introduces this peer.
         Returns the verified SignedGroupAdvertisement. Raises TimeoutError
         when no verified document arrived within ``timeout`` seconds: a
-        hostile seed can delay the join and can never substitute a policy."""
-        self.group = group_id
+        hostile seed can delay the join and can never substitute a policy.
+
+        ``group_id`` is the bare id or the join URI ``aspace://<id>[/<space>]``.
+        The want goes out again while the join waits, in slices of 1 s, 2 s,
+        4 s, then 5 s, as Java's join does (ISSUE-BootstrapRobustness FR-4),
+        so a seed that missed the first want still answers."""
+        bare = beacon.parse_group_id(group_id)
+        if bare is None:
+            raise ValueError(f"no GroupId in {group_id!r}")
+        self.group = bare
         self.founding = None
         self._founding_ready.clear()
         self._seed = Seed(host, int(port), scheme.lower())
@@ -622,8 +630,15 @@ class Peer:
         self._running = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
-        self._send(wire.KIND_GROUP_AD_WANT, b"")
-        if not self._founding_ready.wait(timeout) or self.founding is None:
+        deadline = time.monotonic() + timeout
+        slice_seconds = 1.0
+        while True:
+            self._send(wire.KIND_GROUP_AD_WANT, b"")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self._founding_ready.wait(min(slice_seconds, remaining)):
+                break
+            slice_seconds = min(slice_seconds * 2, 5.0)
+        if not self._founding_ready.is_set() or self.founding is None:
             self.close()
             raise TimeoutError(
                 f"no verified GROUP_AD for {group_id} from {host}:{port} "

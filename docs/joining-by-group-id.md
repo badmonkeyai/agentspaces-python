@@ -3,9 +3,13 @@
 Written for: Python developers who build with agentspaces-client.
 
 A peer that knows only a self-certifying GroupID and one seed endpoint joins
-with `Peer.join_by_group_id(host, port, group_id, timeout=10.0)` (spec §5.1,
-§10.1): it dials the seed, sends an unaddressed `GROUP_AD_WANT` naming the
-group, waits for a `GROUP_AD` whose `SignedGroupAdvertisement` body passes
+with `Peer.join_by_group_id(host, port, group_id, timeout=10.0, scheme="tcp")`
+(spec §5.1, §10.1). The id may be bare or the join URI
+`aspace://<id>[/<space>]`, read as Java's `GroupId.ofUri` reads it, and
+`scheme="tls"` dials a TLS seed. It dials the seed, sends an unaddressed
+`GROUP_AD_WANT` naming the group and sends it again while it waits (after 1 s,
+2 s, 4 s, then every 5 s, as Java's join does), waits for a `GROUP_AD` whose
+`SignedGroupAdvertisement` body passes
 `verify_signed_group_ad` and derives to exactly that GroupID, ignores every
 answer that fails, and only then publishes its self-advertisement. It raises
 `TimeoutError` when no seed served a verified document in time, so a hostile

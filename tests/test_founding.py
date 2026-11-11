@@ -303,3 +303,67 @@ def test_join_by_group_id_times_out_without_a_verified_answer(monkeypatch):
                               timeout=0.05)
     assert peer.group == GOLDEN["founding_group_id"]
     assert not peer.connected
+
+
+def test_parse_group_id_reads_the_join_uri_as_java_does():
+    # Defect of 2026-11-11: the join needed the bare id; Java's GroupId.ofUri takes either.
+    from agentspaces import beacon
+    gid = GOLDEN["founding_group_id"]
+    assert beacon.parse_group_id(gid) == gid
+    assert beacon.parse_group_id(f"aspace://{gid}") == gid
+    assert beacon.parse_group_id(f"ASPACE://{gid}/tasks") == gid
+    assert beacon.parse_group_id("  aspace://  ") is None
+    assert beacon.parse_group_id("aspace://") is None
+    assert beacon.parse_group_id(None) is None
+
+
+def test_join_by_group_id_takes_the_uri_and_asks_again_until_a_seed_answers(monkeypatch):
+    # Defects of 2026-11-11: GROUP_AD_WANT went out once with no retry, and an
+    # aspace:// prefix became the group. The seed here misses the first want.
+    import socket as socket_module
+    import threading
+
+    gid = GOLDEN["founding_group_id"]
+    wants = []
+    holder = {}
+
+    class FakeSocket:
+        def __init__(self):
+            self.closed = threading.Event()
+
+        def settimeout(self, value):
+            pass
+
+        def sendall(self, data):
+            env = wire.decode_frame(data[4:])
+            if env is None or env["kind"] != wire.KIND_GROUP_AD_WANT:
+                return
+            wants.append(env)
+            if len(wants) == 2:  # answer the second want, off the sender's lock
+                threading.Timer(0.01, _drive, (holder["peer"], _hex("group_ad_frame_cbor"))).start()
+
+        def recv(self, count):
+            self.closed.wait()
+            raise OSError("closed")
+
+        def close(self):
+            self.closed.set()
+
+    monkeypatch.setattr(socket_module, "create_connection",
+                        lambda address, timeout=None: FakeSocket())
+    golden_seconds = int(GOLDEN["hlc_encoded"].split(":")[0]) / 1000  # the golden frame's instant
+    peer = Peer(_identity(), None, clock=lambda: golden_seconds + 1)
+    holder["peer"] = peer
+    try:
+        founding = peer.join_by_group_id("127.0.0.1", 1, f"aspace://{gid}/tasks", timeout=5.0)
+        assert founding is not None
+        assert peer.group == gid, "the group is the bare id, not the URI"
+        assert len(wants) >= 2, "the want went out again after the first slice"
+        assert all(want["group"] == gid for want in wants)
+    finally:
+        peer.close()
+
+
+def test_join_by_group_id_refuses_a_uri_without_an_id():
+    with pytest.raises(ValueError):
+        Peer(_identity(), None).join_by_group_id("127.0.0.1", 1, "aspace://", timeout=0.05)

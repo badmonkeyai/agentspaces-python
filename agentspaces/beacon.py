@@ -346,11 +346,16 @@ def parse_document(body: bytes) -> dict:
 # -------------------------------------------------------------- selection
 
 def parse_group_id(text: str | None) -> str | None:
-    """The bare GroupID of an ``aspace://<id>`` URI or a bare id."""
+    """The bare GroupID of ``aspace://<id>``, ``aspace://<id>/<space>``, or a
+    bare id, read as Java's ``GroupId.ofUri`` reads it: the prefix matched
+    without regard to case, anything after the first slash dropped."""
     if not isinstance(text, str) or not text.strip():
         return None
     text = text.strip()
-    return text[len(URI_PREFIX):] if text.startswith(URI_PREFIX) else text
+    if text[:len(URI_PREFIX)].lower() == URI_PREFIX:
+        text = text[len(URI_PREFIX):]
+    text = text.split("/", 1)[0]
+    return text or None
 
 
 def group_from_document(doc: dict, group_id: str | None = None, name: str | None = None) -> dict:
