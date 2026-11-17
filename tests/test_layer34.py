@@ -292,3 +292,44 @@ def test_a_ballot_casts_once_per_proposal_and_a_decision_fires_once_at_quorum():
         assert vote.ballots(peer.states, "rel:2") == []
     finally:
         bound.close()
+
+
+def test_a_binding_made_after_the_proposals_folded_still_casts_and_decides_once():
+    # R2 (2026-11-16): a council worker joined, the coordinator's proposal came by rumor at once, and
+    # the worker bound its agent a second later. A pull with the replica's own digest never sends that
+    # proposal again, so a binding that only watched for new folds never cast. The binding now reads
+    # the proposals already held when it binds.
+    peer = StubPeer()
+    other = StubPeer()
+
+    def deliver():
+        for kind, body in other.sent:
+            peer._fold(cbor.loads(cbor.loads(body)["payload"])["state"])
+        other.sent.clear()
+
+    vote.propose(other, "votes", "rel:open", "ship 1.0?", ["yes", "no"], 2)
+    vote.propose(other, "votes", "rel:closed", "ship 0.9?", ["yes", "no"], 1)
+    vote.cast(other, "votes", "rel:closed", "no")
+    vote.propose(other, "votes", "ops:3", "ship?", ["yes", "no"], 1)
+    deliver()
+    assert vote.decision(peer.states, "rel:closed")["winner"] == "no"
+    panelist = Panelist()
+    started = time.monotonic()
+    bound = Binder(peer, publish_card=False).bind(panelist)
+    try:
+        # Liveness ceilings, not expectations: each lands in milliseconds.
+        assert _await(30, lambda: vote.tally(peer.states, "rel:open").get("yes") == 1)
+        assert _await(30, lambda: panelist.decided == ["rel:closed"])
+        print(f"late bind: ballot and decision within {time.monotonic() - started:.3f} s")
+        # The held proposal is not judged twice: refolding everything raises no second ballot or decision.
+        for dto in list(peer.states.values()):
+            peer._fold(dict(dto))
+        time.sleep(0.3)
+        mine = [b for b in vote.ballots(peer.states, "rel:open")
+                if (b[0].get("issuer") or "").startswith(peer.identity.peer_id)]
+        assert len(mine) == 1
+        assert panelist.decided == ["rel:closed"]
+        # The prefix still filters what the binding reads at bind time.
+        assert vote.ballots(peer.states, "ops:3") == []
+    finally:
+        bound.close()

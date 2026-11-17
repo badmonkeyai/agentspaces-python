@@ -434,10 +434,18 @@ def rumor_body(stream_id: str, item_id: str, hops: int, payload: bytes) -> bytes
                        "hopsRemaining": hops, "payload": payload})
 
 
-def digest_body(digests: dict) -> bytes:
+def digest_body(digests: dict, budget: int | None = None) -> bytes:
     """A DIGEST body, its digests map in the canonical order a map field takes (HLC round
-    six, 2026-11-08, rule P2): ``peers`` before ``space:<name>``."""
-    return cbor.dumps({"digests": cbor.canonical_map(digests)})
+    six, 2026-11-08, rule P2): ``peers`` before ``space:<name>``. With ``budget`` (SPEC annex
+    I.6, v0.1.35; a positive number of bytes) the body carries it after the digests, the
+    other fields of annex I.6 omitted, which a sender writes only toward a card that carries
+    ``wire.ae=2``."""
+    body = {"digests": cbor.canonical_map(digests)}
+    if budget is not None:
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+            raise ValueError(f"a budget is a positive number of bytes: {budget!r}")
+        body["budget"] = budget
+    return cbor.dumps(body)
 
 
 def channel_hello_body(accepts_bare: bool, attested_remote: str) -> bytes:
@@ -875,7 +883,7 @@ def agent_card(group: str, identity: Identity, local_name: str, issued_iso: str,
 
 
 def ui_declaration(components: list, reads: list | None = None, writes: list | None = None,
-                   protocol: str = "a2ui", version: str = "v0.9.1") -> dict:
+                   protocol: str = "a2ui", version: str = "1.0") -> dict:
     """A UiDeclaration in Java field order (SPEC §6.1a.3): protocol, version,
     components (each id, catalogId, component, entry, controls, role), entries
     (reads, writes), catalogIds (derived from the components when not given)."""

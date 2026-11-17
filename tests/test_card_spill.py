@@ -113,7 +113,7 @@ def test_every_stub_rule_holds_at_decode_on_both_kinds():
 
 def test_the_card_spill_builder_refuses_what_the_record_refuses():
     root = cbor.loads(_hex("app_card_spill_cbor"))["spill"]["root"]
-    assert wire.card_spill(root, 452, ["reads", "views", "ui"]) == cbor.loads(_hex("app_card_spill_cbor"))["spill"]
+    assert wire.card_spill(root, 449, ["reads", "views", "ui"]) == cbor.loads(_hex("app_card_spill_cbor"))["spill"]
     for args in ((root, 0, ["reads"]), (root, 1, []), ("bafy", 1, ["reads"]), (root, 1, ["reads", "reads"])):
         with pytest.raises(ValueError):
             wire.card_spill(*args)

@@ -75,7 +75,12 @@ carries its entry's tags. A watch, and `@space_notify(on=[...])`, deliver
 five kinds: `WRITTEN`, `TAKEN`, `COMPLETED`, `EXPIRED` (the write lease
 lapsed while the entry was open: a leased entry as a timer), and
 `REAPPEARED` (a take claim lapsed), the last two judged by a sweep on the
-clock, once per entry and lapse. `Space.notify(template, callback, lease)`
+clock, once per entry and lapse. An entry first learned completed raises
+`COMPLETED` alone, from what the peer holds, and an entry learned lapsed or
+withdrawn raises no `WRITTEN` (SPEC §7.2, v0.1.35); a `WRITTEN` that waits for
+a block or artifact fires only if the entry is still live when it lands.
+`Taken.renew` extends the take's hold, never shortening it.
+`Space.notify(template, callback, lease)`
 is the leased push subscription of the Java space: it lapses on
 the peer's clock unless `renew()`ed, and the binder renews a notify's, a
 propose's, and a join part's at half-lease while the agent is bound. Takes

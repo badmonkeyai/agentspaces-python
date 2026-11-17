@@ -122,10 +122,10 @@ class Wire:
         self.deliver("PULL_RESP", cbor.dumps({"deltas": {"space:tasks": sync}}))
 
 
-def _write(host: Identity, now_ms: int, agent=None) -> dict:
+def _write(host: Identity, now_ms: int, agent=None, lease_millis: int = 60_000) -> dict:
     """A signed write as another member gossips it."""
     _, body = wire.entry_delta("tasks", GROUP, "T#v1", cbor.dumps({"x": 1}), host, "w",
-                               60_000, agent=agent, now_ms=now_ms)
+                               lease_millis, agent=agent, now_ms=now_ms)
     return cbor.loads(cbor.loads(body)["payload"])["state"]
 
 

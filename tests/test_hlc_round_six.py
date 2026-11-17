@@ -179,7 +179,9 @@ def test_lapsed_claims_on_entries_never_held_leave_the_claim_map_under_churn():
 def test_a_live_claim_and_a_claim_on_a_held_entry_stay():
     holder = Identity.generate()
     receiver, link, clock = _receiver(holder)
-    write = _write(holder, T)
+    # The entry's lease outlasts the hour below, so the entry is still held then: a lapsed one
+    # would be collected with its claim (SPEC §7.3, v0.1.35).
+    write = _write(holder, T, lease_millis=2 * HOUR)
     held = write["record"]["entryId"]
     link.rumor(write)
     link.rumor(claim=(held, _claim(holder, held, T, T + 60_000)))

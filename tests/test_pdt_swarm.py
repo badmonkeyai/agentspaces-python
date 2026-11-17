@@ -322,7 +322,7 @@ def test_a_lazy_follower_loads_the_nodes_of_an_inline_head_from_its_issuer():
 def test_a_recordless_state_merges_when_the_record_is_held_and_waits_otherwise():
     _network, nodes = _fleet(2)
     (pa, _ca, a), (pb, _cb, b) = nodes
-    assert pa.wire_hints == {"wire.recordless": "1", "wire.appcard": "2"}
+    assert pa.wire_hints == {"wire.recordless": "1", "wire.appcard": "2", "wire.horizon": "1"}
     entry_id = a.map_ref("facts").swap(lambda m: m.assoc("k", 1)) and next(
         e for e, d in pa.states.items() if (d.get("record") or {}).get("type") == PREF_TYPE)
     pa.renew_entry("pdt", entry_id, 1_200_000)

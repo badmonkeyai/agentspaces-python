@@ -1,0 +1,1 @@
+{"schemaVersion":1,"kind":"track.ship","label":"Ships","style":{"icon":"ship","color":"#8888cc"},"fields":["mmsi","speed_kn","destination"]}

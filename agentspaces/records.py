@@ -50,7 +50,7 @@ WireCodec.Signed { envelope: Envelope, senderPublicKey: bytes, signature: bytes 
 Envelope { ver: int, group: GroupId, kind: enum Kind[PING,PING_REQ,ACK,RUMOR,DIGEST,PULL_RESP,QUERY,QUERY_HIT,BLOCK_WANT,BLOCK,PIPE_DATA,BATCH,HAVE,GRAFT,PRUNE,RELAY_FRAME,CHANNEL_HELLO,SESSION_HELLO,GROUP_AD_WANT,GROUP_AD], from: PeerId, to: PeerId, stamp: HlcTimestamp, body: bytes }
 Bodies.Ping { nonce: long, root: bytes ?null, hashes: map<String,bytes> ?null, have: list<Bodies.HaveItem> ?null }
 Bodies.Rumor { streamId: String, itemId: String, hopsRemaining: int, payload: bytes }
-Bodies.PullResp { deltas: map<String,bytes> }
+Bodies.PullResp { deltas: map<String,bytes>, remainder: map<String,Long> ?null }
 Bodies.RelayFrame { target: PeerId, frame: bytes, path: list<PeerId> ?null, hop: Integer ?null }
 Bodies.HaveItem { streamId: String, hash: bytes }
 BlockExchange.Want { cid: String }
@@ -275,6 +275,9 @@ _INVARIANTS = {
                               and (v["payload"] is None or len(v["payload"]) <= wire.INLINE_PAYLOAD_LIMIT)
                               and (v.get("keyEpoch") is None or v["keyEpoch"] >= 1)),
     "LeaseInfo": lambda v: _none_of(v, "holder", "kind") and v["expiresAtMillis"] > 0,
+    # SPEC annex I.6 (v0.1.35): a remainder counts the states left out, so a negative one makes
+    # the carrier undecodable (the vector adv_pull_resp_remainder_negative_body).
+    "Bodies.PullResp": lambda v: v.get("remainder") is None or all(n >= 0 for n in v["remainder"].values()),
     "Dot": lambda v: v["replica"] is not None and v["counter"] > 0,
     "TakeClaim": lambda v: (_none_of(v, "entryId", "spaceId", "stamp", "holder") and v["epoch"] >= 1
                             and math.isfinite(v["bid"])),

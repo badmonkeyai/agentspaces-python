@@ -95,6 +95,10 @@ class Decision:
 
 _META = "__agentspaces_binding__"
 
+# How many held proposals a vote binding reads when it binds (Binder._start_ballot): far past
+# any vote space in practice, and a bound on the work a bind does.
+_BIND_SWEEP_LIMIT = 10_000
+
 
 def _mark(fn, verb: str, **attrs):
     setattr(fn, _META, {"verb": verb, **attrs})
@@ -465,11 +469,12 @@ class Binder:
             return
         ttl_ms = duration_millis(self.card_ttl)
         peer_id = self.peer.identity.peer_id
-        ids = []
+        ids, payloads = [], []
         for use in declared:
             payload = {"schemaVersion": 1, "agent": name, "peer": peer_id, "reads": list(use["reads"]),
                        "writes": list(use["writes"]), "source": use["source"], "sensitivity": use["sensitivity"],
                        "freshness": use["freshness"], "declaredBy": "decorator"}
+            payloads.append(payload)
             ids.append(self.peer.write_entry(self.data_use_space, self.data_use_type, payload,
                                              agent_name=self.agent_name, lease_millis=ttl_ms, agent=self.agent))
         bound.data_use = ids
@@ -479,9 +484,17 @@ class Binder:
             while bound._running:
                 if bound._stopped.wait(half_seconds):
                     return
-                for entry_id in ids:
-                    if bound._running:
+                for index, entry_id in enumerate(ids):
+                    if not bound._running:
+                        continue
+                    try:
                         self.peer.renew_entry(self.data_use_space, entry_id, lease_millis=ttl_ms, agent=self.agent)
+                    except ValueError:
+                        # SPEC §7.2 (v0.1.35): an entry that lapsed here (a paused process) or was
+                        # collected cannot be renewed, so the declaration is written again instead.
+                        ids[index] = self.peer.write_entry(self.data_use_space, self.data_use_type, payloads[index],
+                                                           agent_name=self.agent_name, lease_millis=ttl_ms,
+                                                           agent=self.agent)
 
         thread = threading.Thread(target=renew, name=f"{bound.name}.data-use", daemon=True)
         bound._threads.append(thread)
@@ -631,14 +644,17 @@ class Binder:
         space = self.space(meta["space"])
         prefix = meta.get("prefix") or ""
         cast_for: set[str] = set()
+        lock = threading.Lock()
         lease_ms = duration_millis(meta.get("lease", "1h"))
 
-        def on_event(event: Event):
-            proposal = event.entry.value
+        def consider(proposal: dict):
             pid = proposal.get("proposalId")
-            if not isinstance(pid, str) or not pid.startswith(prefix) or pid in cast_for:
+            if not isinstance(pid, str) or not pid.startswith(prefix):
                 return
-            cast_for.add(pid)
+            with lock:  # the reader thread and the bind-time sweep below both get here
+                if pid in cast_for:
+                    return
+                cast_for.add(pid)
 
             def react():
                 try:
@@ -651,7 +667,14 @@ class Binder:
                                agent=self.agent, agent_name=self.agent_name)
             threading.Thread(target=react, name=f"{bound.name}.{method.__name__}", daemon=True).start()
 
-        bound._subscriptions.append(space.watch(Template(votes.PROPOSAL_TYPE), on_event))
+        bound._subscriptions.append(space.watch(Template(votes.PROPOSAL_TYPE), lambda event: consider(event.entry.value)))
+        # A proposal that folded before this binding existed raises no WRITTEN for it: a member
+        # that binds after it joins (the proposal came by rumor first) still owes its ballot. A
+        # pull with this replica's own digest never sends that proposal again, so the binding
+        # reads the open proposals it already holds. The watch is in place first, so a proposal
+        # folding meanwhile is seen by one or the other and cast once.
+        for held in space.entries(Template(votes.PROPOSAL_TYPE), limit=_BIND_SWEEP_LIMIT):
+            consider(held.value)
 
     def _start_decision(self, bound: Bound, obj, method, meta) -> None:
         space = self.space(meta["space"])
@@ -660,7 +683,7 @@ class Binder:
         lock = threading.Lock()
 
         def check(pid: str):
-            if not pid.startswith(prefix):
+            if not isinstance(pid, str) or not pid.startswith(prefix):
                 return
             decided = votes.decision(self.peer.states, pid)
             if decided is None:
@@ -685,6 +708,10 @@ class Binder:
 
         bound._subscriptions.append(space.watch(Template(votes.BALLOT_TYPE), on_ballot))
         bound._subscriptions.append(space.watch(Template(votes.PROPOSAL_TYPE), on_proposal))
+        # A quorum that closed on ballots folded before this binding existed raises no event
+        # here again (see _start_ballot): judge the proposals already held once at bind time.
+        for held in space.entries(Template(votes.PROPOSAL_TYPE), limit=_BIND_SWEEP_LIMIT):
+            check(held.value.get("proposalId", ""))
 
     def _start_estimate(self, bound: Bound, obj, method, meta) -> None:
         if self.aggregate is None:

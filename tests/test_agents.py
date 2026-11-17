@@ -73,10 +73,13 @@ def test_a_renewing_agent_stays_verifiable_after_its_first_certificate_lapses():
     host = Identity.generate()
     agent = host.renewing_subordinate("planner", "PT1H", clock=clock)
     first = agent.certificate
-    _, early = wire.entry_delta("tasks", GROUP, "T#v1", b"\x01", host, "x", 600_000,
+    # Leases that outlast the four hours below: a lapsed entry would meet the collection
+    # horizon at the door (SPEC §7.3, v0.1.35), which is not what this test judges.
+    lease = 6 * 60 * 60 * 1000
+    _, early = wire.entry_delta("tasks", GROUP, "T#v1", b"\x01", host, "x", lease,
                                 agent=agent, now_ms=clock.millis)
     clock.advance(31 * 60 * 1000)  # past half-life: the next signature renews
-    _, later = wire.entry_delta("tasks", GROUP, "T#v1", b"\x02", host, "x", 600_000,
+    _, later = wire.entry_delta("tasks", GROUP, "T#v1", b"\x02", host, "x", lease,
                                 agent=agent, now_ms=clock.millis)
     assert agent.certificate is not first
     assert agent.certificate_covering(T0) is first

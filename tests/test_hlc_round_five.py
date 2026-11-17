@@ -206,7 +206,9 @@ def test_the_counters_carry_java_names_for_far_future_refusals_and_deferrals():
 
 def test_a_hostile_far_future_state_counts_apart_and_merges_once_the_wall_catches_up():
     host = Identity.generate()
-    hostile = _with_issued(_write(host, T), host, f"{HOSTILE_AT}:0:{host.agent('w')}")
+    # A lease that outlasts the two hours below, so the state is still live when the wall
+    # catches up: a lapsed one would meet the collection horizon at the door (SPEC §7.3).
+    hostile = _with_issued(_write(host, T, lease_millis=3 * HOUR), host, f"{HOSTILE_AT}:0:{host.agent('w')}")
     receiver, link, clock = _receiver(host)
     link.rumor(hostile)
     link.pull_resp([hostile], {})
@@ -353,7 +355,7 @@ def test_an_agent_record_past_the_margin_is_deferred_and_merges_once_the_wall_ca
 def test_an_agent_record_an_hour_past_the_margin_is_refused_as_hostile():
     host = Identity.generate()
     agent = _agent(host)
-    hostile = _signed_now(_write(host, HOSTILE_AT, agent=agent), agent)
+    hostile = _signed_now(_write(host, HOSTILE_AT, agent=agent, lease_millis=3 * HOUR), agent)
     receiver, link, clock = _receiver(host)
     link.rumor(hostile)
     link.rumor(hostile)

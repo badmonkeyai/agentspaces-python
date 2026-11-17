@@ -97,14 +97,20 @@ def main() -> int:
     bound = Binder(peer, agent=agent_identity).bind(Councillor())
     aggregate.start("load", value)
     aggregate.run(0.25)
-    settled = None
+    # One settle watch for the whole run, as the Ruby worker keeps. A one-second await_settled
+    # inside the loop started a new watch each turn, and a new watch needs four ticks with fresh
+    # frames before its three-tick streak can close, which a one-second window at a 0.25 s tick
+    # almost never holds, so this worker never reported the estimate (R2, 2026-11-16).
+    estimates: list[float] = []
+
+    def on_settled(estimate) -> None:
+        estimates.append(estimate.value)
+        print(f"  [py] epoch load settled at {estimate.value:.3f}", flush=True)
+
+    aggregate.on_estimate(lambda epoch: epoch == "load", Settle.after(3, 0.01), on_settled)
     deadline = time.time() + max_seconds
     try:
         while time.time() < deadline and peer.connected:
-            if settled is None:
-                settled = aggregate.await_settled("load", Settle.after(3, 0.01), timeout_seconds=1.0)
-                if settled is not None:
-                    print(f"  [py] epoch load settled at {settled:.3f}", flush=True)
             peer.pull_space("tasks")
             peer.pull_space("votes")
             time.sleep(0.5)
@@ -112,6 +118,7 @@ def main() -> int:
         bound.close()
         aggregate.close()
         peer.close()
+    settled = estimates[0] if estimates else None
     print(f"python council worker done: {State.completed} tasks, decision "
           f"{State.decided.winner if State.decided else 'none'}, estimate {settled}", flush=True)
     return 0 if State.completed >= 1 and State.decided is not None and settled is not None else 1

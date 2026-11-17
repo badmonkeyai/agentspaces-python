@@ -31,7 +31,7 @@ import threading
 import time
 from typing import Callable
 
-from . import beacon, cbor, records, social, tls, wire
+from . import beacon, cbor, digests, horizon, records, social, tls, wire
 from .identity import (Identity, derive_id, instant_iso, verify_agent_certificate_covering,
                        verify_signed_group_ad)
 from . import revocation as revocations
@@ -45,6 +45,37 @@ JOIN_SLICE_MAX_S = 5.0
 
 
 HINT_RECORDLESS = "wire.recordless"
+#: SPEC v0.1.35 §7.3 (srad/replication-by-entry.md RE-L-03): this client renews by the rule of §7.2
+#: (issuer only, present and unexpired, never shorter) and runs one node per identity, so it
+#: advertises the per-entry horizon's hint, and applies that horizon itself while its view does.
+HINT_HORIZON = "wire.horizon"
+#: SPEC annex I.6: a member that audits by the trie advertises ``wire.ae=2``. This client does not,
+#: and reads the hint on its seed's card alone, to send a budget beside its own pull.
+HINT_AE = "wire.ae"
+#: The PULL_RESP budget this client asks for (annex I.6, *The budget*): 1 MiB, the default.
+DEFAULT_PULL_BUDGET = 1_048_576
+#: How many times one pull continues after a budgeted answer left states out (annex I.6): each
+#: continuation asks for at most one budget, so the bound is about a gigabyte of states.
+MAX_PULL_CONTINUATIONS = 1024
+#: The most bytes a space's text digest takes in a DIGEST this client sends: room under the
+#: frame ceiling of SPEC §9 for the envelope, the signature and the revocation streams.
+MAX_DIGEST_TEXT_BYTES = wire.MAX_FRAME_BYTES - 65_536
+#: The acknowledgements a space's digest holds at most (SPEC §7.3 and R7 of §9.2), the least
+#: recently refused forgotten first, as Java's REFUSED_ACK_CAP.
+REFUSED_ACK_CAP = 8192
+#: How long the acknowledgement of a collected tombstone lasts after the last refusal it answered
+#: (SPEC §7.3), as Java's COLLECTED_ACK_HOLD_MILLIS.
+COLLECTED_ACK_HOLD_MILLIS = 5 * 60 * 1000
+#: Rounds the view must stay fully hinted before the per-entry horizon engages, and their bounds
+#: (SPEC §7.3, RE-Q-REL-09), as Java's ReplicatedSpace; a round here is HORIZON_ROUND_MILLIS.
+DEFAULT_HORIZON_ENGAGE_ROUNDS = 3
+HORIZON_ENGAGE_ROUNDS_FLOOR, HORIZON_ENGAGE_ROUNDS_CEILING = 1, 64
+#: One round of the hysteresis when the group's period is not known here: Java counts a gossip
+#: period of the group, one second by default (``Peer.horizon_round_millis``).
+HORIZON_ROUND_MILLIS = 1000
+#: How often, at most, the peer collects its tombstones (SPEC §7.3): it runs no timer of its own,
+#: so the collection rides on the space sweep, the pulls and the folds.
+COLLECT_PERIOD_MILLIS = 1000
 #: The AppCard level a member reads (SPEC §6.1a.2 and §9, v0.1.32; AppCard origin and formats,
 #: 2026-11-09): canonical decimal text, read as level N or above. A member at level 2 reads a card's
 #: origin, formats, an ``idp`` host, and a spill reference; an issuer writes them only while every
@@ -79,6 +110,20 @@ MAX_CLAIM_PREDATES_ISSUE_MILLIS = wire.MAX_HLC_SKEW_MILLIS
 #: The race allowance a contesting claim's stamp gets past the drift bound: Java's default
 #: ``ReplicatedSpace`` settle window, 200 ms (HLC round six, 2026-11-08, R6).
 CONTEST_SETTLE_MILLIS = 200
+#: The longest follow-up wait a take makes after its settle window before it judges the race:
+#: one fold or this much, as the TypeScript take's ``TAKE_FOLLOW_UP_MAX_MILLIS``.
+TAKE_FOLLOW_UP_MAX_MILLIS = 300
+
+
+def take_judged_within_millis(settle_millis: int) -> int:
+    """How long after its claim goes out a take may be judged in a quiet space: the whole settle
+    window, then the follow-up wait (``min(settle, 300)`` ms), which ends early only when something
+    folds. A take lease must be longer than this, or the claim has lapsed when it is judged (SPEC
+    §7.4), as the TypeScript ``takeJudgedWithinMillis``."""
+    settle = max(0, int(settle_millis))
+    return settle + min(settle, TAKE_FOLLOW_UP_MAX_MILLIS)
+
+
 #: The fewest claims the claim map holds before ``_prune_claims`` scans it (HLC round six,
 #: 2026-11-08, R10), as Ruby's ``CLAIMS_PRUNE_FLOOR``.
 CLAIMS_PRUNE_FLOOR = 1024
@@ -147,7 +192,7 @@ class Peer:
     def __init__(self, identity: Identity, group: str, clock=None, founder: str | None = None, *,
                  appcard_level: int = APPCARD_LEVEL, ad_cache_max_entries: int = AD_CACHE_MAX_ENTRIES,
                  ad_cache_max_bytes: int = AD_CACHE_MAX_BYTES,
-                 spill_max_fetch_bytes: int = wire.CARD_SPILL_MAX_FETCH_BYTES):
+                 spill_max_fetch_bytes: int = wire.CARD_SPILL_MAX_FETCH_BYTES, horizon_hint: bool = True):
         if not 1 <= appcard_level <= APPCARD_LEVEL:
             raise ValueError(f"this client reads AppCard levels 1 to {APPCARD_LEVEL}: {appcard_level}")
         if ad_cache_max_entries <= 0 or ad_cache_max_bytes <= 0 or spill_max_fetch_bytes <= 0:
@@ -172,6 +217,7 @@ class Peer:
         # (core cancel events, 2026-11-09), which a Space announces as EXPIRED
         self.on_withdrawn = None
         self.on_claim = None  # optional callback(entry_id, signed_claim) after a claim folds
+        self.on_collected = None  # optional callback(entry_ids) after a collection dropped them (SPEC §7.3)
         # Handlers of the gossip streams a capability follows, by stream id: a pushed delta's bundles ride
         # pdt:<space>:<name> (PDT 2 phase 7, P2-P-02), each item handed over once
         self.stream_handlers: dict[str, Callable] = {}
@@ -255,6 +301,45 @@ class Peer:
         self.appcard_level = appcard_level
         if appcard_level > 1:
             self.wire_hints[HINT_APPCARD] = str(appcard_level)
+        # ``wire.horizon=1`` (SPEC v0.1.35 §7.3): on by default, since every renewal here keeps the
+        # rule of §7.2; ``horizon_hint=False`` builds a member that keeps the legacy horizon, for a
+        # mixed fleet in a test or a deployment that runs one identity on two nodes.
+        self.horizon_hint = horizon_hint
+        if horizon_hint:
+            self.wire_hints[HINT_HORIZON] = "1"
+        # The collection horizon (SPEC §7.3): the longest lease observed per space id, capped at
+        # MAX_TRACKED_LEASE_MILLIS; the per-entry mode, judged from the view with Java's hysteresis
+        # (LEGACY, WAITING, SETTLING, PER_ENTRY) and its counters; since when each member has been
+        # a hinted member of the view in its current stay (the writer's half); and the last
+        # collection. Before v0.1.35 this client kept every state it ever folded.
+        self.max_lease: dict[str, int] = {}
+        self.horizon_mode = "LEGACY"
+        self.horizon_engage_rounds = DEFAULT_HORIZON_ENGAGE_ROUNDS
+        self.horizon_engagements = 0
+        self.horizon_settlements = 0
+        self.horizon_disengagements = 0
+        self._horizon_streak = 0
+        self._horizon_counted_at: int | None = None
+        self._horizon_engaged_at = 0
+        self._hinted_since: dict[str, int] = {}
+        self._horizon_lock = threading.Lock()
+        self._collected_at: int | None = None
+        self.tombstones_collected = 0
+        self.collected_reoffers_refused = 0
+        # The lines this replica acknowledges in the text digests it sends (SPEC §7.3, TECH-SPEC
+        # §7.5), per space id: line -> the instant after which the acknowledgement may go, kept in
+        # least recently refused order and bounded by REFUSED_ACK_CAP. Only the continuation of a
+        # budgeted pull sends a text digest, so a replica that only ever pulls with empty digests
+        # relies on its refusal cache alone, as before.
+        self._acks: dict[str, dict[str, int]] = {}
+        # A budgeted pull in flight per space name (annex I.6): the continuations it made and the
+        # digest it last sent, so an answer that changed nothing ends it.
+        self._budgeted_pulls: dict[str, dict] = {}
+        self._state_hashes: dict[str, tuple] = {}  # entry id -> (the held state, its digest hash)
+        self.pull_continuations = 0
+        # The connection on which the seed's PeerID was last confirmed by a frame addressed to us:
+        # a budget goes only to the seed of the current connection, never to a stale one.
+        self._seed_confirmed_on = None
         # The cards this peer issues (SPEC §6.1a.2 and §6.1a.5): each full AppCard and AgentCard
         # by id with its type, the issue instant last signed, the view's AppCard level as the
         # last look saw it, the roots of parts documents held to the expiry of the last card
@@ -922,10 +1007,124 @@ class Peer:
         """Anti-entropy pull (spec §5.3): offer an empty digest, and the
         partner answers with every state this replica is missing. The
         revocation streams ride along: a partner answers only the streams a
-        digest names, so a late joiner learns the group's revocations here."""
+        digest names, so a late joiner learns the group's revocations here.
+
+        Toward a seed whose current card carries ``wire.ae=2`` the pull is budgeted (SPEC
+        annex I.6, *The budget*; RE-L-03): it names ``DEFAULT_PULL_BUDGET`` and offers this
+        replica's own text digest of the space, empty while it holds nothing there, so the
+        partner answers at most a budget of the states this replica lacks, newest first, and
+        an answer that left states out is continued at once (``_continue_pulls``). Toward any
+        other seed the pull is the empty digest of every release, answered whole."""
         self._pulled_spaces.add(space)
+        self._collect_if_due()
+        budget = self.pull_budget()
+        if budget is None:
+            self._send("DIGEST", wire.digest_body(
+                {f"space:{space}": b"", **{stream: b"" for stream in revocations.STREAMS}}))
+            return
+        text = self.space_digest(space)
+        self._budgeted_pulls[space] = {"budget": budget, "continuations": 0,
+                                       "sent": hashlib.sha256(text).digest()}
         self._send("DIGEST", wire.digest_body(
-            {f"space:{space}": b"", **{stream: b"" for stream in revocations.STREAMS}}))
+            {f"space:{space}": text, **{stream: b"" for stream in revocations.STREAMS}}, budget=budget))
+
+    def pull_budget(self) -> int | None:
+        """The budget this peer names on a pull (annex I.6), or None for an unbudgeted pull. A
+        sender reads the partner's current card before each round and sends ``budget`` only
+        toward a card that carries ``wire.ae=2``, since a member without the hint drops the
+        whole DIGEST as undecodable (P1). This client's partner is its seed, so the budget goes
+        only when the seed's PeerID was confirmed on the current connection and the seed's
+        current advertisement, unexpired, carries the hint; a reconnect to another seed sends
+        empty digests until that seed is known."""
+        seed = self.seed_peer
+        if seed is None or self._socket is None or self._seed_confirmed_on is not self._socket:
+            return None
+        ad = self.members.get(seed) or {}
+        if not ad or _ad_expires_ms(ad) <= self._now_ms():
+            return None
+        return DEFAULT_PULL_BUDGET if (ad.get("resourceHints") or {}).get(HINT_AE) == "2" else None
+
+    def space_digest(self, space: str) -> bytes:
+        """This replica's text digest of a space (TECH-SPEC §7.5): an ``e:`` line for every state
+        it holds, tombstones included, a ``c:`` line for every claim, and an ``a:`` line for every
+        state or claim it acknowledges, so a partner answers only what differs. Past
+        MAX_DIGEST_TEXT_BYTES the lines a partner would send first (present states, newest first)
+        are kept and the rest left out, so the DIGEST stays within the 8 MiB frame and the
+        partner sends the left-out entries again, which costs bytes and never correctness."""
+        from .identity import space_id_local
+        space_id = space_id_local(f"{self.group}/{space}")
+        now = self._now_ms()
+        with self._state_lock:
+            held = [(entry_id, dto) for entry_id, dto in list(self.states.items())
+                    if (dto.get("record") or {}).get("spaceId") == space_id]
+            claims = [(entry_id, signed["claim"]) for entry_id, signed in list(self.claims.items())
+                      if signed["claim"].get("spaceId") == space_id]
+        acknowledged = self._ack_lines(space_id, now)
+        lines: dict[str, str] = {}
+        for entry_id, dto in held:
+            lines[f"e:{entry_id}"] = self._state_hash(entry_id, dto)
+        for entry_id, claim in claims:
+            lines[f"c:{entry_id}"] = digests.claim_hash(claim)
+        text = digests.digest_text(lines, acknowledged)
+        if len(text) <= MAX_DIGEST_TEXT_BYTES:
+            return text
+        # The partner's order (annex I.6, *The fetch*): present states, then tombstones, newest
+        # first by lease stamp; a claim travels with its state.
+        order = sorted(held, key=lambda item: item[0].encode("utf-8"))
+        order.sort(key=lambda item: _stamp_key(item[1].get("leaseStamp")), reverse=True)
+        order.sort(key=lambda item: not present(item[1]))
+        claimed = dict(claims)
+        kept: dict[str, str] = {}
+        size = sum(len(f"a:{line}\n".encode("utf-8")) for line in acknowledged)
+        for entry_id, dto in order:
+            pair = {f"e:{entry_id}": self._state_hash(entry_id, dto)}
+            if entry_id in claimed:
+                pair[f"c:{entry_id}"] = digests.claim_hash(claimed[entry_id])
+            cost = sum(len(f"{k}={v}\n".encode("utf-8")) for k, v in pair.items())
+            if size + cost > MAX_DIGEST_TEXT_BYTES:
+                break
+            kept.update(pair)
+            size += cost
+        return digests.digest_text(kept, acknowledged)
+
+    def _state_hash(self, entry_id: str, dto: dict) -> str:
+        """The digest hash of a held state, cached while the replica holds that same state: a fold,
+        a renewal or a cancel replaces the held dict rather than changing it, so a take that pulls
+        every settle window hashes only what changed since."""
+        cached = self._state_hashes.get(entry_id)
+        if cached is not None and cached[0] is dto:
+            return cached[1]
+        value = digests.state_hash(dto)
+        self._state_hashes[entry_id] = (dto, value)
+        return value
+
+    def _continue_pulls(self, remainder: dict) -> None:
+        """Continues each budgeted pull whose answer left states out (annex I.6): at once, to the
+        same seed, with this replica's text digest under the same budget, since the partner holds
+        the rest. A pull ends when an answer left nothing out or after MAX_PULL_CONTINUATIONS. An
+        answer that changed nothing here (a duplicate, or states this replica refuses) sends
+        nothing, since the partner would answer the same digest the same way, and keeps the pull,
+        so the answer still in flight to the last digest continues it. A lost answer ends the
+        pull; the next pull of the space starts from what this replica holds, and anti-entropy
+        brings anything a pull leaves (ROBUSTNESS.md §10)."""
+        for stream, left in remainder.items():
+            if not str(stream).startswith("space:"):
+                continue
+            space = stream[len("space:"):]
+            pull = self._budgeted_pulls.get(space)
+            if pull is None:
+                continue  # an answer to no budgeted pull of ours: the states folded, nothing more
+            if left <= 0 or pull["continuations"] >= MAX_PULL_CONTINUATIONS:
+                self._budgeted_pulls.pop(space, None)
+                continue
+            text = self.space_digest(space)
+            sent = hashlib.sha256(text).digest()
+            if sent == pull["sent"]:
+                continue
+            pull["continuations"] += 1
+            pull["sent"] = sent
+            self.pull_continuations += 1
+            self._send("DIGEST", wire.digest_body({stream: text}, budget=pull["budget"]))
 
     def pull_space_paced(self, space: str, settle_seconds: float) -> bool:
         """Pulls a space unless it was pulled within ``settle_seconds`` (JS-V-02): a
@@ -1069,13 +1268,15 @@ class Peer:
 
     # ------------------------------------------------------------- payloads
 
-    def value_of(self, dto: dict) -> tuple:
+    def value_of(self, dto: dict, fetch: bool = True) -> tuple:
         """``(True, value)`` with the value an entry's payload holds, or ``(False, None)``
         while the payload is on its way (``payload_of``) or when its bytes are outside the
         wire encoding. The record signature covers those bytes, so such an entry still
         replicates, and every read skips its value (HLC round six, 2026-11-08, owner ruling
-        F3)."""
-        raw = self.payload_of(dto)
+        F3). With ``fetch`` False a payload held nowhere here starts no transfer: the event of
+        an entry that arrived completed is raised from what the replica holds alone (SPEC
+        §7.2, completed on arrival)."""
+        raw = self.payload_of(dto, fetch)
         if raw is None:
             return False, None
         try:
@@ -1083,7 +1284,7 @@ class Peer:
         except ValueError:
             return False, None
 
-    def payload_of(self, dto: dict) -> bytes | None:
+    def payload_of(self, dto: dict, fetch: bool = True) -> bytes | None:
         """The payload bytes of an entry's record: inline, or resolved from a block
         (``z``) or a content root (``b``) held here. A reference not yet held starts
         its transfer and returns None; reads never block on the network (SPEC §7.2).
@@ -1099,15 +1300,17 @@ class Peer:
             # SPEC §7.1 tree roots: the codec alone tells a persistent tree (dag-cbor, 0x71) from a
             # piece artifact (raw, 0x55); each goes to the seam that can carry it, never the other.
             if _is_tree_root(ref):
-                return None if self.pdt is None else self.pdt.payload(ref)
+                if self.pdt is None or (not fetch and not self.pdt.store.complete(ref)):
+                    return None
+                return self.pdt.payload(ref)
             if self.content is None:
                 return None
             data = self.content.local(ref)
-            if data is None:
+            if data is None and fetch:
                 self.content.ensure(ref)
             return data
         data = self.blocks.get(ref)
-        if data is None:
+        if data is None and fetch:
             self.want_block(ref, dto)
         return data
 
@@ -1145,7 +1348,11 @@ class Peer:
         held = self.members.get(ad["issuer"])
         if held and parse_instant_millis(held["issued"]) > parse_instant_millis(ad["issued"]):
             return  # a reordered older advertisement never replaces the hints a newer one states
+        now = self._now_ms()
+        if held and _ad_expires_ms(held) <= now:
+            self._hinted_since.pop(ad["issuer"], None)  # it left the view meanwhile: a new stay starts
         self.members[ad["issuer"]] = ad
+        self._note_stay(ad["issuer"], ad, now)
         self._maintain_cards(view_changed=True)
 
     def find(self, type_name: str):
@@ -1266,6 +1473,9 @@ class Peer:
                 self.seed_peer = sender
                 self.resource_hints["relay.via"] = sender
                 self.introduce()
+            if not relayed and self._seed is not None and env.get("to") == self.identity.peer_id \
+                    and self.seed_peer == sender:
+                self._seed_confirmed_on = self._socket
         if kind not in wire.BODY_RECORDS:
             # A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are
             # never sent to it, but a misconfigured peer could), or one it does not act on (the
@@ -1321,6 +1531,7 @@ class Peer:
                 self._on_stream_item(sender, rumor)
             elif str(rumor["streamId"]).startswith("space:"):
                 self._prune_claims()
+                self._collect_if_due()
                 delta = wire.decode_delta(rumor["payload"])
                 if delta is None:
                     self.deltas_undecodable += 1  # HLC round four, 2026-11-08, decision D5
@@ -1333,6 +1544,7 @@ class Peer:
                     self._name_recordless(delta["state"], rumor.get("itemId"))
                     self._fold(delta["state"])
         elif kind == "PULL_RESP":
+            self._collect_if_due()
             for stream, delta_bytes in (decoded["deltas"] or {}).items():
                 if stream in revocations.STREAMS and delta_bytes:
                     self.revocations.accept_delta(stream, delta_bytes, self._now_ms())
@@ -1353,6 +1565,8 @@ class Peer:
                         self._fold_claim(entry_id, signed)
                     for dto in (sync.get("states") or []):
                         self._fold(dto)
+            if decoded.get("remainder") is not None:
+                self._continue_pulls(decoded["remainder"])
 
     @staticmethod
     def _name_recordless(state: dict, item_id) -> None:
@@ -1402,6 +1616,7 @@ class Peer:
             # Authentic, but its actor is revoked here (SPEC §5.6): what is already held
             # stays as held, this state is not merged, and its stamps count nothing, since
             # the peer judges revocation before them (HLC round five, 2026-11-08, decision E6).
+            self._acknowledge_state(dto, record)
             return
         # HLC round four, 2026-11-08 (decisions D1, D4, D5): after verification, as Java's
         # ReplicatedSpace judges it, the peer refuses a state whose record, lease or signing
@@ -1423,6 +1638,19 @@ class Peer:
             return
         if verdict != _MERGE:
             self._count_refused(key, verdict)
+            self._acknowledge_state(dto, record)
+            return
+        # SPEC §7.3 (v0.1.35): the door refuses a state a lagging partner offers once it is past
+        # its collection horizon here, so a collected tombstone never returns, and acknowledges
+        # the refusal for five minutes when this replica holds no state of the entry, so the
+        # partner reads the line as held and stops offering it while its own horizon is later.
+        self._observe_state_lease(dto)
+        now = self._now_ms()
+        if self.collectable_here(dto, now, self.horizon_rule(now)):
+            self.collected_reoffers_refused += 1
+            if entry_id not in self.states:
+                self._acknowledge(record.get("spaceId"), f"e:{entry_id}={digests.state_hash(dto)}",
+                                  now + COLLECTED_ACK_HOLD_MILLIS)
             return
         pending = self.pending_states.pop(entry_id, None)
         self._pending_since.pop(entry_id, None)
@@ -1476,6 +1704,248 @@ class Peer:
         2026-11-08, decision E2)."""
         if _remember(self._deferred_seen, key):
             self.stamps_far_future_deferred += 1
+
+    # ------------------------------------------------- the collection horizon (SPEC §7.3)
+
+    def max_lease_of(self, space_id: str) -> int:
+        """The longest lease observed in a space, the measure of its horizons (SPEC §7.3)."""
+        return self.max_lease.get(space_id, 0)
+
+    def _observe_lease(self, space_id, granted_millis: int) -> None:
+        """Raises the longest lease of a space to ``granted_millis``, capped at
+        MAX_TRACKED_LEASE_MILLIS; a lease that is not positive records nothing."""
+        if not isinstance(space_id, str) or granted_millis <= 0:
+            return
+        granted = min(int(granted_millis), horizon.MAX_TRACKED_LEASE_MILLIS)
+        if granted > self.max_lease.get(space_id, 0):
+            self.max_lease[space_id] = granted
+
+    def _observe_state_lease(self, dto: dict) -> None:
+        """Records the lease a state grants, from its lease stamp to its expiry."""
+        try:
+            granted = horizon.lease_expiry(dto) - wire.hlc_physical(dto.get("leaseStamp"))
+        except (TypeError, ValueError):
+            return
+        self._observe_lease((dto.get("record") or {}).get("spaceId"), granted)
+
+    def _note_stay(self, peer_id: str, ad: dict, now: int) -> None:
+        """Keeps since when a member has been a hinted member of the view in its current stay (the
+        writer's half of SPEC §7.3): it starts the first time the member is seen in view with
+        ``wire.horizon=1``, and ends when its advertisement lapses or stops carrying the hint."""
+        if ad and _ad_expires_ms(ad) > now and (ad.get("resourceHints") or {}).get(HINT_HORIZON) == "1":
+            self._hinted_since.setdefault(peer_id, now)
+        else:
+            self._hinted_since.pop(peer_id, None)
+
+    def view_advertises_horizon(self, now: int | None = None) -> bool:
+        """Whether this peer and every member of its view advertise ``wire.horizon=1`` (SPEC §7.3).
+        The view is the member table, as the AppCard gate reads it: a member counts from its
+        first frame or advertisement and leaves when its advertisement lapses, and one heard from
+        whose advertisement has not arrived counts as lacking the hint. A lone peer judges by its
+        own setting."""
+        if not self.horizon_hint:
+            return False
+        now = self._now_ms() if now is None else now
+        hinted = True
+        for peer_id, ad in list(self.members.items()):
+            self._note_stay(peer_id, ad, now)
+            if not ad:
+                hinted = False
+            elif _ad_expires_ms(ad) > now and (ad.get("resourceHints") or {}).get(HINT_HORIZON) != "1":
+                hinted = False
+        return hinted
+
+    def set_horizon_engage_rounds(self, rounds: int) -> None:
+        """Sets the rounds the view must stay fully hinted before the per-entry horizon engages
+        (RE-Q-REL-09), from HORIZON_ENGAGE_ROUNDS_FLOOR to HORIZON_ENGAGE_ROUNDS_CEILING."""
+        if not HORIZON_ENGAGE_ROUNDS_FLOOR <= rounds <= HORIZON_ENGAGE_ROUNDS_CEILING:
+            raise ValueError(f"horizon engage rounds must be from {HORIZON_ENGAGE_ROUNDS_FLOOR} to "
+                             f"{HORIZON_ENGAGE_ROUNDS_CEILING}, not {rounds}")
+        self.horizon_engage_rounds = rounds
+
+    def horizon_round_millis(self) -> int:
+        """One round of the per-entry horizon's hysteresis: one gossip period of the group, as Java
+        counts it, read from the founding document this peer joined with, and HORIZON_ROUND_MILLIS,
+        Java's default period, when it holds none. SPEC §7.3 asks for three rounds of anti-entropy
+        before the rule engages again; a fixed second would cut that short in a group whose period
+        is longer (the adversarial review, 2026-11-15). Safety never rests on it: the settle wait of
+        one maximum lease plus the grace, and the writer's half, are what the horizon relies on."""
+        from .identity import parse_duration_millis
+        try:
+            period = (self.founding or {})["advertisement"]["gossip"]["period"]
+            return max(1, parse_duration_millis(period))
+        except (KeyError, TypeError, ValueError):
+            return HORIZON_ROUND_MILLIS
+
+    def _settle_millis(self) -> int:
+        """One maximum lease plus the lapse grace: the wait after engaging, and a writer's stay."""
+        return max(self.max_lease.values(), default=0) + horizon.LAPSED_GRACE_MILLIS
+
+    def horizon_rule(self, now: int | None = None) -> str:
+        """Judges the collection rule this replica may apply now and moves the mode, as Java's
+        ``ReplicatedSpace.horizon``: a member without the hint in view, or this peer on the legacy
+        setting, disengages at once (SPEC §7.3 MUST); a fully hinted view counts one round per
+        judgement at least ``horizon_round_millis`` after the last counted one and engages after
+        ``horizon_engage_rounds`` of them (SETTLING); the rule comes into force one maximum lease
+        plus the grace later (PER_ENTRY), so every copy a member renewed while its card lacked the
+        hint has lapsed first. Called by the collection and the door. Returns ``horizon.LEGACY``
+        or ``horizon.PER_ENTRY``."""
+        now = self._now_ms() if now is None else now
+        if not self.view_advertises_horizon(now):
+            self._disengage_horizon()
+            return horizon.LEGACY
+        with self._horizon_lock:
+            mode = self.horizon_mode
+            if mode in ("LEGACY", "WAITING"):
+                if self._horizon_counted_at is None or now < self._horizon_counted_at:
+                    self._horizon_counted_at = now  # the first hinted judgement, or a clock that stepped back
+                elif now - self._horizon_counted_at >= self.horizon_round_millis():
+                    self._horizon_streak += 1
+                    self._horizon_counted_at = now
+                if self._horizon_streak >= self.horizon_engage_rounds:
+                    self._horizon_engaged_at = now
+                    mode = "SETTLING"
+                    self.horizon_engagements += 1
+                else:
+                    mode = "WAITING"
+            if mode == "SETTLING":
+                if now < self._horizon_engaged_at:
+                    self._horizon_engaged_at = now  # the clock stepped back: the wait counts from here
+                elif now - self._horizon_engaged_at >= self._settle_millis():
+                    mode = "PER_ENTRY"
+                    self.horizon_settlements += 1
+            self.horizon_mode = mode
+        return horizon.PER_ENTRY if mode == "PER_ENTRY" else horizon.LEGACY
+
+    def _disengage_horizon(self) -> None:
+        with self._horizon_lock:
+            was = self.horizon_mode
+            self.horizon_mode = "LEGACY"
+            self._horizon_streak = 0
+            self._horizon_counted_at = None
+        if was in ("SETTLING", "PER_ENTRY"):
+            self.horizon_disengagements += 1
+            LOG.info("a member without wire.horizon=1 is in view; withdrawals keep the legacy horizon again (was %s)",
+                     was)
+
+    def _vouches_for_writers(self, dto: dict, now: int) -> bool:
+        """The writer's half of SPEC §7.3: whether every node that wrote a state (the replica of
+        each add dot) is this peer, or a member of the view whose current card carries the hint
+        and whose stay has lasted one maximum lease plus the grace. A state with no add dot, or
+        one by a writer out of view or unhinted, is vouched for by nobody here."""
+        adds = [dot for dot in dto.get("adds") or [] if isinstance(dot, dict)]
+        if not adds:
+            return False
+        settle = self._settle_millis()
+        for dot in adds:
+            writer = dot.get("replica")
+            if writer == self.identity.peer_id:
+                continue
+            ad = self.members.get(writer)
+            since = self._hinted_since.get(writer)
+            if (since is None or not ad or _ad_expires_ms(ad) <= now
+                    or (ad.get("resourceHints") or {}).get(HINT_HORIZON) != "1" or now - since < settle):
+                return False
+        return True
+
+    def collectable_here(self, dto: dict, now: int, rule: str) -> bool:
+        """Whether this replica collects a state now under the rule it judged (SPEC §7.3): the
+        per-entry rule applies to a withdrawal only when this replica vouches for its writers; a
+        withdrawal it cannot vouch for keeps the later of the legacy and the per-entry horizons, so
+        a writer leaving the view never brings a horizon closer."""
+        max_lease = self.max_lease_of((dto.get("record") or {}).get("spaceId"))
+        if rule == horizon.PER_ENTRY and horizon.kind_of(dto) == "withdrawn" \
+                and not self._vouches_for_writers(dto, now):
+            return (horizon.collectable(dto, now, max_lease, horizon.LEGACY)
+                    and horizon.collectable(dto, now, max_lease, horizon.PER_ENTRY))
+        return horizon.collectable(dto, now, max_lease, rule)
+
+    def _collect_if_due(self) -> None:
+        now = self._now_ms()
+        if self._collected_at is None or now < self._collected_at or now - self._collected_at >= COLLECT_PERIOD_MILLIS:
+            self.collect_tombstones(now)
+
+    def collect_tombstones(self, now: int | None = None) -> list[str]:
+        """Collects every state past its collection horizon (SPEC §7.3, Java's sweep): drops the
+        state, its claim, a pending recordless state, a lapsed claim on an entry this replica
+        does not hold, and any block or content artifact no remaining state names. Before
+        v0.1.35 this client held every state it ever folded. Returns the collected entry ids."""
+        now = self._now_ms() if now is None else now
+        self._collected_at = now
+        rule = self.horizon_rule(now)
+        with self._state_lock:
+            for signed in list(self.claims.values()):
+                claim = signed["claim"]
+                try:
+                    self._observe_lease(claim.get("spaceId"),
+                                        int(claim["expiresAtMillis"]) - wire.hlc_physical(claim["stamp"]))
+                except (TypeError, ValueError, KeyError):
+                    pass
+            collected = [entry_id for entry_id, dto in list(self.states.items())
+                         if self.collectable_here(dto, now, rule)]
+            refs = set()
+            for entry_id in collected:
+                dto = self.states.pop(entry_id)
+                self._state_hashes.pop(entry_id, None)
+                self.claims.pop(entry_id, None)
+                self.pending_states.pop(entry_id, None)
+                self._pending_since.pop(entry_id, None)
+                ref = (dto.get("record") or {}).get("payloadRef")
+                if isinstance(ref, str) and ref:
+                    refs.add(ref)
+            for entry_id, signed in list(self.claims.items()):
+                if entry_id not in self.states and now >= int(signed["claim"]["expiresAtMillis"]):
+                    self.claims.pop(entry_id, None)
+            if refs:
+                refs -= {(dto.get("record") or {}).get("payloadRef") for dto in list(self.states.values())}
+        for ref in refs:
+            if ref in self.blocks:
+                self.blocks.pop(ref, None)
+                self._block_asked.pop(ref, None)
+            elif ref[0] == "b" and not _is_tree_root(ref) and self.content is not None:
+                self.content.unpin(ref)
+        if collected:
+            self.tombstones_collected += len(collected)
+            if self.on_collected is not None:
+                self.on_collected(collected)
+        return collected
+
+    # ------------------------------------------------- acknowledgements (SPEC §7.3, TECH-SPEC §7.5)
+
+    def _acknowledge(self, space_id, line: str, forget_at: int) -> None:
+        """Acknowledges a refused, verified state or claim in this replica's digests, as
+        ``a:<line>``, until ``forget_at``; the most recently refused last, at most
+        REFUSED_ACK_CAP per space, the least recently refused forgotten first."""
+        if not isinstance(space_id, str):
+            return
+        acks = self._acks.setdefault(space_id, {})
+        acks.pop(line, None)
+        acks[line] = forget_at
+        while len(acks) > REFUSED_ACK_CAP:
+            del acks[next(iter(acks))]
+
+    def _ack_lines(self, space_id: str, now: int) -> list[str]:
+        """The lines a space's digest acknowledges now, each forgotten once its time passed."""
+        acks = self._acks.get(space_id)
+        if not acks:
+            return []
+        for line, until in list(acks.items()):
+            if until <= now:
+                acks.pop(line, None)
+        return list(acks)
+
+    def _acknowledge_state(self, dto: dict, record: dict) -> None:
+        """Acknowledges a verified state refused for its stamps or its revoked actor until the
+        horizon at which a holder collects it, and no sooner than five minutes after the refusal
+        (annex I.6, *The audited set*)."""
+        now = self._now_ms()
+        space_id = record.get("spaceId")
+        try:
+            until = horizon.collection_horizon(dto, self.max_lease_of(space_id), horizon.LEGACY)
+        except (TypeError, ValueError):
+            until = 0
+        self._acknowledge(space_id, f"e:{record.get('entryId')}={digests.state_hash(dto)}",
+                          max(until, now + COLLECTED_ACK_HOLD_MILLIS))
 
     def _expire_pending_states(self, now: float | None = None) -> None:
         """Drops pending recordless states older than ``PENDING_STATE_TTL_S`` (PD-L-02)."""
@@ -1648,6 +2118,11 @@ class Peer:
         # decision E6).
         certificate = signed.get("holderCertificate") or {}
         if self.revocations.refuses(claim.get("holder"), certificate.get("agentPublicKey"), None):
+            # R7 of SPEC §9.2: the digest acknowledges a revoked holder's claim, until the claim's
+            # lapse grace has passed and no sooner than five minutes after the refusal.
+            now = self._now_ms()
+            self._acknowledge(claim.get("spaceId"), f"c:{entry_id}={digests.claim_hash(claim)}",
+                              max(int(expires) + horizon.LAPSED_GRACE_MILLIS, now + COLLECTED_ACK_HOLD_MILLIS))
             return
         # HLC round four, 2026-11-08 (decisions D4, D5): after verification the peer refuses
         # a claim whose stamp the rule refuses or runs more than an hour past the skew margin
@@ -1691,6 +2166,7 @@ class Peer:
             self._count_deferred(key)
             return
         self.claims[entry_id] = wire.merge_claims(self.claims.get(entry_id), signed)
+        self._observe_lease(claim.get("spaceId"), int(expires) - stamped)  # a hold counts as a lease (SPEC §7.3)
         if self.on_claim is not None:
             self.on_claim(entry_id, self.claims[entry_id])
         self._wake_fold_waiters()
@@ -1747,8 +2223,25 @@ class Peer:
         Fold-driven (JS-V-02): while nothing matches, the take pulls the space
         at most once per settle window and sleeps on the next fold, so an entry
         that arrives wakes it at once; the settle window after a claim is waited
-        out in full, since a competing claim may fold at its end."""
+        out in full, since a competing claim may fold at its end.
+
+        Only a live claim wins (SPEC §7.4), and in a quiet space the claim is judged
+        after the whole settle window and a follow-up wait of up to
+        ``min(settle, 300 ms)``, so ``lease_millis`` must exceed
+        ``take_judged_within_millis(settle)`` (900 ms for the default 0.6 s window).
+        A take whose lease cannot outlast that raises ValueError at once. Leave a
+        margin above the bound: a busy interpreter wakes the take late."""
         from .identity import space_id_local
+        # A lease no longer than the window and the follow-up wait has always lapsed when the take
+        # judges it, so such a take could only publish doomed claims, each holding the entry from
+        # other takers for its lease, and come back empty at its timeout as if it had lost every race
+        # (2026-11-15; Java and TypeScript refuse the same).
+        judged_within = take_judged_within_millis(round(settle_seconds * 1000))
+        if not lease_millis > judged_within:
+            raise ValueError(
+                f"a take lease of {lease_millis} ms cannot outlast its settle window of "
+                f"{round(settle_seconds * 1000)} ms and follow-up wait: the claim would lapse "
+                f"before the take is judged (the lease must exceed {judged_within} ms)")
         holder = agent.agent_id if agent is not None else self.identity.agent(agent_name)
         if self.revocations.refuses(holder, agent.public_raw if agent else None, None):
             return None  # a revoked agent takes nothing, even locally
@@ -1786,18 +2279,23 @@ class Peer:
                 signed = wire.signed_claim(claim, self.identity, agent)
                 self.claims[entry_id] = wire.merge_claims(
                     self.claims.get(entry_id), signed)
+                self._observe_lease(space_id, lease_millis)  # this take's hold counts as a lease (SPEC §7.3)
                 self._send("RUMOR", wire.rumor_body(
                     f"space:{space}", f"c:{entry_id}:{claim['stamp']}", 6,
                     wire.claim_delta(entry_id, signed)))
                 claimed = True
                 time.sleep(settle_seconds)  # the settle window: a competing claim folds within it
                 self.pull_space_paced(space, settle_seconds)
-                self.await_fold(min(settle_seconds, 0.3))
+                self.await_fold(min(settle_seconds, TAKE_FOLLOW_UP_MAX_MILLIS / 1000))
                 winner = self._claim_of(entry_id)
                 # core cancel events, 2026-11-09: an entry completed or withdrawn during the
-                # settle window is nobody's, so a cancel that folded meanwhile leaves the take empty
+                # settle window is nobody's, so a cancel that folded meanwhile leaves the take empty.
+                # Only a claim still live wins (SPEC §7.4), as Java's tryTakeOnce and the TypeScript
+                # take judge it: a claim that lapsed during a late wake is free for any taker already,
+                # so returning it would hand out an entry this peer no longer holds.
                 if winner and winner.get("holder") == holder \
                         and int(winner.get("epoch")) == epoch \
+                        and int(winner.get("expiresAtMillis", 0)) > self._now_ms() \
                         and present(self.states.get(entry_id) or {}):
                     return entry_id
             if not claimed:
@@ -1806,7 +2304,28 @@ class Peer:
                 self.await_fold(min(settle_seconds, deadline - time.monotonic()), since=seen)
         return None
 
-    def complete_entry(self, space: str, entry_id: str, agent=None) -> None:
+    def require_held(self, entry_id: str, agent=None, holder: str | None = None, epoch: int | None = None) -> None:
+        """Raises ValueError unless this replica's live claim on the entry is still the
+        taker's: ``holder`` and ``epoch`` when given (the take's own claim), else the
+        agent's, else one of this peer's agents. SPEC §7.4, the settle guarantee
+        (2026-11-15): a claim can reach a taker later than its settle window, so a take
+        that won its window can be displaced by an earlier claim before it completes,
+        and a holder that learns of a better claim MUST NOT complete. Java's
+        ``complete`` and the TypeScript ``requireHeld`` refuse the same."""
+        claim = self._claim_of(entry_id)
+        expected = holder if holder is not None else (agent.agent_id if agent is not None else None)
+        held = claim is not None and int(claim.get("expiresAtMillis", 0)) > self._now_ms()
+        if held and expected is not None:
+            held = claim.get("holder") == expected
+        elif held:
+            held = str(claim.get("holder")).startswith(self.identity.peer_id + "/")
+        if held and epoch is not None:
+            held = int(claim.get("epoch", 0)) == epoch
+        if not held:
+            raise ValueError(f"{entry_id} is not held here: the take lapsed, or a better claim displaced it")
+
+    def complete_entry(self, space: str, entry_id: str, agent=None, holder: str | None = None,
+                       epoch: int | None = None) -> None:
         """Completes a held entry: publishes its state with the monotone
         completed flag set, re-signed by the holder and carrying our winning
         claim, so honest replicas can authenticate the completion (SPEC §11a).
@@ -1814,11 +2333,14 @@ class Peer:
         agent (``take_entry(agent=...)``) must be completed as that agent, whose
         signed state is what receivers require (A6, v0.1.13). An entry this replica
         holds completed or withdrawn is held by nobody, as Java's ``complete``
-        refuses it (core cancel events, 2026-11-09)."""
+        refuses it (core cancel events, 2026-11-09), and so is one whose claim
+        lapsed or lost to a better claim that arrived after the settle window
+        (``require_held``; ``holder`` and ``epoch`` name the take's own claim)."""
         with self._state_lock:
             dto = dict(self.states[entry_id])
             if not present(dto):
                 raise ValueError(f"{entry_id} is not held here: it is completed or withdrawn")
+            self.require_held(entry_id, agent=agent, holder=holder, epoch=epoch)
             dto["completed"] = True
             dto = wire.sign_state(dto, self.identity, agent, self._now_ms())
             self.states[entry_id] = dto
@@ -1831,13 +2353,22 @@ class Peer:
 
 
     def renew_entry(self, space: str, entry_id: str, lease_millis: int = 600_000,
-                    agent=None) -> None:
-        """Renews this peer's write of an entry (SPEC §7.3): a later lease stamp
-        and expiry, re-signed by the issuer, as the agent when it wrote as one.
-        Only the issuer renews: ``agent`` must be the record's issuer, and
-        without one the issuer must be one of this peer's agent names."""
+                    agent=None) -> bool:
+        """Renews this peer's write of an entry (SPEC §7.2, v0.1.35): the lease runs at least
+        ``lease_millis`` from now and never shorter than it already does, ``max(current, now +
+        extension)``, under a later lease stamp re-signed by the issuer, as the agent when it
+        wrote as one. Three conditions guard it, and a renewal that fails one raises ValueError,
+        changes nothing and sends nothing: only the issuer renews (``agent`` must be the record's
+        issuer, and without one the issuer must be one of this peer's agent names), and the entry
+        must be present here, neither completed nor withdrawn, with its lease not lapsed. A
+        renewal whose extension ends before the current expiry leaves the lease as it is, sends
+        nothing and returns False; True when the lease moved. A caller that wants a shorter lease
+        cancels and writes again."""
         with self._state_lock:
-            dto = dict(self.states[entry_id])
+            previous = self.states.get(entry_id)
+            if previous is None:
+                raise ValueError(f"{entry_id} is not held here")
+            dto = dict(previous)
             record = dto.get("record") or {}
             issuer = str(record.get("issuer"))
             if agent is not None and agent.agent_id != issuer:
@@ -1845,14 +2376,58 @@ class Peer:
             if agent is None and not issuer.startswith(self.identity.peer_id + "/"):
                 raise ValueError(f"{entry_id} was written by {issuer}, not by this peer")
             now_ms = self._now_ms()
+            current = horizon.lease_expiry(dto)
+            if not present(dto) or current <= now_ms:
+                raise ValueError(f"{entry_id} cannot be renewed: it is completed, withdrawn or lapsed here")
+            expiry = horizon.renewed_expiry(current, now_ms, lease_millis)
+            if expiry == current:
+                return False  # the lease already runs that long, and a renewal never shortens it
             dto["leaseStamp"] = wire.hlc_now(record.get("issuer"), now_ms)
-            dto["leaseValue"] = {"holder": record.get("issuer"),
-                                 "expiresAtMillis": now_ms + lease_millis, "kind": "WRITE"}
+            dto["leaseValue"] = {"holder": record.get("issuer"), "expiresAtMillis": expiry, "kind": "WRITE"}
             dto = wire.sign_state(dto, self.identity, agent, now_ms)
             self.states[entry_id] = dto
+        self._observe_state_lease(dto)
         self._send("RUMOR", wire.rumor_body(
             f"space:{space}", f"r:{entry_id}:{now_ms}", 6,
             cbor.dumps({"state": dto, "claimEntry": None, "claim": None})))
+        return True
+
+    def renew_take(self, space: str, entry_id: str, lease_millis: int, agent=None,
+                   holder: str | None = None, epoch: int | None = None) -> bool:
+        """Renews the take lease of a held entry, as Java's ``TakenEntry.renew`` (SPEC §7.2 and
+        §7.4, v0.1.35): the same claim (entry, space, epoch, stamp, holder and bid) with a later
+        expiry, ``max(current, now + extension)``, signed by the holder, so the lattice keeps the
+        holder and moves only its expiry. ``holder`` and ``epoch`` name the take's own claim (the
+        agent's, or one of this peer's, without them). Raises ValueError, sending nothing, when
+        that claim is no longer the live claim here or its holder is revoked; returns False,
+        sending nothing, when the hold already runs that long, and True when it moved."""
+        with self._state_lock:
+            signed = self.claims.get(entry_id)
+            current = signed["claim"] if signed else None
+            now_ms = self._now_ms()
+            expected = holder if holder is not None else (agent.agent_id if agent is not None else None)
+            held = current is not None and int(current["expiresAtMillis"]) > now_ms
+            if held and expected is not None:
+                held = current["holder"] == expected
+            elif held:
+                held = str(current["holder"]).startswith(self.identity.peer_id + "/")
+            if held and epoch is not None:
+                held = int(current["epoch"]) == epoch
+            if not held:
+                raise ValueError(f"take lease lapsed for entry {entry_id}")
+            certificate = signed.get("holderCertificate") or {}
+            if self.revocations.refuses(current["holder"], certificate.get("agentPublicKey"), None):
+                raise ValueError(f"take lease of entry {entry_id} cannot be renewed: {current['holder']} is revoked")
+            expiry = horizon.renewed_expiry(int(current["expiresAtMillis"]), now_ms, lease_millis)
+            if expiry == int(current["expiresAtMillis"]):
+                return False  # the hold already runs that long, and a renewal never shortens it
+            renewed = wire.take_claim(entry_id, current["spaceId"], int(current["epoch"]), current["stamp"],
+                                      current["holder"], current["bid"], expiry)
+            proof = wire.signed_claim(renewed, self.identity, agent)
+            self.claims[entry_id] = wire.merge_claims(self.claims.get(entry_id), proof)
+        self._send("RUMOR", wire.rumor_body(
+            f"space:{space}", f"c:{entry_id}:renew:{now_ms}", 6, wire.claim_delta(entry_id, proof)))
+        return True
 
     def on_stream(self, stream_id: str, handler: Callable) -> Callable:
         """Hands each item of a gossip stream to ``handler(sender, item_id, payload)`` once, as Java's
@@ -1910,6 +2485,14 @@ def _dots_bound_to_issuer(dto: dict, record: dict) -> bool:
     peer = str(record.get("issuer") or "").partition("/")[0]
     return all(isinstance(dot, dict) and dot.get("replica") == peer
                for dot in (dto.get("adds") or []) + (dto.get("removes") or []))
+
+
+def _stamp_key(stamp) -> tuple:
+    """A stamp's place in Java's order, the least for one that is missing or not acceptable."""
+    try:
+        return wire.hlc_tuple(stamp)
+    except (TypeError, ValueError):
+        return (-1, -1, b"")
 
 
 def lease_of(dto: dict) -> dict:

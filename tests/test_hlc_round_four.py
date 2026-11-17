@@ -425,7 +425,10 @@ def test_an_honest_taker_dragged_ahead_is_never_refused_by_a_receiver_running_be
 
 def test_a_state_past_the_margin_by_more_than_an_hour_is_refused_once_until_the_wall_catches_up():
     host = Identity.generate()
-    hostile = _with_issued(_write(host, T), host, f"{T + DRIFT + MARGIN + HOUR + 1}:0:{host.agent('w')}")
+    # A lease that outlasts the two hours below: a lapsed state would meet the collection
+    # horizon at the door once the wall caught up (SPEC §7.3, v0.1.35).
+    hostile = _with_issued(_write(host, T, lease_millis=3 * HOUR), host,
+                           f"{T + DRIFT + MARGIN + HOUR + 1}:0:{host.agent('w')}")
     receiver, link, clock = _receiver(host)
     link.rumor(hostile)
     link.pull_resp([hostile], {})

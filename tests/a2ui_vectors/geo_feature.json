@@ -1,0 +1,1 @@
+{"schemaVersion":1,"type":"Feature","id":"ship-217","geometry":{"coordinates":[-3.0123,53.4087],"type":"Point"},"properties":{"destination":"Berth 4","mmsi":"235012345","speed_kn":11.2},"kind":"track.ship.cargo","label":"MV Northgate","style":{"heading":74,"icon":"ship","color":"#8888cc"},"at":"2026-11-12T09:14:03Z","severity":"info","links":[{"rel":"bound-for","id":"berth-4"}]}

@@ -310,15 +310,19 @@ class Subscription:
         return not self._closed
 
     def renew(self, lease=None) -> None:
-        """Extends the lease (the same length again when none is given); a lapsed
-        subscription stays closed, and a watch without a lease never lapses."""
+        """Extends the lease (the same length again when none is given) to at least that
+        long from now, never shorter than it already runs (SPEC §7.2, v0.1.35: a subscription's
+        lease reads "extend" as an entry's does); close the subscription to stop it sooner. A
+        lapsed subscription stays closed, and a watch without a lease never lapses."""
         if self._closed:
             return
         millis = self._lease_millis if lease is None else duration_millis(lease)
         if millis is None:
             return
         self._lease_millis = millis
-        self._expires_ms = self._space.peer._now_ms() + millis
+        with self._space._lock:  # two renewals at once must not let the shorter one write last
+            now = self._space.peer._now_ms()
+            self._expires_ms = now + millis if self._expires_ms is None else max(self._expires_ms, now + millis)
 
     def lapsed(self, now_ms: int) -> bool:
         return self._expires_ms is not None and self._expires_ms <= now_ms
@@ -354,21 +358,42 @@ class Taken:
         self.entry_id = entry_id
         self.value = value
         self.lease_millis = lease_millis
+        # The claim this take won, so completing checks that exact claim still holds (SPEC §7.4).
+        # The holder is the take's own, never read back from the lattice: a rival's better claim
+        # can fold between the take's win and this line, and reading it here would make the
+        # completion check the rival's claim and pass (the adversarial review, 2026-11-15). The
+        # epoch is the lattice's only while the claim there is still the take's.
+        self.holder = space.agent.agent_id if space.agent is not None else space.peer.identity.agent(space.agent_name)
+        claim = space.peer._claim_of(entry_id) or {}
+        self.epoch = int(claim["epoch"]) if claim.get("holder") == self.holder and "epoch" in claim else None
 
     def complete(self, result=None, lease="1h", tags: dict | None = None, result_space: "Space | None" = None) -> str | None:
         """Completes the take, writing ``result`` first (into the take space,
         or ``result_space``) so a caller correlating on it sees it with the
-        completion. Returns the result's entry id."""
+        completion. Returns the result's entry id. Raises ValueError, writing
+        nothing, when the take no longer holds the entry: its lease lapsed, or a
+        better claim that reached this replica after the settle window displaced
+        it, or the entry completed meanwhile (SPEC §7.4, the settle guarantee)."""
+        self.space.peer.require_held(self.entry_id, agent=self.space.agent, holder=self.holder, epoch=self.epoch)
+        if not present(self.space.peer.states.get(self.entry_id) or {}):
+            raise ValueError(f"{self.entry_id} is not held here: it is completed or withdrawn")
         result_id = None
         if result is not None:
             target = result_space or self.space
             result_id = target.write(result, lease=lease, tags=tags)
-        self.space.peer.complete_entry(self.space.name, self.entry_id, agent=self.space.agent)
+        self.space.peer.complete_entry(self.space.name, self.entry_id, agent=self.space.agent,
+                                       holder=self.holder, epoch=self.epoch)
         return result_id
 
-    def renew(self, lease=None) -> None:
+    def renew(self, lease=None) -> bool:
+        """Renews the take lease, not the entry's write lease, as Java's ``TakenEntry.renew``
+        (SPEC §7.2 and §7.4, v0.1.35; matrix P19): the hold runs at least ``lease`` from now
+        (the take's lease again when none is given) and never shorter. Raises ValueError when
+        the take no longer holds the entry; returns whether the hold moved. To give the entry
+        back sooner, let the take lapse; nothing here shortens it."""
         millis = self.lease_millis if lease is None else duration_millis(lease)
-        self.space.peer.renew_entry(self.space.name, self.entry_id, millis, agent=self.space.agent)
+        return self.space.peer.renew_take(self.space.name, self.entry_id, millis, agent=self.space.agent,
+                                          holder=self.holder, epoch=self.epoch)
 
 
 # ------------------------------------------------------ return conventions
@@ -451,6 +476,11 @@ class Space:
         self._next_key = 0
         self._lock = threading.Lock()
         self._seen: dict[str, str] = {}   # entry_id -> last delivered kind
+        # Entries that were present and unexpired when their state merged here but whose block or
+        # artifact had not landed: their WRITTEN waits for the payload, and the sweep raises it
+        # then if the entry is still live, or COMPLETED alone if it completed meanwhile (SPEC
+        # §7.2, v0.1.35, completed on arrival; Java's payloadArrived).
+        self._awaiting: dict[str, bool] = {}
         self._install()
 
     # the fold hooks: one dispatcher per peer, shared by every Space over it
@@ -485,6 +515,10 @@ class Space:
                 # EXPIRED and REAPPEARED are judged by the clock, not by a fold.
                 while getattr(peer, "_running", True):
                     time.sleep(0.25)
+                    try:
+                        peer._collect_if_due()  # the tombstone collection of SPEC §7.3 rides on this timer
+                    except Exception:
+                        pass
                     for s in list(peer._agentspaces_spaces):
                         try:
                             s._sweep()
@@ -558,7 +592,9 @@ class Space:
         """An exclusive take of one matching entry under the space's strategy;
         the configured bid function prices it under AUCTION. With ``through``
         (an ``OrderedLog``, JS-V-05) the claim goes through the fleet's ordered
-        log instead, and the take is held once the log committed it."""
+        log instead, and the take is held once the log committed it. Without
+        ``through`` the lease must outlast the take's settle window and
+        follow-up wait (over 900 ms), or ValueError (``Peer.take_entry``)."""
         millis = duration_millis(lease)
         timeout_seconds = duration_millis(timeout) / 1000
         if through is not None:
@@ -605,12 +641,15 @@ class Space:
 
     # ---------------------------------------------------------------- events
 
-    def _deliver(self, dto: dict, kind: str, mark: str | None = None) -> None:
+    def _deliver(self, dto: dict, kind: str, mark: str | None = None, fetch: bool = True) -> bool:
+        """Delivers ``kind`` for an entry to every matching watch once; returns whether the
+        entry's value was readable here, which an event needs. ``fetch`` False reads only what
+        the replica holds and starts no transfer."""
         record = dto.get("record") or {}
         entry_id = record.get("entryId")
-        readable, payload = self.peer.value_of(dto)
+        readable, payload = self.peer.value_of(dto, fetch)
         if not readable:
-            return  # a referenced payload not here yet, or one outside the encoding
+            return False  # a referenced payload not here yet, or one outside the encoding
         tags = record.get("tags") or {}
         now_ms = self.peer._now_ms()
         # one mark for every watch: a watch's mark must not depend on the watches before it
@@ -632,14 +671,42 @@ class Space:
             entry = Entry(entry_id, template.decode(payload), dict(tags), record.get("issuer"),
                           int(lease.get("expiresAtMillis", 0)), kind == COMPLETED, kind == TAKEN)
             callback(Event(kind, entry))
+        return True
+
+    def _live(self, dto: dict) -> bool:
+        """Present and unexpired: an entry a reader here could see."""
+        return present(dto) and int(lease_of(dto).get("expiresAtMillis", 0)) > self.peer._now_ms()
+
+    def _written(self, dto: dict) -> bool:
+        """WRITTEN for an entry a reader could see, then TAKEN when a claim on it is already in
+        force (a claim merges before its entry's state in a pull), as Java's writtenThenTaken.
+        Returns whether the value was readable."""
+        if not self._deliver(dto, WRITTEN):
+            return False
+        entry_id = (dto.get("record") or {}).get("entryId")
+        claim = self.peer._claim_of(entry_id)
+        if claim and int(claim.get("expiresAtMillis", 0)) > self.peer._now_ms():
+            self._deliver(dto, TAKEN)
+        return True
 
     def _on_state(self, dto: dict) -> None:
+        """The events of a merged state (SPEC §7.2, v0.1.35). A completed entry raises COMPLETED
+        from what the replica holds alone, never fetching for it, and an entry first learned
+        completed raises COMPLETED and never WRITTEN, since no reader here saw it live (completed
+        on arrival, decision 21). WRITTEN is for an entry present and unexpired when it merges:
+        one withdrawn or lapsed when learned is history, not news. When its payload is still on
+        its way, WRITTEN waits for it (``_awaiting``)."""
         if not self._mine(dto):
             return
+        entry_id = (dto.get("record") or {}).get("entryId")
         if dto.get("completed"):
-            self._deliver(dto, COMPLETED)
-        elif present(dto):
-            self._deliver(dto, WRITTEN)  # a withdrawn entry learned late is history, not news
+            if self._deliver(dto, COMPLETED, fetch=False):
+                self._awaiting.pop(entry_id, None)
+            # Without the value here, an entry whose WRITTEN waits for its payload hears COMPLETED
+            # when the payload lands; one first learned completed raises nothing.
+        elif self._live(dto):
+            if not self._written(dto) and self._watchers:
+                self._awaiting[entry_id] = True
 
     def _on_withdrawn(self, dto: dict) -> None:
         """EXPIRED for a cancel that withdrew an entry present here, the kind Java's ReplicatedSpace and
@@ -653,18 +720,40 @@ class Space:
             return
         self._deliver(dto, TAKEN)
 
+    def _payloads_arrived(self) -> None:
+        """The events a merge deferred until a block or artifact landed, as Java's payloadArrived:
+        the state is read again now, so a live entry raises WRITTEN (and the TAKEN of a claim in
+        force), one that completed meanwhile raises COMPLETED alone, and one withdrawn or lapsed
+        meanwhile raises nothing, since no reader here saw it live. Each entry is decided once."""
+        for entry_id in list(self._awaiting):
+            dto = self.peer.states.get(entry_id)
+            if dto is None or not (dto.get("completed") or self._live(dto)):
+                self._awaiting.pop(entry_id, None)
+                continue
+            readable, _ = self.peer.value_of(dto)
+            if not readable:
+                continue
+            self._awaiting.pop(entry_id, None)
+            if dto.get("completed"):
+                self._deliver(dto, COMPLETED)
+            else:
+                self._written(dto)
+
     def _sweep(self) -> None:
         """Closes every leased subscription whose lease lapsed (JS-V-01), then
         delivers EXPIRED once per entry whose write lease lapsed while open,
         and REAPPEARED once per lapsed claim epoch on an entry still open."""
         if not self._watchers:
+            self._awaiting.clear()
             return
         now = self.peer._now_ms()
         for _, _, _, subscription in list(self._watchers.values()):
             if subscription.lapsed(now):
                 subscription.close("lapsed")
         if not self._watchers:
+            self._awaiting.clear()
             return
+        self._payloads_arrived()
         for entry_id, dto in list(self.peer.states.items()):
             if not self._mine(dto) or not present(dto):
                 continue  # a cancel already delivered a withdrawn entry's EXPIRED (core cancel events, 2026-11-09)

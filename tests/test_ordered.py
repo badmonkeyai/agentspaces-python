@@ -20,6 +20,7 @@ that applies the OrderedTakes.onCommand rule. The end-to-end proof against
 three Java voters is agentspaces-capabilities' PythonOrderedTakeTest."""
 
 import json
+import threading
 import time
 import pathlib
 
@@ -282,3 +283,38 @@ def test_without_a_log_in_the_ads_a_take_submits_nothing_and_returns_at_its_time
     assert ordered_log.submit(b"cmd") is False
     assert ordered_log.take("jobs", JOB, "py-worker", lease_millis=60_000, timeout_seconds=0.5) is None
     assert client.claims == {}
+
+
+class LateLog(SimulatedLog):
+    """A log whose leader commits each command ``delay`` seconds after it arrives, as a log
+    busy with an election or a slow follower does."""
+
+    def __init__(self, voters, space_name, delay):
+        super().__init__(voters, space_name)
+        self.delay = delay
+
+    def commit(self, command: bytes) -> None:
+        timer = threading.Timer(self.delay, super().commit, args=(command,))
+        timer.daemon = True
+        timer.start()
+
+
+def test_a_claim_the_log_commits_after_the_takers_timeout_still_hands_the_entry_to_the_taker():
+    # As Java's OrderedTakesClusterTest.aClaimTheLogCommitsAfterTheTakersTimeoutStillHandsTheEntryToTheTaker
+    # (SPEC v0.1.33 §9.4): a submitted claim is waited on for its whole attempt window, even past the
+    # caller's timeout, since a claim committed after the caller gave up would hold the entry for its
+    # whole lease with nobody to adopt it. Before phase 8 the window stopped at the caller's deadline.
+    peers = fleet(GROUP, 4)
+    voters, client = peers[:3], peers[3]
+    log = LateLog(voters, "jobs", delay=1.0)
+    log.advertise()
+    job = voters[1].write_entry("jobs", JOB, {"jobId": "job-late", "payload": "x"})
+    started = time.monotonic()
+    taken = OrderedLog(Pipes(client), attempt_seconds=3.0).take("jobs", JOB, "py-worker", lease_millis=60_000,
+                                                                  timeout_seconds=0.3)
+    elapsed = time.monotonic() - started
+    assert taken == job, "the claim the log committed late is the taker's"
+    assert log.installed == [f"{job}:1"]
+    assert 1.0 <= elapsed < 3.0, f"held for the commit, inside the attempt window: {elapsed:.2f}s"
+    client.complete_entry("jobs", taken)
+    assert all(v.states[job]["completed"] for v in voters)

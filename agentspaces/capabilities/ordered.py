@@ -163,7 +163,9 @@ class OrderedLog:
         claim is the agent's, signed by its key with its certificate in the
         command (v0.1.13). ``matches(payload, tags)`` narrows the candidates.
         The caller completes the entry as after any take; a command lost to a
-        leader election is resubmitted on the next scan."""
+        leader election is resubmitted on the next scan. A claim already submitted
+        is waited on for its whole attempt window (``attempt_seconds``), even past
+        ``timeout_seconds``, and handed to the caller when the log commits it."""
         peer = self.peer
         holder = agent.agent_id if agent is not None else peer.identity.agent(agent_name)
         if peer.revocations.refuses(holder, agent.public_raw if agent else None, None):
@@ -200,7 +202,11 @@ class OrderedLog:
                 submitted = True
                 # The log decides this generation within a bounded attempt, observed as the
                 # committed claim folding from the space; undecided, the next scan resubmits.
-                attempt = min(deadline, time.monotonic() + self.attempt_seconds)
+                # The attempt window holds even past the caller's deadline, as Java's
+                # OrderedTakes.take holds its 3 s window (SPEC v0.1.33 §9.4): a claim the log
+                # commits after the caller gave up would hold the entry for its whole lease with
+                # nobody to adopt it (the 0.6.0 regression, 2026-11-10).
+                attempt = time.monotonic() + self.attempt_seconds
                 while time.monotonic() < attempt:
                     peer.await_fold(min(self.pull_interval_seconds, attempt - time.monotonic()))
                     decided = peer._claim_of(entry_id)

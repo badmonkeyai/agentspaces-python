@@ -257,6 +257,10 @@ def test_a_completion_that_lands_while_a_fold_of_the_entry_runs_stays_completed(
     entry_id = write["record"]["entryId"]
     receiver, space, events, link, _ = _member(host)
     link.rumor(write)
+    # The completion is a holder's: its live claim is in place, as after a won take (SPEC §7.4).
+    holder = receiver.identity.agent("python")
+    receiver.claims[entry_id] = wire.signed_claim(wire.take_claim(
+        entry_id, write["record"]["spaceId"], 1, f"{T}:0:{holder}", holder, 0.0, T + 600_000), receiver.identity)
     receiver.states = _LandsDuringFold(receiver.states, entry_id,
                                        lambda: receiver.complete_entry("tasks", entry_id))
 

@@ -60,7 +60,7 @@ def test_the_decorators_derive_the_declaration_in_java_field_order():
     actions = [wire.card_action("research", "", ["Task"], [], "take", "tasks")]
     ui = _ui_declaration(Desk(), _methods(Desk()), actions)
     assert list(ui.keys()) == ["protocol", "version", "components", "entries", "catalogIds"]
-    assert ui["protocol"] == "a2ui" and ui["version"] == "v0.9.1"
+    assert ui["protocol"] == "a2ui" and ui["version"] == "1.0"
     assert [c["id"] for c in ui["components"]] == ["share", "ask"]
     assert list(ui["components"][0].keys()) == ["id", "catalogId", "component", "entry", "controls", "role"]
     assert ui["components"][0]["controls"] == ["research"]

@@ -335,6 +335,24 @@ def head_order(issued, issuer, attrs: dict, now_ms: int) -> tuple:
     return original, str(original_issuer)
 
 
+def superseded_by(loadable: list[Head], live: list[Head]) -> set[tuple[str, str]]:
+    """The live versions a loadable version supersedes, directly or through other live versions, as Java's
+    ``Refs.supersededBy``; each named by (root, entry id). heads_among reads base links only among the versions it is
+    given, so with the middle of a chain still loading, the version below it would be read as a head and merged in,
+    and a key a later version removed would come back for that read."""
+    superseded: set[tuple[str, str]] = set()
+    frontier = list(loadable)
+    while frontier:
+        newer = frontier.pop(0)
+        by = 1 << 62 if newer.seq >= MAX_SEQ else newer.seq
+        for older in live:
+            key = (older.root, older.entry_id)
+            if older.seq < by and older.root in newer.base and key not in superseded:
+                superseded.add(key)
+                frontier.append(older)
+    return superseded
+
+
 def heads_among(entries: list[Head]) -> list[Head]:
     """The entries no other entry supersedes, equal roots folded (10.2)."""
     superseded_below: dict[str, int] = {}
@@ -661,7 +679,15 @@ class Ref:
         """The heads in merge order (PD-R-02); a head whose root cannot load within the timeout is ignored."""
         with self._lock:
             live = self._live_entries()
-            return heads_among(self._loadable(live, wait))
+            loadable = self._loadable(live, wait)
+            considered = [h for h in live if h.entry_id not in self.ignored]
+            if len(loadable) < len(considered):
+                # some live version is still loading: a loaded version that a loaded head supersedes through it is no
+                # head either (Java's Refs.heads; a late joiner's stale ancestor would otherwise bring removed keys back)
+                folded = superseded_by(loadable, live)
+                if folded:
+                    loadable = [h for h in loadable if (h.root, h.entry_id) not in folded]
+            return heads_among(loadable)
 
     def _value_of(self, root: str, store=None):
         store = store or self.store

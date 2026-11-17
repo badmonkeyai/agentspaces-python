@@ -73,9 +73,16 @@ order as Java's `Double.compare` orders them, -0.0 below 0.0. As Java's
 `mergeClaim` does, the peer drops, uncounted, a claim stamped more than the
 drift bound before its entry's issue stamp, and a claim contesting another
 holder's claim with a stamp older than the drift bound and Java's 200 ms
-settle window. This client offers an empty digest on every pull, so it
-acknowledges no refused state; its partners re-offer it, and the count stays
-at one. This client keeps no strikes. `peer.counters()` returns these counts
+settle window. This client offers an empty digest on a pull toward a seed
+without `wire.ae=2`, so there it acknowledges no refused state; its partners
+re-offer it, and the count stays at one. Toward a seed whose card carries
+`wire.ae=2` a pull names a budget of 1 MiB (SPEC annex I.6) and offers this
+peer's own text digest of the space, with an `a:<line>` for each verified
+state it refused and each revoked holder's claim; when an answer's
+`remainder` says states were left out, the peer asks again at once with its
+digest, until nothing is left out or an answer changes nothing here. The
+digest stays under the 8 MiB frame by keeping the lines a partner would send
+first. This client keeps no strikes. `peer.counters()` returns these counts
 under the Java node's names (`framesLogicalRefused`, `framesFarFuture`,
 `framesFarFutureSkewed`, `stampsLogicalRefused`, `stampsFarFutureRefused`,
 `stampsFarFutureDeferred`, `deltasUndecodable`). A ref head reads its advisory
@@ -107,3 +114,25 @@ pauses (§10.6). A bootstrapped peer reads its beacon again every
 in flight keeps polling across the gap. `close()` by the owner is final.
 `tests/test_robustness.py` pins each case against a fake seed over TCP, and
 `tests/test_tls.py` the tls binding against one over TLS.
+
+## Renewals and the collection horizon (SPEC v0.1.35)
+
+- `peer.renew_entry` renews by the rule of SPEC §7.2. Only the issuer renews,
+  the entry must be present and its lease not lapsed here, and the new expiry
+  is `max(current, now + extension)`, so a renewal never shortens a lease. A
+  renewal the rule leaves unchanged sends nothing and returns `False`; one
+  that fails a condition raises `ValueError`. Cancel and write again for a
+  shorter lease.
+- `Taken.renew` renews the take's claim, as Java's `TakenEntry.renew`: same
+  epoch, stamp, holder and bid, a later expiry. It never touches the write
+  lease. `Subscription.renew` never shortens a subscription's lease either.
+- The peer collects tombstones by SPEC §7.3: a lapsed entry five minutes at
+  most after its lapse, a completion two of the space's longest leases after
+  its expiry, a withdrawal never before ten minutes (the drift floor). The
+  door refuses a collected state a lagging partner offers again and
+  acknowledges it for five minutes.
+- The peer advertises `wire.horizon=1` (pass `horizon_hint=False` to opt out,
+  for one identity run on two nodes). While it and every member of its view
+  advertise the hint for three rounds, then one longest lease and five
+  minutes more, a withdrawal whose writer it vouches for goes at ten minutes
+  past its expiry (`peer.horizon_mode`, `peer.horizon_rule()`).

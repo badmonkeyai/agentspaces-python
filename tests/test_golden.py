@@ -245,7 +245,9 @@ def test_digest_body_matches_java():
 def test_decoder_round_trips_every_golden_vector():
     # Deltas too: the adversarial ``*_delta`` vectors are well-formed CBOR whose
     # content (not encoding) is hostile, so they round-trip like the rest.
-    names = [name for name in GOLDEN if name.endswith(("_cbor", "_delta"))]
+    # The annex I.6 refusal bodies (v0.1.35, adv_*_body) are well-formed CBOR that break a
+    # record's form rule, so they round-trip like the rest.
+    names = [name for name in GOLDEN if name.endswith(("_cbor", "_delta", "_body"))]
     assert len(names) >= 35, "the v0.1.10 vectors are present"
     for name in names:
         if name == "adv_deep_nesting_cbor":
@@ -606,7 +608,8 @@ def test_a_recordless_renew_matches_java_merges_over_a_held_record_and_waits_oth
     assert unnamed["entryId"] == ENTRY
 
     # the hint rides on this peer's advertisement
-    assert waiting.wire_hints == {"wire.recordless": "1", "wire.appcard": "2"}
+    # beside the AppCard level and the per-entry horizon's promise (SPEC v0.1.35 §7.3)
+    assert waiting.wire_hints == {"wire.recordless": "1", "wire.appcard": "2", "wire.horizon": "1"}
 
 
 def test_a_completion_without_its_claim_is_refused():

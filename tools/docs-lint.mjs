@@ -93,7 +93,8 @@ function markdownLinks(text) {
     for (const m of prose.matchAll(/\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g)) links.push({ target: m[1], line: i + 1 });
     // a reference definition starts a block: it never continues a paragraph
     const opensBlock = i === 0 || !/\S/.test(rows[i - 1].line) || /^\s*\[[^\]]+\]:\s/.test(rows[i - 1].line);
-    if (opensBlock) for (const m of prose.matchAll(/^\s{0,3}\[[^\]]+\]:\s+(\S+)/g)) links.push({ target: m[1], line: i + 1 });
+    // a footnote's definition ("[^1]: The critic ...") opens with a caret: it holds prose, not a link target (GFM)
+    if (opensBlock) for (const m of prose.matchAll(/^\s{0,3}\[(?!\^)[^\]]+\]:\s+(\S+)/g)) links.push({ target: m[1], line: i + 1 });
     for (const m of prose.matchAll(/\s(?:href|src)="([^"]+)"/g)) links.push({ target: m[1], line: i + 1 });
   });
   return links;
@@ -179,8 +180,10 @@ function lintDocument(file, root, fix) {
         if (have) text = text.replace(have, want);
         else {
           const at = text.split("\n");
-          const audience = at.findIndex((l) => AUDIENCE.test(l));
-          at.splice(audience + 1, 0, "", want);
+          // after the whole audience paragraph, not its first line: a "Written for" sentence may wrap over several lines
+          let after = at.findIndex((l) => AUDIENCE.test(l));
+          while (after + 1 < at.length && at[after + 1].trim() !== "") after++;
+          at.splice(after + 1, 0, "", want);
           text = at.join("\n");
         }
         writeFileSync(file, text);

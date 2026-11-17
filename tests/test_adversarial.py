@@ -202,3 +202,71 @@ def test_hostile_certified_claims_never_enter_the_lattice(name):
     delta = cbor.loads(_hex(name))
     peer._fold_claim(delta["claimEntry"], delta["claim"])
     assert peer.claims == {}
+
+
+# The annex I.6 refusal vectors (SPEC v0.1.35, I.8). Java refuses each for the one form rule
+# it breaks. This client audits nothing (no wire.ae=2): it reads no DIGEST at all (RE-L-03 keeps
+# it so), and a sender writes these fields only toward a card that carries wire.ae=2, so the
+# verdicts below are the right ones, not a gap. Its Bodies.PullResp reads ``remainder`` since
+# phase 8, the answer to the budget it names toward a seed on wire.ae=2 (RE-L-03).
+ANNEX_I6_DIGEST_REFUSALS = [
+    "adv_digest_tree_path_nibble_body", "adv_digest_tree_path_long_body",
+    "adv_digest_tree_nodes_length_body", "adv_digest_tree_nodes_few_body",
+    "adv_digest_tree_two_forms_body", "adv_digest_tree_no_form_body",
+    "adv_digest_tree_lines_order_body", "adv_digest_tree_lines_empty_line_body",
+    "adv_digest_ids_twice_body", "adv_digest_budget_zero_body",
+]
+
+
+def test_every_annex_i6_refusal_vector_is_judged_here():
+    names = [k for k in GOLDEN if k.startswith(("adv_digest_", "adv_pull_resp_"))]
+    assert sorted(names) == sorted(ANNEX_I6_DIGEST_REFUSALS + ["adv_pull_resp_remainder_negative_body"])
+
+
+def _from(sender: Identity, kind: str, body: bytes) -> dict:
+    return {"group": GOLDEN["group_id"], "kind": kind, "from": sender.peer_id, "to": None,
+            "stamp": wire.hlc_now(sender.peer_id), "body": body}
+
+
+def test_a_peer_ignores_every_digest_whatever_its_annex_i6_body():
+    # No body record exists for DIGEST here, so a verified DIGEST frame is counted as an
+    # ignored kind before anything decodes its body, hostile or honest, and changes nothing.
+    assert "DIGEST" not in wire.BODY_RECORDS
+    peer, sender = _peer(), Identity.generate()
+    for name in ANNEX_I6_DIGEST_REFUSALS:
+        peer._handle(_from(sender, "DIGEST", _hex(name)))
+    assert peer.ignored_kinds == {"DIGEST": len(ANNEX_I6_DIGEST_REFUSALS)}
+    assert peer.malformed_frames == 0
+    assert peer.states == {} and peer.claims == {}
+    # The signed fetch frame of I.8 verifies, since v0.1.35 leaves the frame's encoding alone.
+    frame = wire.decode_frame(_hex("digest_ids_frame_cbor"))
+    assert frame is not None and frame["kind"] == "DIGEST"
+    assert frame["body"] == _hex("digest_ids_body_cbor")
+
+
+def test_a_pull_response_reads_an_honest_remainder_and_refuses_a_negative_one():
+    # Phase 8 (RE-L-03): Bodies.PullResp names ``remainder`` beside ``deltas``, so the honest
+    # remainder of 3 decodes, and the negative one is refused by its form rule (annex I.6): the
+    # frame counts as malformed and nothing folds. The answer without the field decodes as before.
+    assert wire.decode_body("PULL_RESP", _hex("adv_pull_resp_remainder_negative_body")) is None
+    assert wire.decode_body("PULL_RESP", _hex("pull_resp_remainder_body_cbor"))["remainder"] == {"space:tasks": 3}
+    plain = wire.decode_body("PULL_RESP", _hex("pull_resp_body_cbor"))
+    assert list(plain["deltas"]) == ["space:tasks"] and plain.get("remainder") is None
+    peer = _peer()
+    peer._handle(_from(Identity.generate(), "PULL_RESP", _hex("adv_pull_resp_remainder_negative_body")))
+    assert peer.malformed_frames == 1
+    assert peer.states == {}
+
+
+@pytest.mark.parametrize("name", [
+    "ping_hashes_have_body_cbor", "ping_hashes_body_cbor", "ping_have_body_cbor",
+    "ping_hashes_twenty_streams_body_cbor",
+])
+def test_the_v0_1_35_ping_carriers_decode_and_re_encode(name):
+    # The PING carriers of I.7 hold v0.1.17 fields this reader already names. This client
+    # reads no ACK body, so the ACK carriers of I.7 have no reader here.
+    body = wire.decode_body("PING", _hex(name))
+    assert body is not None and "root" not in body
+    assert cbor.dumps(body) == _hex(name)
+    frame = wire.decode_frame(_hex("ping_hashes_have_frame_cbor"))
+    assert frame is not None and frame["body"] == _hex("ping_hashes_have_body_cbor")

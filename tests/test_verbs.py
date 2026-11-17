@@ -230,11 +230,13 @@ def test_a_notify_reacts_to_several_kinds_including_expired_and_reappeared():
         assert _await(3, lambda: (EXPIRED, "t1") in kinds)
         time.sleep(0.6)
         assert kinds.count((EXPIRED, "t1")) == 1
-        # A take claim that lapses: REAPPEARED fires once per lapsed claim.
+        # A take claim that lapses: REAPPEARED fires once per lapsed claim. The lease must outlast the
+        # take's 0.6 s window and 0.3 s follow-up wait (SPEC §7.4), or the claim has lapsed when the take
+        # is judged and the take wins nothing; this one lapses about 0.6 s after the take returns.
         _fold_from(other, "timers", "com.acme.Claim#v1", {"claim_id": "t2", "amount": 2}, peer)
-        taken = space.take(Template(Claim, where={"claim_id": "t2"}), lease="400ms", timeout="3s")
+        taken = space.take(Template(Claim, where={"claim_id": "t2"}), lease="1500ms", timeout="30s")
         assert taken is not None
-        assert _await(3, lambda: (REAPPEARED, "t2") in kinds)
+        assert _await(30, lambda: (REAPPEARED, "t2") in kinds)
         time.sleep(0.6)
         assert kinds.count((REAPPEARED, "t2")) == 1
         assert _await(3, lambda: watcher.kinds.count("t2") == 2)  # WRITTEN and REAPPEARED; TAKEN is not wanted
