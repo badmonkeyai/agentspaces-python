@@ -105,10 +105,10 @@ def test_a_hint_that_is_not_one_to_nine_ascii_digits_reads_as_version_one(hint):
 
 def test_the_builders_shape_the_six_components():
     status = a2ui.title_status("/working", "Agent working", "Ready")
-    assert a2ui.title_bar("bar", {"path": "/app/title"}, "Claims desk", "briefcase", status, [a2ui.title_action("share", "Share", "share", "share")], "bar-menu") == {
-        "id": "bar", "component": "TitleBar", "title": {"path": "/app/title"}, "subtitle": "Claims desk", "icon": "briefcase",
+    assert a2ui.title_bar("bar", {"@path": "/app/title"}, "Claims desk", "briefcase", status, [a2ui.title_action("share", "Share", "share", "share")], "barMenu") == {
+        "id": "bar", "component": "TitleBar", "title": {"@path": "/app/title"}, "subtitle": "Claims desk", "icon": "briefcase",
         "status": {"from": "/working", "labels": {"working": "Agent working", "idle": "Ready"}},
-        "actions": [{"id": "share", "label": "Share", "icon": "share", "action": {"name": "share"}}], "menu": "bar-menu"}
+        "actions": [{"id": "share", "label": "Share", "icon": "share", "action": {"name": "share"}}], "menu": "barMenu"}
     assert list(a2ui.title_bar("bar", "Workbench")) == ["id", "component", "title"]
     items = [a2ui.menu_item("new-chat", "New chat", "chat.new", {"shortcut": "Ctrl+Shift+O"}), a2ui.submenu("share", "Share", [a2ui.menu_item("copy", "Copy link", "share.link")])]
     assert a2ui.menu("more", a2ui.trigger("overflow", "More"), items)["items"][0] == {"id": "new-chat", "label": "New chat", "shortcut": "Ctrl+Shift+O", "action": {"name": "chat.new"}}
@@ -129,7 +129,44 @@ def test_the_builders_shape_the_six_components():
     assert a2ui.file_tree("tree", "/files", {"working": "/working", "upload": True}) == {"id": "tree", "component": "FileTree", "reads": "/files", "upload": True, "working": "/working"}
     with pytest.raises(ValueError, match="actions"):
         a2ui.file_tree("tree", "/files", {"actions": ["burn"]})
-    assert a2ui.file_preview("preview", {"path": "/selected/file"}, {"files": "/files", "csvRows": 500}) == {
-        "id": "preview", "component": "FilePreview", "file": {"path": "/selected/file"}, "csvRows": 500, "files": "/files"}
+    assert a2ui.file_preview("preview", {"@path": "/selected/file"}, {"files": "/files", "csvRows": 500}) == {
+        "id": "preview", "component": "FilePreview", "file": {"@path": "/selected/file"}, "csvRows": 500, "files": "/files"}
     with pytest.raises(ValueError, match="16 MiB"):
         a2ui.file_preview("preview", "f-1", {"maxBytes": 17000000})
+
+
+def test_the_builders_hold_a_component_to_a2ui_one_point_zero():
+    # v0.9.1's binding and call are refused wherever they sit, naming the place
+    with pytest.raises(ValueError, match=r'TitleBar\.title binds with A2UI 1\.0\'s \{"@path"'):
+        a2ui.title_bar("bar", {"path": "/title"})
+    with pytest.raises(ValueError, match=r"FilePreview\.file binds"):
+        a2ui.file_preview("preview", {"path": "/selected/file"})
+    with pytest.raises(ValueError, match=r"Menu\.items\[\]\.checked binds"):
+        a2ui.menu_item("pin", "Pin", "pin", {"checked": {"path": "/pinned"}})
+    with pytest.raises(ValueError, match=r'context\.row calls a function with A2UI 1\.0\'s \{"@call"'):
+        a2ui.menu_item("go", "Go", "go", {"context": {"row": {"call": "now", "args": {}}}})
+    # an action's context keys are names: an entry called path with a literal passes, and 1.0's forms pass
+    a2ui.menu("more", a2ui.trigger("overflow"), [a2ui.menu_item("go", "Go", "go", {"context": {"path": "/docs/a", "row": {"@path": "/row"}}})])
+    # an id is an identifier
+    with pytest.raises(ValueError, match=r"not an A2UI 1\.0 identifier.*mainSplit"):
+        a2ui.split("main-split", "horizontal", "", 0, [a2ui.pane("a", "x", 0.5), a2ui.pane("b", "y", 0.5)])
+    assert a2ui.component_id("bar_menu") == "bar_menu"
+    assert a2ui.component_id("Überblick2") == "Überblick2"
+    with pytest.raises(ValueError, match="identifier"):
+        a2ui.component_id("2fast")
+    # the kept keys take their @; a bare one is named, and the @ ones are options every open component takes
+    for bare in ("catalogId", "accessibility", "metadata"):
+        with pytest.raises(ValueError, match=rf"FileTree\.{bare} is A2UI 1\.0's @{bare} envelope key"):
+            a2ui.file_tree("tree", "/files", {bare: {}})
+    assert a2ui.file_tree("tree", "/files", {"@accessibility": {"label": "Files"}}) == {
+        "id": "tree", "component": "FileTree", "reads": "/files", "@accessibility": {"label": "Files"}}
+    # below the top level a single @ is reserved; doubled, it is a literal
+    with pytest.raises(ValueError, match=r"context\.row\.@type is a reserved A2UI 1\.0 key.*@@type"):
+        a2ui.menu_item("go", "Go", "go", {"context": {"row": {"@type": "Claim"}}})
+    a2ui.menu_item("go", "Go", "go", {"context": {"row": {"@@type": "Claim"}}})
+    # a Chat's suggestions: strings, or one 1.0 binding to the agent's rows
+    assert a2ui.chat("chat", "a", "main", {"suggestions": {"@path": "/followups"}})["suggestions"] == {"@path": "/followups"}
+    with pytest.raises(ValueError, match=r"Chat\.suggestions binds"):
+        a2ui.chat("chat", "a", "main", {"suggestions": {"path": "/followups"}})
+    with pytest.raises(ValueError, match="list of strings or one binding"):
+        a2ui.chat("chat", "a", "main", {"suggestions": {"@path": "/followups", "extra": 1}})

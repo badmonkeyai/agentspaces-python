@@ -18,9 +18,11 @@ The four records an application's agents write beside its surfaces, ``ChatMessag
 fields are in Java's declared order, so a record encodes to the bytes the Java vectors pin; a version 2 field
 is left out of a version 1 record. Each factory refuses what the Java constructor refuses. The builders
 shape the components of the open catalogs as ``Surfaces`` does in Java: ``title_bar``, ``menu`` and ``split``
-of agentspaces-viz, and ``chat``, ``file_tree`` and ``file_preview`` of agentspaces-widgets.
+of agentspaces-viz, and ``chat``, ``file_tree`` and ``file_preview`` of agentspaces-widgets. They hold each component to
+A2UI 1.0 as Java does: a binding is ``{"@path": ...}``, an id is an identifier, and a component's kept keys carry their ``@``.
 """
 
+import unicodedata
 from dataclasses import dataclass, field
 
 from .cbor import utf16_units
@@ -219,7 +221,79 @@ def chat_progress(key, inReplyTo, agent, at, state="submitted", steps=None, id=N
     return ChatProgress(schemaVersion, id or chat_progress_id(inReplyTo), key, inReplyTo, agent, _state(state), out, at)
 
 
-# ---- the component builders, each the shape Surfaces writes in Java
+# ---- the component builders, each the shape Surfaces writes in Java, held to A2UI 1.0 as Java holds them
+
+#: A2UI 1.0's component envelope keys (spec 2.9): the only ``@``-prefixed keys at a component's top level. ``id`` and
+#: ``component`` stay bare. The open catalogs declare the first three on every component, so a builder takes them as options.
+ENVELOPE_KEYS = ("@catalogId", "@accessibility", "@metadata", "@checks")
+_OPTION_ENVELOPE_KEYS = ("@catalogId", "@accessibility", "@metadata")
+
+
+def _id_char(c, first):
+    return c == "_" or c.isalpha() or (not first and unicodedata.category(c) == "Nd")
+
+
+def component_id(id):
+    """Refuses a component id A2UI 1.0 refuses, naming a form it takes: an id is a Unicode identifier (UAX #31), so
+    ``barMenu`` and ``bar_menu`` pass and ``bar-menu`` does not. Returns the id. Java's pen checks the same rule as it writes."""
+    s = "" if id is None else str(id)
+    if not s or not _id_char(s[0], True) or not all(_id_char(c, False) for c in s[1:]):
+        words, word = [], ""
+        for c in s:
+            if _id_char(c, False):
+                word += c
+            elif word:
+                words.append(word)
+                word = ""
+        if word:
+            words.append(word)
+        hint = words[0] + "".join(w[0].upper() + w[1:] for w in words[1:]) if words else "root"
+        raise ValueError(f"component id '{s}' is not an A2UI 1.0 identifier (UAX #31): use letters, digits and _ only, such as {hint}")
+    return s
+
+
+def _reserved(key):
+    """A key in 1.0's reserved single-``@`` namespace, ``^@([^@]|$)``; a doubled ``@@`` is a literal."""
+    return key.startswith("@") and not key.startswith("@@")
+
+
+def _binding(where, value, keys_are_names=False):
+    """Walks a value to its leaves as Java's ``Surfaces.binding`` does: v0.9.1's ``{"path": ...}`` binding and
+    ``{"call": ...}`` function call are refused, naming where they sit, as is a key in 1.0's reserved ``@`` namespace
+    other than ``@path`` and ``@call`` (a literal one is written doubled, ``@@type``). An action's ``context`` is a record
+    whose keys are names, so an entry called ``path`` there passes, and its values are walked like any other."""
+    if isinstance(value, (list, tuple)):
+        for i, v in enumerate(value):
+            _binding(f"{where}[{i}]", v)
+        return
+    if not isinstance(value, dict):
+        return
+    if not keys_are_names and "path" in value and "@path" not in value:
+        raise ValueError(f'{where} binds with A2UI 1.0\'s {{"@path": ...}}, not v0.9.1\'s {{"path": ...}}')
+    if not keys_are_names and "call" in value and "@call" not in value:
+        raise ValueError(f'{where} calls a function with A2UI 1.0\'s {{"@call": ...}}, not v0.9.1\'s {{"call": ...}}')
+    for k, v in value.items():
+        k = str(k)
+        if _reserved(k) and k not in ("@path", "@call"):
+            raise ValueError(f"{where}.{k} is a reserved A2UI 1.0 key; a literal key that starts with @ is written @{k}")
+        _binding(f"{where}.{k}", v, k == "context" and not keys_are_names and "name" in value)
+
+
+def _checked(m):
+    """Holds one built component to A2UI 1.0, as Java's ``Surfaces.bindings`` does: its id is an identifier, its kept
+    keys carry their ``@`` (a bare ``catalogId``, ``accessibility``, ``metadata`` or ``checks`` is refused, naming the
+    ``@`` key), no other top-level key starts with a single ``@``, and every property is walked. Returns the component."""
+    name = str(m["component"])
+    component_id(m["id"])
+    for k, v in m.items():
+        if "@" + k in ENVELOPE_KEYS:
+            raise ValueError(f"{name}.{k} is A2UI 1.0's @{k} envelope key, not {k}")
+        if _reserved(k) and k not in ENVELOPE_KEYS:
+            raise ValueError(f"{name}.{k} is a reserved A2UI 1.0 key; a component's top level takes only {', '.join(ENVELOPE_KEYS)}")
+        if k not in ("id", "component"):
+            _binding(f"{name}.{k}", v)
+    return m
+
 
 def _comp(id, component):
     return {"id": id, "component": component}
@@ -231,7 +305,13 @@ def _put(m, key, value):
 
 
 def _check(component, options, known, maxima=None):
+    """Refuses an option a component does not take, or a word outside its list, as the Java builders check the catalog.
+    The envelope keys the open catalogs declare on every component are taken, and a bare one is refused naming its ``@`` key."""
     for k, v in options.items():
+        if k in _OPTION_ENVELOPE_KEYS:
+            continue
+        if k not in known and "@" + k in ENVELOPE_KEYS:
+            raise ValueError(f"{component}.{k} is A2UI 1.0's @{k} envelope key, not {k}")
         if k not in known:
             raise ValueError(f"{component} has no property {k}; it takes {', '.join(known)}")
         words = known[k]
@@ -244,7 +324,7 @@ def _check(component, options, known, maxima=None):
 
 
 def title_bar(id, title, subtitle="", icon="", status=None, actions=None, menu=""):
-    """The page's one bar: a title (a literal or ``{"path": ...}``), a subtitle, an icon, a status, buttons, a menu by id."""
+    """The page's one bar: a title (a literal or ``{"@path": ...}``), a subtitle, an icon, a status, buttons, a menu by id."""
     m = _comp(id, "TitleBar")
     m["title"] = title
     _put(m, "subtitle", subtitle)
@@ -254,7 +334,7 @@ def title_bar(id, title, subtitle="", icon="", status=None, actions=None, menu="
     if actions:
         m["actions"] = list(actions)
     _put(m, "menu", menu)
-    return m
+    return _checked(m)
 
 
 def title_status(source, working="", idle=""):
@@ -278,7 +358,7 @@ def menu(id, trigger, items):
     m = _comp(id, "Menu")
     m["trigger"] = trigger
     m["items"] = list(items) if isinstance(items, list) else items
-    return m
+    return _checked(m)
 
 
 def trigger(kind, label=""):
@@ -298,6 +378,7 @@ def menu_item(id, label, action_name, more=None):
         elif v is not None and not (isinstance(v, str) and not v.strip()):
             m[k] = v
     m["action"] = action
+    _binding("Menu.items[]", m)
     return m
 
 
@@ -306,7 +387,9 @@ def submenu(id, label, items):
     for i in items:
         if "items" in i:
             raise ValueError(f"a menu has one level of submenu: {i.get('id')} holds items of its own")
-    return {"id": id, "label": label, "items": list(items)}
+    m = {"id": id, "label": label, "items": list(items)}
+    _binding("Menu.items[]", m)
+    return m
 
 
 def split(id, orientation="horizontal", persist="", stack_below=0, panes=()):
@@ -322,7 +405,7 @@ def split(id, orientation="horizontal", persist="", stack_below=0, panes=()):
     if stack_below > 0:
         m["stackBelow"] = stack_below
     m["panes"] = list(panes)
-    return m
+    return _checked(m)
 
 
 def pane(id, child, size, min=0, collapsible=False, label=""):
@@ -349,11 +432,25 @@ def chat(id, agent, key, options=None):
     """The one agentic chat of agentspaces-widgets: the agent named over the thread, its key, and its other options."""
     options = options or {}
     _check("Chat", options, _CHAT, {"max": 1000})
+    _suggestions(options.get("suggestions"))
     m = _comp(id, "Chat")
     _put(m, "agent", agent)
     m["key"] = key or ""
     m.update(dict(sorted(options.items())))
-    return m
+    return _checked(m)
+
+
+def _suggestions(value):
+    """A Chat's ``suggestions`` is a list of strings, or one binding ``{"@path": "/..."}`` to the rows the agent writes,
+    as the catalog's ``oneOf`` says; anything else is refused here, and an old form is named by the binding walk."""
+    if value is None:
+        return
+    _binding("Chat.suggestions", value)
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return
+    if isinstance(value, dict) and len(value) == 1 and isinstance(value.get("@path"), str) and value["@path"].startswith("/"):
+        return
+    raise ValueError(f'Chat.suggestions is a list of strings or one binding {{"@path": "/..."}} to the agent\'s rows, not {value!r}')
 
 
 def file_tree(id, reads="/files", options=None):
@@ -363,14 +460,14 @@ def file_tree(id, reads="/files", options=None):
     m = _comp(id, "FileTree")
     m["reads"] = reads or "/files"
     m.update(dict(sorted(options.items())))
-    return m
+    return _checked(m)
 
 
 def file_preview(id, file, options=None):
-    """One file by its media type: a file id, or ``{"path": ...}`` where a tree puts the person's choice."""
+    """One file by its media type: a file id, or ``{"@path": ...}`` where a tree puts the person's choice."""
     options = options or {}
     _check("FilePreview", options, _PREVIEW, {"maxBytes": 16777216, "csvRows": 5000})
     m = _comp(id, "FilePreview")
     m["file"] = file
     m.update(dict(sorted(options.items())))
-    return m
+    return _checked(m)
