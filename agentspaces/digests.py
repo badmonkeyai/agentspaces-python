@@ -17,7 +17,9 @@
 and ``c:<entryId>=<claimHash>``, in the order of Java's ``TreeMap``, then one
 ``a:<line>`` per state or claim the replica acknowledges.
 
-This client reads no DIGEST, but since v0.1.35 it sends one: a budgeted pull of a whole
+This client reads one DIGEST, its seed's text round, and answers it with the states and claims the
+seed's digest lacks (``Peer.space_delta_for``; owner decision 2026-11-23). Since v0.1.35 it also sends
+one: a budgeted pull of a whole
 space (SPEC annex I.6, *The budget*) draws the partner's newest states first, and the asker
 continues with its own text digest under the same budget, since the empty digest again
 would draw the same states again (srad/replication-by-entry.md RE-L-03). A partner answers

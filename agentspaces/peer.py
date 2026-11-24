@@ -24,11 +24,13 @@ nothing on this wire is Java-specific, and this module holds the proof."""
 
 import hashlib
 import logging
+import queue
 import random
 import socket
 import struct
 import threading
 import time
+from collections import OrderedDict
 from typing import Callable
 
 from . import beacon, cbor, digests, horizon, records, social, tls, wire
@@ -36,6 +38,7 @@ from .identity import (Identity, derive_id, instant_iso, verify_agent_certificat
                        verify_signed_group_ad)
 from . import revocation as revocations
 from .seed import Seed, parse_seed
+from .timesource import SYSTEM, TimeSource, wait_until
 
 
 # The join through a document waits in slices of 1 s, 2 s, 4 s, then 5 s each
@@ -60,6 +63,14 @@ MAX_PULL_CONTINUATIONS = 1024
 #: The most bytes a space's text digest takes in a DIGEST this client sends: room under the
 #: frame ceiling of SPEC §9 for the envelope, the signature and the revocation streams.
 MAX_DIGEST_TEXT_BYTES = wire.MAX_FRAME_BYTES - 65_536
+#: The most bytes of space deltas one PULL_RESP this client sends carries: room under the frame
+#: ceiling of SPEC §9, as for its digests. States left out go in the seed's next round, whose digest
+#: still lacks them (owner decision 2026-11-23: a dial-only peer answers its seed's DIGEST).
+MAX_PULL_RESP_DELTA_BYTES = wire.MAX_FRAME_BYTES - 65_536
+#: The DIGEST fields of the hashed round (v0.1.17, ``wire.hashes=1``) and of annex I.6 (``wire.ae=2``):
+#: this client advertises neither, so an honest seed sends it the text form alone, and a DIGEST that
+#: carries any of these is ignored and counted, as before.
+DIGEST_FIELDS_NOT_SPOKEN = ("hashes", "want", "tree", "ids", "budget", "sketch")
 #: The acknowledgements a space's digest holds at most (SPEC §7.3 and R7 of §9.2), the least
 #: recently refused forgotten first, as Java's REFUSED_ACK_CAP.
 REFUSED_ACK_CAP = 8192
@@ -113,6 +124,91 @@ CONTEST_SETTLE_MILLIS = 200
 #: The longest follow-up wait a take makes after its settle window before it judges the race:
 #: one fold or this much, as the TypeScript take's ``TAKE_FOLLOW_UP_MAX_MILLIS``.
 TAKE_FOLLOW_UP_MAX_MILLIS = 300
+#: The keepalive bound a Java member judges this peer by, and the member TTL a released 0.6.0 member
+#: judges by (SPEC v0.1.36 §5.2: every member keeps its own keepalive inside 30 s). This client
+#: judges nobody by it: it is the step of its wall clock past its monotonic clock that means its
+#: members may have dropped it (a suspend), so it introduces itself again (EL-C-14, the resume).
+KEEPALIVE_TTL_MS = 30_000
+#: A step of the wall clock past the monotonic clock, either way, longer than this re-judges every
+#: deadline anchored to wall time (SPEC v0.1.36 §9.5).
+WALL_STEP_MS = 1_000
+#: A frame whose handling held the reader longer than this is a slow frame, counted by kind
+#: (srad/agentspaces-event-loop.md EL-X-10, WD-8); PINGs queued behind it wait as long.
+SLOW_FRAME_S = 0.1
+#: A frame still in its handler after this long is a wedged reader: the watchdog names it once
+#: (WD-8). Per-link order must hold, so no second reader takes over the socket.
+WEDGED_FRAME_S = 5.0
+#: The displaced holder's re-offers of its claim (SPEC v0.1.36 §7.4, the second rule's evidence):
+#: at once, then no sooner than 1 s, 2 s, 4 s and so on after the previous offer, six offers in
+#: all, while the claim is live and younger than half the drift ceiling; at most this many lines.
+REOFFER_MAX = 6
+#: How often a linked peer re-issues its self-advertisement (SPEC §5.2: every member periodically
+#: republishes it). A member that dropped this peer for silence (a sleep, a lost relay) admits it again
+#: only on an advertisement issued after the drop, so a peer that re-issued nothing while its link held
+#: stayed out of that view for good; and other dial-only members, which read cards, held its card only
+#: until the card's TTL (the mixed idle run of 2026-11-23). The seed floods the rumor.
+SELF_AD_REFRESH_S = 60.0
+#: A member card held that ends sooner than this is left out of the view digest this peer sends its
+#: seed, so the seed sends the member's current card (SPEC §5.2, the ``view`` stream): a member that
+#: refreshes its card only to the members it holds a link to (a Java member's direct refresh never
+#: reaches a dial-only peer) stays in this peer's view while the seed holds it, and leaves it when the
+#: seed no longer does (the mixed idle run of 2026-11-23: every such card lapsed at 10 minutes).
+VIEW_REFRESH_MARGIN_MS = 180_000
+#: The least time between two of those view pulls.
+VIEW_PULL_MIN_S = 30.0
+#: A link to the seed silent this long is asked: this peer PINGs its seed, which answers every PING at
+#: once (SPEC §5.2). 1.5 times the 30 s keepalive bound a member keeps, so a live seed in a quiet group
+#: is asked rarely; a Java seed's own probes and the targeted relay's PINGs keep a busy link from it.
+LINK_QUIET_S = 45.0
+#: A link asked and still silent this long after is dead: a seed that left without a FIN (power loss,
+#: a partition, a laptop moved to another network or back from a suspend) is otherwise read from for
+#: ever, so this peer would never fail over and its ``relay.via`` would go on naming a holder that is
+#: gone, and every member's targeted relay would fail. The link is shut and the reader reconnects.
+#: The dead-seed rule every dial-only client keeps (owner decision 2026-11-23): this is the ping
+#: timeout, 2 s, the one a prober gives each PING (SPEC §9.4, the core's ``GroupMembership``). It is
+#: judged when it falls due, not on the watchdog's next check, and bytes of a frame still arriving
+#: count as an answer, so a large frame on a slow link is not taken for a dead seed.
+LINK_ANSWER_S = 2.0
+#: After a wake, how long a member whose card lapsed only during the absence stays in the horizon's
+#: view as lacking the hint (the cautious side) while the wake's view pull asks the seed for its
+#: current card (owner decision 3 of 2026-11-23: a probe before a judgement by elapsed time):
+#: 1.5 times LINK_ANSWER_S plus the widest first redial step (5.5 s), as Ruby and Rust keep it.
+VIEW_REPROBE_S = 1.5 * (LINK_ANSWER_S + 5.5)
+REOFFER_BACKOFF_MS = 1_000
+REOFFER_LINES_CAP = 1024
+#: The answers to relayed DIGESTs (owner decision 1 of 2026-11-23): a dial-only peer answers a
+#: DIGEST another member sent through the seed only for the spaces where it holds a displaced claim
+#: or completion, and only with those entries, from a token bucket per asker of this many answers at
+#: once, refilled at RELAYED_ANSWER_RATE a second on the monotonic clock (the Rust figures, 16 and 4,
+#: the same in every client). Per asker (the cross-client check of 2026-11-23): one member flooding
+#: relayed DIGESTs spends its own bucket alone and cannot starve a winner's targeted round. The seed's
+#: own round is answered as before, outside them, so no member can starve the repair of this peer's
+#: lost rumors. At most RELAYED_ANSWER_ASKERS buckets are kept, the least recently asked going first.
+RELAYED_ANSWER_BURST = 16
+RELAYED_ANSWER_RATE = 4.0
+RELAYED_ANSWER_ASKERS = 1024
+#: A watchdog check that comes back more than this late on the monotonic clock, with no wall step to
+#: account for it, is a wake (owner decision 3 of 2026-11-23): the process was frozen (SIGSTOP, a
+#: long pause), its members judged it silent all the same, and the held takes and the seed link are
+#: judged again at once, as after a suspend. The same 30 s as the wall step that makes a resume.
+LATE_WAKE_S = 30.0
+#: The redial table every peer keeps (owner decision 2026-11-23, one table in the core and every
+#: client): the waits between rounds of seed dials, in seconds, taken in turn from a per-peer
+#: position that advances after each wait and wraps back to the first. A link that held resets the
+#: position, and so does a wake from sleep, which also dials at once. A peer's waits scale with its
+#: ``reconnect_interval_s`` (the first entry, 5 s by default), so a test may run the same table faster.
+REDIAL_TABLE_S = (5.0, 10.0, 20.0, 30.0)
+#: The random spread on each wait of the redial table, a fraction either way (+/-10%), so the clients
+#: of a seed that restarts do not all dial it again in the same instant.
+REDIAL_SPREAD = 0.10
+#: The seed dials' stagger (owner decision 2026-11-23, RFC 8305 Happy Eyeballs' connection attempt
+#: delay): the seeds are dialled in list order, each start 250 ms after the one before, or at once when
+#: a dial fails; the first to answer wins, the dials not yet started are not started, and a connection
+#: that answers after the winner is closed. Every client and the core keep it.
+DIAL_STAGGER_S = 0.25
+#: At most this many seed dials are out at once (a hostname may resolve to many addresses); the next
+#: starts when one fails.
+DIALS_IN_FLIGHT_MAX = 16
 
 
 def take_judged_within_millis(settle_millis: int) -> int:
@@ -192,7 +288,8 @@ class Peer:
     def __init__(self, identity: Identity, group: str, clock=None, founder: str | None = None, *,
                  appcard_level: int = APPCARD_LEVEL, ad_cache_max_entries: int = AD_CACHE_MAX_ENTRIES,
                  ad_cache_max_bytes: int = AD_CACHE_MAX_BYTES,
-                 spill_max_fetch_bytes: int = wire.CARD_SPILL_MAX_FETCH_BYTES, horizon_hint: bool = True):
+                 spill_max_fetch_bytes: int = wire.CARD_SPILL_MAX_FETCH_BYTES, horizon_hint: bool = True,
+                 time_source: TimeSource | None = None):
         if not 1 <= appcard_level <= APPCARD_LEVEL:
             raise ValueError(f"this client reads AppCard levels 1 to {APPCARD_LEVEL}: {appcard_level}")
         if ad_cache_max_entries <= 0 or ad_cache_max_bytes <= 0 or spill_max_fetch_bytes <= 0:
@@ -209,9 +306,21 @@ class Peer:
         self._state_lock = threading.RLock()
         self.claims = {}  # entryId -> winning SignedClaim dict (lattice merge)
         self._claims_prune_at = CLAIMS_PRUNE_FLOOR  # the claim map's size that runs _prune_claims
+        # The time source (SPEC v0.1.36 §9.5): wall time for what peers read, monotonic time for
+        # every local period, and every wait; ``VirtualTime`` drives the same code in a test.
+        self.time: TimeSource = time_source or SYSTEM
         # Seconds since the epoch; a test pins it to verify time-bound material
-        # (agent certificates) against a fixed instant, as Java's TestClock does.
-        self.clock = clock or time.time
+        # (agent certificates) against a fixed instant, as Java's TestClock does. Without one,
+        # the time source's wall clock.
+        self.clock = clock or (lambda: self.time.wall_ms() / 1000)
+        # A bare ``clock`` has no monotonic twin, so a peer given one judges no wall steps; a peer
+        # on its time source does (``_judge_wall_step``), and tells these listeners of each step.
+        self._steps_judged = clock is None
+        self._wall_step_listeners: list[Callable[[int], None]] = []
+        # Told after a resume (``_resume``): a renewer of a lease another peer reads (the binder's
+        # data-use entries) renews at once rather than at the end of its monotonic wait (WD-4).
+        self._resume_listeners: list[Callable[[], None]] = []
+        self._step_lock = threading.Lock()
         self.on_state = None  # optional callback(dto)
         # optional callback(dto) after a fold withdraws an entry that was present here: a cancel
         # (core cancel events, 2026-11-09), which a Space announces as EXPIRED
@@ -241,6 +350,9 @@ class Peer:
         # Admission runs on the caller's thread (publish_ad, semantic hits) and the reader's, so the
         # check against the bounds and the store happen under one lock, as AdCache.admit is synchronized.
         self._ads_lock = threading.Lock()
+        # The last issue instant and content signed under each advertisement id (``_sign_and_send``).
+        self._ads_issued: dict[str, tuple[int, bytes]] = {}
+        self._ads_issue_lock = threading.Lock()
         self.pipe_handlers: dict[str, object] = {}  # capability type -> fn(from_peer, payload bytes)
         # The group's revocations (SPEC §5.6, v0.1.13): peer revocations and
         # credential revocations, verified founder-rooted (when the founder is
@@ -249,6 +361,10 @@ class Peer:
         self.revocations = revocations.Registry(lambda: self._founder(), lambda: self.group)
         self._configured_founder = founder
         self._running = False
+        # Set by close(), which is final: the loops over this peer (the sweep, the binder's takes,
+        # the aggregate's rounds) run until it, through any reconnect gap (a lost socket is not a
+        # closed peer).
+        self._closed = False
         # The verified SignedGroupAdvertisement this peer joined with, once a
         # GROUP_AD answer passed the four checks of spec §5.1 (join_by_group_id).
         self.founding = None
@@ -272,8 +388,8 @@ class Peer:
         self.ignored_kinds: dict[str, int] = {}
         self.malformed_frames = 0
         # A lost socket is reconnected to the seed and the peer re-introduced and re-pulled, with
-        # rounds of dials that back off from reconnect_interval_s to six times it (5, 10, 20, 30 s)
-        # with a random spread, until the owner's close(), which is final (swarm retries).
+        # rounds of dials paced by the redial table (5, 10, 20, 30 s, then 5 s again) with a random
+        # spread, until the owner's close(), which is final (swarm retries, owner decision 2026-11-23).
         self._seed = None
         # The seeds connect_any was given, dialed in order and failed over across on a
         # lost socket (SRAD DB-X-01); a bootstrap also sets _refresh_seeds, which
@@ -336,6 +452,25 @@ class Peer:
         # digest it last sent, so an answer that changed nothing ends it.
         self._budgeted_pulls: dict[str, dict] = {}
         self._state_hashes: dict[str, tuple] = {}  # entry id -> (the held state, its digest hash)
+        # A state this replica joined from two signed inputs, neither of which equals the join, carries
+        # no signature anyone made: entry id -> (the join as held, its most advanced signed input),
+        # which an answer to the seed's DIGEST forwards in its place, as Java's ``signedStates``.
+        self._signed_states: dict[str, tuple] = {}
+        #: The seed's DIGESTs this peer answered with a PULL_RESP (owner decision 2026-11-23).
+        self.pulls_answered = 0
+        #: Relayed DIGESTs answered with this peer's displaced entries (owner decision 1 of 2026-11-23,
+        #: final round), and those the asker's answer bucket held back; the buckets, by asker: (tokens,
+        #: last refill), the least recently asked first.
+        self.displaced_digest_answers = 0
+        self.relayed_answers_paced = 0
+        self._relayed_buckets: "OrderedDict[str, tuple[float, float]]" = OrderedDict()
+        #: Watchdog checks more than LATE_WAKE_S late with no wall step: each was a wake (decision 3).
+        self.late_wakes = 0
+        #: Wakes that re-probed the view (owner decision 3): the members whose card lapsed by the wake,
+        #: held in the horizon's view as lacking the hint until the view answer or VIEW_REPROBE_S.
+        self.view_reprobes = 0
+        self._reprobe_held: frozenset = frozenset()
+        self._reprobe_until = 0.0
         self.pull_continuations = 0
         # The connection on which the seed's PeerID was last confirmed by a frame addressed to us:
         # a budget goes only to the seed of the current connection, never to a stale one.
@@ -378,6 +513,7 @@ class Peer:
         # declares the seed as its relay in the ``relay.via`` hint so members reach it
         # the same way back. ``max_path_hops`` bounds a path through further relays.
         self.seed_peer: str | None = None
+        self._via_seed = None  # the seed endpoint seed_peer was learned on
         self.max_path_hops = 4
         self.relayed_frames = 0
         self.relay_signals: list[dict] = []
@@ -388,7 +524,7 @@ class Peer:
         # The content swarm attached to this peer (``agentspaces.capabilities.content``):
         # resolves ``b`` references and takes payloads above its escalation bound.
         self.content = None
-        #: The wait after the first round of reconnect dials; each later round doubles it, up to six times it.
+        #: The first wait of the redial table (``REDIAL_TABLE_S``); the table's waits scale with it.
         self.reconnect_interval_s = 5.0
         #: How long the seeds are dialed before a bootstrapped peer reads its beacon document again.
         self.reconnect_window_s = 600.0
@@ -396,13 +532,88 @@ class Peer:
         # When the current link was dialed, and how many links in a row ended within the reconnect
         # interval: such a link counts as a failed round of dials (swarm retries, ROBUSTNESS.md §10.6).
         self._link_since = 0.0
-        self._quick_drops = 0
+        # The position in the redial table of the next wait (``_next_redial_wait``), and the spread's
+        # source of randomness (a test may give its own).
+        self._redial_at = 0
+        self._redial_random = random.Random()
+        # The link's liveness (``_judge_link``): when a frame was last read off it (monotonic), when this
+        # peer asked a silent link with a PING (None when not asked), and links judged dead for silence.
+        # ``_redial`` cuts a reconnect pause short: a resume (a suspend may have slept through the pause)
+        # and close() set it.
+        self._heard_at = self.time.monotonic()
+        self._link_asked_at: float | None = None
+        self._link_lock = threading.Lock()
+        # The redial and seed counters, under one set of names in every client (owner decision
+        # 2026-11-23; camelCase in TypeScript): PINGs sent to ask the seed (a silent link's or a
+        # wake's), the wake's among them, links dropped for silence, wakes judged (``resumes``,
+        # below), seed dials started, and connections that answered after another seed won and
+        # were closed.
+        self.seed_pings = 0
+        self.wake_pings = 0
+        self.links_silent = 0
+        self.seed_dials = 0
+        self.late_seed_channels = 0
+        # When the reader last took bytes off the link (monotonic), a frame complete or not; the link
+        # this peer last judged dead (not judged again while it is still the socket); and the condition
+        # an asked link's answer is waited on (``_await_link_answer``).
+        self._bytes_at = float("-inf")
+        self._link_dropped = None
+        # The ask a wake made (its asked instant, or the ask already waiting it adopted): its verdict
+        # fails over at once, however young the link (owner decision 2026-11-23, rule 3); and that a
+        # dropped link is owed such a failover (``_reconnect`` takes it).
+        self._wake_asked = None
+        self._link_failover = False
+        self._link_answer = threading.Condition()
+        self._redial = threading.Event()
         # Fold-driven waits (JS-V-02): a take, a read, or an ordered take waits on the
         # next fold (a state or a claim) rather than polling, and pulls a space at most
         # once per settle window.
         self._fold_condition = threading.Condition()
         self._fold_count = 0
         self._last_pull: dict[str, float] = {}  # space name -> monotonic seconds of the last pull
+        # The self-advertisement's last issue (SPEC v0.1.36, §10.16 of the core's record): the
+        # gossip item millisecond, the issue instant, and what the advertisement said, so a changed
+        # advertisement is never issued under the item id or the instant of the one before it.
+        self._self_ad_item_ms = 0
+        self._intro_lock = threading.Lock()
+        #: When this peer last introduced itself and last pulled the view (monotonic), whether a
+        #: refresh thread runs, and how many re-issues and view pulls the refresh made.
+        self._introduced_mono = float("-inf")
+        self._view_pulled_mono = float("-inf")
+        self._refreshing = False
+        self.self_ad_refreshes = 0
+        self.view_pulls = 0
+        self._self_ad_issued_ms = 0
+        self._self_ad_content = None
+        # The loop's health (the watchdog-equivalent check, srad/agentspaces-event-loop.md §3.9):
+        # when the frame in hand started (monotonic, 0 when none) and its kind; slow frames by kind;
+        # wedged frames named once; reader restarts; and the wall step and resume judgements.
+        self._frame_started = 0.0
+        self._frame_kind = ""
+        self._frame_wedge_named = False
+        self.slow_frames: dict[str, int] = {}
+        self.frames_wedged = 0
+        self.reader_restarts = 0
+        self.wall_steps = 0
+        self.resumes = 0
+        self._wall_anchor: tuple[int, float] | None = (
+            (self._now_ms(), self.time.monotonic()) if self._steps_judged else None)
+        # The sweep of the spaces over this peer (agentspaces.space), set by the first Space: told
+        # of every change so it waits for the next deadline rather than polling.
+        self._sweeper = None
+        # The losing side of the settle guarantee's second rule (SPEC v0.1.36 §7.4): the epoch this
+        # peer completed each entry under, and each completion whose claim a better claim displaced,
+        # with its offers so far (entry id -> [signed claim, offers, next offer wall ms, space name]).
+        self._completed_here: dict[str, tuple[str, str, int]] = {}  # entry id -> (space, holder, epoch)
+        self._displaced_own: dict[str, list] = {}
+        # The claims made here that a better claim of another peer displaced, the first one lost per
+        # entry, with or without a completion under it (Java's ``displacedHere``), while they live: what
+        # a relayed DIGEST draws (owner decision 1 of 2026-11-23, as the core). A winner's targeted round
+        # may come after the re-offers are spent, and its answer is the only source of this peer's
+        # completion (entry id -> signed claim).
+        self._displaced_held: dict[str, dict] = {}
+        self._reoffer_lock = threading.Lock()
+        self.displaced_reoffers = 0
 
     # ------------------------------------------------------------- lifecycle
 
@@ -414,30 +625,63 @@ class Peer:
         seed = parse_seed(host) if port is None else Seed(str(host), int(port), scheme.lower())
         self._seed = seed
         self._socket = self._dial(seed, dial_timeout)
+        self._begin_link(seed)
+
+    def _begin_link(self, seed) -> None:
+        """Starts the peer on the link just dialled to ``seed``: the reader, the introduction, the
+        revocation pull and the PING that learns the seed."""
+        self._seed = seed
+        self._closed = False
         self._running = True
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
+        self._redial.clear()  # a close() before this connect left it set
+        self._redial_at = 0  # a fresh start: the redial table from its first wait
+        self._note_dialled(seed)
+        self._start_reader()
         self.introduce()
         self.pull_revocations()
+        self._learn_seed()
 
-    def connect_any(self, seeds) -> tuple:
-        """Dials the seeds, (host, port) pairs, in order until one accepts, and
-        remembers them all: a lost socket fails over to the next seed inside the
-        reconnect window (SRAD DB-X-01). A hostname is resolved to every address
-        and each is a seed (DB-X-03). Returns the seed connected to; raises OSError
-        when none accepted. ``connect(host, port)`` is unchanged underneath."""
+    def _start_reader(self) -> None:
+        """Starts the reader thread and puts this peer under the process watchdog."""
+        from . import watchdog
+        self._reader = threading.Thread(target=self._read_loop, name="agentspaces-reader", daemon=True)
+        self._reader.start()
+        watchdog.watch(self)
+
+    def _note_dialled(self, seed) -> None:
+        """Names the member this peer dialled in ``relay.via`` before it introduces itself on a new
+        link (SPEC v0.1.36 §5.2, the targeted relay: every non-seed member probes a dial-only peer
+        through the holders that hint names, so a member named but not linked is not reached). On
+        ``tls`` the handshake attested the seed's PeerID, so the first introduction names it. On
+        ``tcp`` the seed is known from its first frame addressed here; a link to another seed than
+        the one the hint was learned on clears the hint and the seed until then, rather than naming
+        a member this peer no longer holds a link to."""
+        attested = self._attested
+        if attested is not None:
+            self.seed_peer = attested
+            self.resource_hints["relay.via"] = attested
+            self._via_seed = seed
+            return
+        if getattr(self, "_via_seed", None) is not None and self._via_seed != seed:
+            self.seed_peer = None
+            self.resource_hints.pop("relay.via", None)
+            self._via_seed = None
+
+    def connect_any(self, seeds, *, dial_timeout: float = 10.0) -> tuple:
+        """Dials the seeds, (host, port) pairs, in list order 250 ms apart, and links to
+        the first that answers (owner decision 2026-11-23, ``_dial_first``: a dead seed
+        costs the stagger, not its connect timeout). It remembers them all: a lost socket fails over to
+        another seed (SRAD DB-X-01). A hostname is resolved to every address and each
+        is a seed (DB-X-03). Returns the seed connected to; raises OSError when none
+        accepted within ``dial_timeout``."""
         expanded = self._expand_seeds(seeds)
         if not expanded:
             raise OSError("no seeds to dial")
         self._seeds = expanded
-        last = None
-        for seed in expanded:
-            try:
-                self.connect(seed.host, seed.port, scheme=seed.scheme)
-                return seed
-            except OSError as e:
-                last = e
-        raise OSError(f"no seed accepted: {[str(s) for s in expanded]}") from last
+        seed, sock = self._dial_first(expanded, dial_timeout)
+        self._socket = sock
+        self._begin_link(seed)
+        return seed
 
     @staticmethod
     def _expand_seeds(seeds) -> list:
@@ -458,10 +702,19 @@ class Peer:
         return expanded
 
     def _dial(self, seed: Seed, timeout: float):
-        """One connected socket for ``seed`` by its scheme: ``tcp`` plain, ``tls`` with
-        this peer's channel certificate and the seed's attested (``agentspaces.tls``).
-        Records the attestation for the reader. Raises OSError for a scheme this
-        client does not dial, as for a refused connection."""
+        """One connected socket for ``seed`` by its scheme (``_open``), taken as this
+        peer's link: records the attestation for the reader and starts the link's clock.
+        Raises OSError for a scheme this client does not dial, as for a refused connection."""
+        self.seed_dials += 1
+        sock, attested = self._open(seed, timeout)
+        self._adopt_link(sock, attested)
+        return sock
+
+    def _open(self, seed: Seed, timeout: float) -> tuple:
+        """Dials ``seed`` by its scheme, ``tcp`` plain, ``tls`` with this peer's channel
+        certificate and the seed's attested (``agentspaces.tls``), and returns ``(socket,
+        attested PeerID or None)``. Touches nothing on the peer, so several run at once
+        (``_dial_first``)."""
         if seed.scheme == "tcp":
             sock = socket.create_connection((seed.host, seed.port), timeout=timeout)
             attested = None
@@ -471,42 +724,127 @@ class Peer:
         else:
             raise OSError(f"no dialer for {seed}: this client dials tcp and tls")
         sock.settimeout(None)
-        self._attested = attested
-        self._link_since = time.monotonic()
-        return sock
+        return sock, attested
 
-    def _candidate_seeds(self) -> list:
-        """The seeds to try on a lost socket: the one after the current first, the
-        current one last, so the failover goes to the next seed."""
+    def _adopt_link(self, sock, attested) -> None:
+        """Takes a socket ``_open`` returned as this peer's link: the attestation, and the link's dial
+        instant and liveness from now."""
+        self._attested = attested
+        self._link_since = self.time.monotonic()
+        with self._link_lock:
+            self._heard_at, self._link_asked_at = self._link_since, None
+            self._wake_asked, self._link_failover = None, False  # a new link owes no wake's failover
+
+    def _dial_first(self, seeds, timeout: float) -> tuple:
+        """Dials ``seeds`` in list order, staggered ``DIAL_STAGGER_S`` (250 ms) apart, and takes the
+        first that answers as this peer's link (owner decision 2026-11-23, RFC 8305): a dial that
+        fails starts the next at once, so a refusing seed costs nothing and a silent one costs the
+        stagger rather than its connect timeout. When one answers, the dials not yet started are not
+        started, and a dial still out that answers later is closed at once. Each dial has its own
+        ``timeout``, and at most ``DIALS_IN_FLIGHT_MAX`` are out at once. The stagger is judged on the
+        time source. One seed is dialled on the calling thread. Returns ``(seed, socket)``; raises
+        OSError, from the last failure, when none answered."""
+        seeds = list(seeds)
+        if not seeds:
+            raise OSError("no seeds to dial")
+        if len(seeds) == 1:
+            return seeds[0], self._dial(seeds[0], timeout)
+        state = threading.Condition()
+        answers: list = []  # (seed, socket or None, attested, error), in the order they came
+        won: list = []
+
+        def dial(seed) -> None:
+            try:
+                sock, attested = self._open(seed, timeout)
+            except Exception as e:  # noqa: BLE001 - a failed dial is an answer: the next starts at once
+                with state:
+                    answers.append((seed, None, None, e))
+                    state.notify_all()
+                return
+            with state:
+                late = bool(won)
+                if late:
+                    self.late_seed_channels += 1
+                else:
+                    won.append(seed)
+                    answers.append((seed, sock, attested, None))
+                    state.notify_all()
+            if late:  # another seed answered first: this connection is not wanted
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        started = failed = 0
+        last: Exception | None = None
+        next_at = self.time.monotonic()
+        winner = None
+        with state:
+            while winner is None:
+                token = self.time.token()
+                while answers:
+                    seed, sock, attested, error = answers.pop(0)
+                    if sock is not None:
+                        winner = (seed, sock, attested)
+                        break
+                    failed += 1
+                    last = error
+                    next_at = self.time.monotonic()  # a failed dial starts the next at once
+                if winner is not None:
+                    break
+                if failed == len(seeds):
+                    raise OSError(f"no seed accepted: {[str(s) for s in seeds]}") from last
+                can_start = started < len(seeds) and started - failed < DIALS_IN_FLIGHT_MAX
+                now = self.time.monotonic()
+                if can_start and now >= next_at:
+                    threading.Thread(target=dial, args=(seeds[started],), name="agentspaces-dial",
+                                     daemon=True).start()
+                    started += 1
+                    self.seed_dials += 1
+                    next_at = now + DIAL_STAGGER_S
+                    continue
+                self.time.wait(state, next_at - now if can_start else None, token)
+        seed, sock, attested = winner
+        self._adopt_link(sock, attested)
+        return seed, sock
+
+    def _dial_order(self) -> list:
+        """The seeds a lost socket dials, in the order ``_dial_first`` staggers them: the seeds of
+        connect_any or the beacon in list order, the one just lost last (owner decision 2026-11-23),
+        so the peer fails over to the next seed and a hung seed whose kernel still accepts does not
+        win the race back. Every round of a reconnect dials in this order."""
         if not self._seeds:
             return [self._seed] if self._seed else []
+        order = [seed for seed in self._seeds if seed != self._seed]
         if self._seed in self._seeds:
-            i = self._seeds.index(self._seed)
-            return self._seeds[i + 1:] + self._seeds[:i + 1]
-        return list(self._seeds)
+            order.append(self._seed)
+        return order
 
     def _reconnect(self) -> bool:
-        """After a lost socket: dials the seed again (every seed of connect_any, the next
-        one first), then introduces this peer again and pulls what it had pulled before, so
-        a network hiccup costs a few seconds rather than the membership (ROBUSTNESS.md §3.6).
-        The rounds back off from reconnect_interval_s to six times it with a random spread,
-        so the clients of a seed that restarts do not all dial it at once, and they go on
-        until the owner closes the peer (swarm retries, ROBUSTNESS.md §10.3 E5). A link
-        that ended within reconnect_interval_s of its dial counts as a failed round, so a
-        seed that accepts each dial and drops it at once gets the same pauses and no dial
-        loop (ROBUSTNESS.md §10.6). A bootstrapped peer reads the beacon document again
-        every reconnect_window_s with nothing reachable, and keeps the seeds it has when
-        the beacon is unreachable too."""
-        if time.monotonic() - self._link_since < self.reconnect_interval_s:
-            self._quick_drops += 1
-            time.sleep(self._reconnect_pause(self._quick_drops))
+        """After a lost socket: dials the seeds again (the seeds of connect_any in list order, 250 ms
+        apart, the one just lost last, the first to answer winning: ``_dial_first``, ``_dial_order``),
+        then introduces this peer again and pulls what it had pulled before, so a network hiccup costs a few seconds rather than the membership (ROBUSTNESS.md
+        §3.6). Between failed rounds it waits on the redial table (``REDIAL_TABLE_S``: 5, 10, 20,
+        30 s, then 5 s again, each with a spread of +/-10%), so the clients of a seed that restarts
+        do not all dial it at once, and it goes on until the owner closes the peer (swarm retries,
+        ROBUSTNESS.md §10.3 E5; owner decision 2026-11-23). A link that held for at least the table's
+        first wait (5 s) resets the table and is dialled again at once; one that ended sooner counts
+        as a failed round and takes the next wait, so a seed that accepts each dial and drops it at once gets the
+        same pauses and no dial loop (ROBUSTNESS.md §10.6). A wake from sleep cuts a wait short and
+        resets the table, and so does the dead-seed verdict on a wake's PING, which fails over at once
+        however young the link. A bootstrapped peer reads the beacon document again every
+        reconnect_window_s with nothing reachable, and keeps the seeds it has when the beacon is
+        unreachable too."""
+        with self._link_lock:
+            at_once, self._link_failover = self._link_failover, False
+        if not at_once and self.time.monotonic() - self._link_since < self.reconnect_interval_s:
+            self._pause_redial(self._next_redial_wait())
         else:
-            self._quick_drops = 0
-        deadline = time.monotonic() + self.reconnect_window_s
-        rounds = 0
+            self._redial_at = 0  # the link held: a successful link starts the table again
+        deadline = self.time.monotonic() + self.reconnect_window_s
         while self._running:
-            if time.monotonic() >= deadline:
-                deadline = time.monotonic() + self.reconnect_window_s
+            if self.time.monotonic() >= deadline:
+                deadline = self.time.monotonic() + self.reconnect_window_s
                 if self._refresh_seeds is not None:
                     try:
                         seeds = self._expand_seeds(self._refresh_seeds())
@@ -514,33 +852,66 @@ class Peer:
                         seeds = None
                     if seeds:
                         self._seeds = seeds
-            for seed in self._candidate_seeds():
-                if not self._running:
-                    return False
+            seed = fresh = None
+            order = self._dial_order()
+            if order:
                 try:
-                    fresh = self._dial(seed, 10)
+                    seed, fresh = self._dial_first(order, 10)
                 except OSError:
-                    continue
+                    pass
+            if fresh is not None:
+                if not self._running:  # closed by the owner while the dial was out
+                    try:
+                        fresh.close()
+                    except OSError:
+                        pass
+                    return False
                 with self._lock:
                     self._socket = fresh
                 self._seed = seed
                 self.reconnects += 1
+                self._redial.clear()
+                self._note_dialled(seed)
                 self.introduce()
                 self.pull_revocations()
                 if self._pulled_ads:
                     self.pull_ads()
                 for space in list(self._pulled_spaces):
                     self.pull_space(space)
+                self._learn_seed()
                 return True
-            rounds += 1
-            time.sleep(self._reconnect_pause(rounds))
+            self._pause_redial(self._next_redial_wait())
         return False
 
-    def _reconnect_pause(self, rounds: int) -> float:
-        """The pause after the ``rounds``-th failed round of dials: reconnect_interval_s doubling
-        to six times it, with a random spread of up to a quarter (swarm retries)."""
-        wait = min(6 * self.reconnect_interval_s, self.reconnect_interval_s * 2 ** min(rounds - 1, 3))
-        return wait * random.uniform(1.0, 1.25)
+    def _learn_seed(self) -> None:
+        """On a link whose seed is not yet known (``tcp``; ``tls`` attests it), asks the seed with a PING,
+        which every member answers at once with an ACK addressed to the prober (SPEC §5.2). That
+        addressed frame names the seed, so the ``relay.via`` hint names the member this peer dialled
+        within one round trip, rather than at the seed's own probe of this peer, which may be a whole
+        quiet cycle away (about 196 s at fifty members), while every member's targeted relay has no
+        holder to ask (SPEC v0.1.36 §5.2)."""
+        if self.seed_peer is None and self._socket is not None:
+            self._send("PING", wire.ping_body(random.getrandbits(62)))
+
+    def _pause_redial(self, seconds: float) -> bool:
+        """A reconnect pause on the time source, cut short by a resume or close() (``_redial``): a
+        laptop that slept through a pause dials again on wake rather than sitting out what is left of
+        it (EL-C-14, "a thin client re-dials its seed on wake"), and the redial table starts again.
+        Returns whether it was cut short."""
+        if self.time.wait_event(self._redial, seconds):
+            self._redial.clear()
+            self._redial_at = 0
+            return True
+        return False
+
+    def _next_redial_wait(self) -> float:
+        """The next wait of the redial table, from this peer's position, which then advances and wraps
+        back to the first wait after the last: ``REDIAL_TABLE_S`` scaled to reconnect_interval_s, with
+        a random spread of +/-``REDIAL_SPREAD``."""
+        at = self._redial_at % len(REDIAL_TABLE_S)
+        self._redial_at = (at + 1) % len(REDIAL_TABLE_S)
+        wait = REDIAL_TABLE_S[at] * self.reconnect_interval_s / REDIAL_TABLE_S[0]
+        return wait * self._redial_random.uniform(1.0 - REDIAL_SPREAD, 1.0 + REDIAL_SPREAD)
 
     def bootstrap(self, url: str, *, group_id: str | None = None, allow_plain: bool = False,
                   beacon_peer: str | None = None, timeout: float = 3.0,
@@ -549,7 +920,8 @@ class Peer:
         document at ``url`` (https unless ``allow_plain``; signed by ``beacon_peer`` when
         pinned), selects the group (by ``group_id``, else the only one), verifies its
         founding advertisement with the four checks of SPEC §5.1 against ``group_id``
-        when given, and dials its ``tcp`` seeds in priority order.
+        when given, and dials its ``tcp`` and ``tls`` seeds in the document's order,
+        250 ms apart, the first to answer winning (owner decision 2026-11-23).
         Returns the verified SignedGroupAdvertisement, kept on ``peer.founding``.
 
         ``timeout`` bounds one attempt (one fetch, one dial of one seed) and
@@ -558,14 +930,14 @@ class Peer:
         1 s, 2 s, 4 s, then 5 s each (the shape of the Java join by id,
         ISSUE-BootstrapRobustness FR-4): at the start of each slice it fetches the
         document again when the previous fetch failed with an OSError or named no tcp
-        seed, and dials again, once per slice, every seed that refused. A beacon or a
+        seed, and dials every seed again, once per slice, staggered as above. A beacon or a
         seed that starts a few seconds after this peer is reached on a later slice.
         A refusal (a bad scheme, a document or founding that does not verify, a
         founding for another id, a group the document does not carry) raises ValueError
         at once, as before. When the budget runs out the call raises
         :class:`BootstrapTimeout` (an OSError) whose message and attributes carry the
         number of fetches, the seeds dialed, how many connected, and the last error."""
-        deadline = time.monotonic() + join_timeout
+        deadline = self.time.monotonic() + join_timeout
         fetches = 0
         dialed: list = []
         connected = 0
@@ -580,7 +952,7 @@ class Peer:
             return beacon.seeds_of(beacon.group_from_document(fresh, group_id=self.group))
 
         while True:
-            started = time.monotonic()
+            started = self.time.monotonic()
             if not seeds:
                 fetches += 1
                 try:
@@ -597,26 +969,26 @@ class Peer:
                             f"the beacon document names no tcp or tls seed for {group.get('name')!r}")
                 except OSError as e:  # the beacon is unreachable or answered an error: ask again
                     last_error = e
-            for seed in seeds:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                if seed not in dialed:
-                    dialed.append(seed)
+            remaining = deadline - self.time.monotonic()
+            if seeds and remaining > 0:
+                for seed in seeds:
+                    if seed not in dialed:
+                        dialed.append(seed)
                 self._seeds = seeds
-                try:
-                    self.connect(seed.host, seed.port, scheme=seed.scheme,
-                                 dial_timeout=min(timeout, remaining))
+                try:  # in order 250 ms apart, the first to answer wins (owner decision 2026-11-23)
+                    seed, sock = self._dial_first(seeds, min(timeout, remaining))
+                    self._socket = sock
+                    self._begin_link(seed)
                 except OSError as e:
                     last_error = e
-                    continue
-                connected += 1
-                return founding
-            now = time.monotonic()
+                else:
+                    connected += 1
+                    return founding
+            now = self.time.monotonic()
             wait = min(slice_s - (now - started), deadline - now)
             if wait > 0:
-                time.sleep(wait)
-            if time.monotonic() >= deadline:
+                self.time.sleep(wait)
+            if self.time.monotonic() >= deadline:
                 raise BootstrapTimeout(
                     f"no join through {url} within {join_timeout:g}s: {fetches} fetch(es), "
                     f"{connected} of {len(dialed)} seed(s) connected; last error: {last_error}",
@@ -712,15 +1084,16 @@ class Peer:
         self._founding_ready.clear()
         self._seed = Seed(host, int(port), scheme.lower())
         self._socket = self._dial(self._seed, 10)
+        self._closed = False
         self._running = True
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
-        deadline = time.monotonic() + timeout
+        self._note_dialled(self._seed)
+        self._start_reader()
+        deadline = self.time.monotonic() + timeout
         slice_seconds = 1.0
         while True:
             self._send(wire.KIND_GROUP_AD_WANT, b"")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or self._founding_ready.wait(min(slice_seconds, remaining)):
+            remaining = deadline - self.time.monotonic()
+            if remaining <= 0 or self.time.wait_event(self._founding_ready, min(slice_seconds, remaining)):
                 break
             slice_seconds = min(slice_seconds * 2, 5.0)
         if not self._founding_ready.is_set() or self.founding is None:
@@ -739,12 +1112,25 @@ class Peer:
         return wire.aggregate_roster_token(peer_id)
 
     def close(self) -> None:
+        self._closed = True
         self._running = False
+        self._redial.set()  # a reconnect pause in progress ends now
+        self._link_answered()
         if self._socket is not None:
             try:
                 self._socket.close()
             finally:
                 self._socket = None
+        sweeper = self._sweeper
+        if sweeper is not None:
+            sweeper.wake()  # it sees the peer closed and ends
+        self._wake_fold_waiters()
+
+    @property
+    def closed(self) -> bool:
+        """Whether ``close()`` ended this peer. A peer between links (a reconnect in progress) is
+        not closed: the loops over it wait for the link and go on."""
+        return self._closed
 
     def _founder(self):
         if self._configured_founder:
@@ -754,6 +1140,8 @@ class Peer:
         return None
 
     def _now_ms(self) -> int:
+        if self._steps_judged:
+            return self.time.wall_ms()  # the time source's own milliseconds, with no float between
         return int(self.clock() * 1000)
 
     def counters(self) -> dict[str, int]:
@@ -771,18 +1159,335 @@ class Peer:
                 "stampsFarFutureDeferred": self.stamps_far_future_deferred,
                 "deltasUndecodable": self.deltas_undecodable}
 
+    # ------------------------------------------------------------- the loop's health
+
+    def loop_health(self) -> dict:
+        """The reader's and the sweep's liveness and what the watchdog judged (SPEC v0.1.36 §9.5;
+        srad/agentspaces-event-loop.md §3.9): whether each thread lives, the frame in hand and how
+        long it has held the reader, slow frames by kind, wedged frames, reader restarts, wall
+        steps and resumes, the displaced claims offered again (§7.4), and the redial and seed counters."""
+        started = self._frame_started
+        sweeper = self._sweeper
+        return {"closed": self._closed, "connected": self.connected,
+                "readerAlive": bool(self._reader is not None and self._reader.is_alive()),
+                "sweepAlive": bool(sweeper is not None and sweeper.alive()),
+                "frameInHand": self._frame_kind if started else "",
+                "frameHeldSeconds": round(self.time.monotonic() - started, 3) if started else 0.0,
+                "slowFrames": dict(self.slow_frames), "framesWedged": self.frames_wedged,
+                "readerRestarts": self.reader_restarts, "wallSteps": self.wall_steps,
+                "resumes": self.resumes, "displacedReoffers": self.displaced_reoffers,
+                # The redial and seed counters under the names every client shares (owner decision
+                # 2026-11-23); "linksSilent" is kept as an alias for one release.
+                "seed_pings": self.seed_pings, "wake_pings": self.wake_pings,
+                "links_silent": self.links_silent, "seed_dials": self.seed_dials,
+                "late_seed_channels": self.late_seed_channels,
+                # A wake no wall step showed (a frozen process), and the relayed DIGESTs answered with
+                # displaced entries and held back by the bucket (owner decisions 3 and 1, final round).
+                "late_wakes": self.late_wakes, "view_reprobes": self.view_reprobes,
+                "displaced_digest_answers": self.displaced_digest_answers,
+                "relayed_answers_paced": self.relayed_answers_paced,
+                "linksSilent": self.links_silent}
+
+    def _watch(self, late_s: float = 0.0) -> None:
+        """One check by the process watchdog (``agentspaces.watchdog``), from outside the reader: it
+        reads this peer's heartbeat and takes no lock a frame handler can hold (WD-1).
+
+        * A reader that died while the peer runs (an exception the read loop did not expect) is
+          started again, which reads on or reconnects as the old one would have (the Dead check).
+        * A frame still in its handler after WEDGED_FRAME_S is named once, with its kind: every PING
+          behind it waits as long, and a prober suspects this peer. No second reader takes the
+          socket, since per-link order must hold (WD-8); a handler hands long work to a thread.
+        * The sweep's thread is started again if it died.
+        * A step of the wall clock past the monotonic clock is judged (``_judge_wall_step``).
+        * A check ``late_s`` past its period, more than LATE_WAKE_S, that no wall step accounts for, is
+          a wake (``_late_wake``): the process was frozen (owner decision 3 of 2026-11-23)."""
+        if self._closed:
+            return
+        now = self.time.monotonic()
+        reader = self._reader
+        if self._running and self._seed is not None and reader is not None and not reader.is_alive():
+            self.reader_restarts += 1
+            LOG.warning("the reader of %s died while the peer runs; starting it again", self.identity.peer_id)
+            self._reader = threading.Thread(target=self._read_loop, name="agentspaces-reader", daemon=True)
+            self._reader.start()
+        started = self._frame_started
+        if started and now - started > WEDGED_FRAME_S and not self._frame_wedge_named:
+            self._frame_wedge_named = True
+            self.frames_wedged += 1
+            LOG.warning("a %s frame has held the reader of %s for %.1f s: PINGs wait behind it and probers "
+                        "suspect this peer; a handler or watch callback should hand long work to a thread",
+                        self._frame_kind or "?", self.identity.peer_id, now - started)
+        sweeper = self._sweeper
+        if sweeper is not None:
+            sweeper.ensure_alive()
+        resumed = self._judge_wall_step()
+        if late_s > LATE_WAKE_S and not resumed:
+            self._late_wake(late_s)
+        self._judge_link()
+        self._judge_refresh()
+
+    def _late_wake(self, late_s: float) -> None:
+        """A loop wake ``late_s`` late with no wall step (owner decision 3 of 2026-11-23): the process
+        was frozen (SIGSTOP, a long pause), so its monotonic clock counted the time and no wall step
+        shows it, yet the members judged this peer silent all the same and its seed may have gone. It
+        is a wake as a suspend is: the resume PINGs the seed under the dead-seed rule, judges the held
+        takes at once (the binder's resume listener), and pulls the view naming only the cards that
+        still live, so a member whose card lapsed only because this peer was frozen is asked for
+        again, never dropped."""
+        if self._closed or not self._running:
+            return
+        self.late_wakes += 1
+        self.resumes += 1
+        LOG.info("a loop wake of %s came %.0f s late with no wall step (a frozen process?): resuming",
+                 self.identity.peer_id, late_s)
+        sweeper = self._sweeper
+        if sweeper is not None:
+            sweeper.wake()
+        threading.Thread(target=self._resume, name="agentspaces-resume", daemon=True).start()
+
+    def _judge_refresh(self) -> None:
+        """From the watchdog: when the self-advertisement is SELF_AD_REFRESH_S old, or a held card
+        ends within VIEW_REFRESH_MARGIN_MS, refreshes on a short thread of its own (the watchdog
+        takes no lock a frame handler can hold, WD-1): introduce again, and pull the view."""
+        if self._socket is None or self._closed or not self._running or self._refreshing:
+            return
+        mono = self.time.monotonic()
+        reissue = mono - self._introduced_mono >= SELF_AD_REFRESH_S
+        repull = mono - self._view_pulled_mono >= VIEW_PULL_MIN_S and self._cards_ending()
+        if not (reissue or repull):
+            return
+        self._refreshing = True
+
+        def refresh() -> None:
+            try:
+                if reissue:
+                    self.self_ad_refreshes += 1
+                    self.introduce()
+                if repull:
+                    self.pull_view()
+            except OSError:
+                pass  # the link went: the reader reconnects, and the link-ready pulls follow
+            finally:
+                self._refreshing = False
+        threading.Thread(target=refresh, name="agentspaces-refresh", daemon=True).start()
+
+    def _cards_ending(self) -> bool:
+        """Whether a live member card held ends within VIEW_REFRESH_MARGIN_MS (a lapsed one asks
+        nothing more: its member left)."""
+        now = self._now_ms()
+        horizon = now + VIEW_REFRESH_MARGIN_MS
+        return any(ad and now < _ad_expires_ms(ad) <= horizon for ad in list(self.members.values()))
+
+    def pull_view(self) -> None:
+        """Pulls the membership view from the seed (SPEC §5.2), naming only the cards held that end
+        later than VIEW_REFRESH_MARGIN_MS from now, so the seed sends the current card of every other
+        member it holds."""
+        self._view_pulled_mono = self.time.monotonic()
+        self.view_pulls += 1
+        self._send("DIGEST", wire.digest_body({"view": self._fresh_view_digest()}))
+
+    def _fresh_view_digest(self) -> bytes:
+        """The view digest naming only this peer and the member cards held that end later than
+        VIEW_REFRESH_MARGIN_MS from now."""
+        horizon = self._now_ms() + VIEW_REFRESH_MARGIN_MS
+        fresh = {peer for peer, ad in list(self.members.items()) if ad and _ad_expires_ms(ad) > horizon}
+        ids = sorted(fresh | {self.identity.peer_id})
+        return "".join(f"{peer}\n" for peer in ids).encode("utf-8")
+
+    def _judge_link(self) -> None:
+        """Judges the link to the seed by what this peer last read off it (from the watchdog). A link
+        silent for LINK_QUIET_S is asked with a PING to the seed; one still silent LINK_ANSWER_S after
+        the PING is dead, and is shut so the reader reconnects (to the next seed first) and the
+        ``relay.via`` hint follows the new holder. A live seed answers every PING at once, so a quiet
+        group costs one PING and one ACK per LINK_QUIET_S and nothing is dropped."""
+        sock = self._socket
+        if sock is None or self._closed or not self._running or self._seed is None:
+            return
+        if self._frame_started:
+            return  # a frame handler holds the reader: the silence is this peer's, not the seed's (WD-8)
+        now = self.time.monotonic()
+        with self._link_lock:
+            if sock is self._link_dropped:
+                return  # judged dead already: the reader is reconnecting
+            if self._bytes_at > self._heard_at:
+                # Bytes of a frame not yet complete: the seed is writing, and a slow link is no dead one.
+                self._heard_at, self._link_asked_at = self._bytes_at, None
+            asked = self._link_asked_at
+            if asked is None:
+                if now - self._heard_at < LINK_QUIET_S:
+                    return
+                dead = False
+            elif now - asked < LINK_ANSWER_S:
+                return
+            else:
+                dead = True
+                self._link_asked_at = None
+                self._link_dropped = sock
+                # the verdict on a wake's PING fails over at once, however young the link (rule 3)
+                self._link_failover, self._wake_asked = asked == self._wake_asked, None
+        if not dead:
+            self._ask_link()
+            return
+        self.links_silent += 1
+        LOG.warning("the link of %s to its seed %s was silent for %.0f s and did not answer a PING: "
+                    "dropping it to dial again", self.identity.peer_id, self._seed, now - self._heard_at)
+        try:
+            shutdown = getattr(sock, "shutdown", None)
+            if shutdown is not None:
+                shutdown(socket.SHUT_RDWR)  # wakes the reader's recv, which reconnects
+        except OSError:
+            pass
+
+    def _ask_link(self, wake: bool = False) -> None:
+        """Asks the link whether the seed still reads it: a PING to the seed (to it by name once known),
+        which every member answers at once with an ACK (SPEC §5.2). Asked once until a frame arrives.
+
+        The PING is sent from the ask's own thread, never from the caller's: toward a seed that died
+        without a FIN, another thread's write can hold the send lock in ``sendall`` behind a full send
+        buffer until TCP gives up. The watchdog then still judges the ask at its timeout and shuts the
+        link, which also frees that write."""
+        with self._link_lock:
+            if self._link_asked_at is not None or self._socket is None or self._socket is self._link_dropped:
+                if wake:  # a PING already waiting is not sent again: it becomes the wake's (rule 3)
+                    self._wake_asked = self._link_asked_at
+                return
+            asked = self._link_asked_at = self.time.monotonic()
+            self.seed_pings += 1
+            if wake:  # marked with the ask, so no verdict can come before the mark
+                self._wake_asked = asked
+                self.wake_pings += 1
+        threading.Thread(target=self._ask_and_await, args=(asked,), name="agentspaces-link-ask",
+                         daemon=True).start()
+
+    def _ask_and_await(self, asked: float) -> None:
+        """The ask's thread: the PING to the seed, then the wait for its answer."""
+        self._send("PING", wire.ping_body(random.getrandbits(62)), to=self.seed_peer)
+        self._await_link_answer(asked)
+
+    def _await_link_answer(self, asked: float) -> None:
+        """Waits out the ping timeout of one ask on the time source, then judges the link at once,
+        rather than on the watchdog's next check. Ends early when a frame answers (``_receive``),
+        a new link replaces the asked one, or the peer closes."""
+        deadline = asked + LINK_ANSWER_S
+        with self._link_answer:
+            while True:
+                token = self.time.token()
+                if self._closed or self._link_asked_at != asked:
+                    return
+                remaining = deadline - self.time.monotonic()
+                if remaining <= 0:
+                    break
+                self.time.wait(self._link_answer, remaining, token)
+        self._judge_link()
+
+    def _link_answered(self) -> None:
+        """Wakes a wait for an asked link's answer (a frame came, a link replaced it, or close())."""
+        with self._link_answer:
+            self._link_answer.notify_all()
+
+    def _judge_wall_step(self) -> bool:
+        """Compares the wall clock's movement with the monotonic clock's since the last judgement
+        (SPEC v0.1.36 §9.5). A step either way longer than WALL_STEP_MS asks every deadline anchored
+        to wall time again (the sweep's lapses). A forward step longer than KEEPALIVE_TTL_MS, which a
+        suspend raises, means the members may have dropped this peer for silence: it introduces
+        itself again with an advertisement issued now, which re-admits it where it was dropped, and
+        pulls what it pulled (the resume, EL-C-14). A lost socket reconnects as before. Returns whether
+        it started a resume."""
+        if not self._steps_judged:
+            return False
+        with self._step_lock:
+            wall, mono = self._now_ms(), self.time.monotonic()
+            anchor = self._wall_anchor
+            self._wall_anchor = (wall, mono)
+            if anchor is None:
+                return False
+            step = int((wall - anchor[0]) - (mono - anchor[1]) * 1000)
+            if abs(step) <= WALL_STEP_MS:
+                return False
+            self.wall_steps += 1
+        for listener in list(self._wall_step_listeners):
+            try:
+                listener(step)  # a local period anchored to wall time moves with the step
+            except Exception:  # noqa: BLE001
+                LOG.exception("a wall step listener failed")
+        sweeper = self._sweeper
+        if sweeper is not None:
+            sweeper.wake()
+        if step > KEEPALIVE_TTL_MS and self._running and not self._closed:
+            self.resumes += 1
+            LOG.info("the wall clock of %s moved %d ms past its monotonic clock (a suspend?): "
+                     "introducing it again", self.identity.peer_id, int(step))
+            threading.Thread(target=self._resume, name="agentspaces-resume", daemon=True).start()
+            return True
+        return False
+
+    def _resume(self) -> None:
+        """The resume (EL-C-14; owner decision 2026-11-23): with the link up, a PING to the seed under
+        the dead-seed rule (no answer within LINK_ANSWER_S, 2 s, drops the link and the peer fails
+        over), then a fresh self-advertisement and the pulls a reconnect makes. With no link, the
+        reconnect in progress dials at once. Either way the redial table starts again. The members whose
+        card lapsed by now are re-probed: held in the horizon's view as lacking the hint until the view
+        answer folds or VIEW_REPROBE_S passes (owner decision 3, as Ruby and Rust)."""
+        now_ms = self._now_ms()
+        self._reprobe_held = frozenset(peer for peer, ad in list(self.members.items())
+                                       if ad and _ad_expires_ms(ad) <= now_ms)
+        self._reprobe_until = self.time.monotonic() + VIEW_REPROBE_S
+        self.view_reprobes += 1
+        for listener in list(self._resume_listeners):
+            try:
+                listener()
+            except Exception:  # noqa: BLE001
+                LOG.exception("a resume listener failed")
+        if self._closed:
+            return
+        self._redial_at = 0  # a wake starts the redial table again
+        if self._socket is None:
+            self._redial.set()  # a reconnect pausing between rounds dials again now
+            return
+        # The link may have died in the suspend with no FIN to tell: ask it first, so a dead one is
+        # dropped within LINK_ANSWER_S rather than after LINK_QUIET_S more of silence, and the PING
+        # goes out ahead of the introduction and the pulls (the dead-seed rule, the same everywhere).
+        # A PING already waiting is not sent again; either way the ask in force is the wake's, and its
+        # verdict fails over at once however young the link on the monotonic clock (which did not
+        # count the sleep): the wake already started the table again, so it is no quick drop.
+        self._ask_link(wake=True)
+        self.introduce()
+        # The view names only the cards that still live past the margin (owner decision 3 of
+        # 2026-11-23): one that lapsed while this peer slept or was frozen is asked for again, so the
+        # seed sends the member's current card: a probe, never a drop for time this peer did not see.
+        self.pull_revocations(fresh_view=True)
+        if self._pulled_ads:
+            self.pull_ads()
+        for space in list(self._pulled_spaces):
+            self.pull_space(space)
+
     # ------------------------------------------------------------- protocol
 
     def introduce(self) -> None:
-        """Publishes this peer's leased self-advertisement (spec §5.2)."""
-        now_ms = self._now_ms()
-        # Whole seconds, as the advertisement has always been stamped.
-        ad = wire.peer_advertisement(self.group, self.identity,
-                                     instant_iso(now_ms - now_ms % 1000),
-                                     resource_hints={**self.wire_hints, **self.resource_hints})
-        payload = wire.signed_peer_ad(ad, self.identity)
-        item_id = f"peer:{self.identity.peer_id}:{now_ms}"
-        self._send("RUMOR", wire.rumor_body("peers", item_id, 6, payload))
+        """Publishes this peer's leased self-advertisement (spec §5.2). The issue instant is the
+        whole second, as the advertisement has always been stamped, and a changed advertisement is
+        issued at least a millisecond after the one before it, which a receiver may keep on an
+        equal instant; the gossip item id moves at least a millisecond each time, so a receiver
+        never drops a new advertisement as a copy of the last (SPEC v0.1.36; the core's §10.16:
+        the ``relay.via`` hint learned a millisecond after the first introduction was lost)."""
+        with self._intro_lock:
+            now_ms = self._now_ms()
+            hints = {**self.wire_hints, **self.resource_hints}
+            content = tuple(sorted(hints.items()))
+            issued_ms = now_ms - now_ms % 1000
+            if issued_ms <= self._self_ad_issued_ms:
+                issued_ms = (self._self_ad_issued_ms if content == self._self_ad_content
+                             else self._self_ad_issued_ms + 1)
+            item_ms = max(now_ms, self._self_ad_item_ms + 1)
+            self._self_ad_issued_ms, self._self_ad_item_ms, self._self_ad_content = issued_ms, item_ms, content
+            ad = wire.peer_advertisement(self.group, self.identity, instant_iso(issued_ms),
+                                         resource_hints=hints)
+            payload = wire.signed_peer_ad(ad, self.identity)
+            item_id = f"peer:{self.identity.peer_id}:{item_ms}"
+            # sent under the lock, so two introductions (a resume's and a seed's first frame) leave in
+            # the order they were issued and the last a receiver reads is the newest
+            self._send("RUMOR", wire.rumor_body("peers", item_id, 6, payload))
+            self._introduced_mono = self.time.monotonic()
         self._announce_channel()
 
     def _announce_channel(self) -> None:
@@ -849,8 +1554,7 @@ class Peer:
                 self._refresh_gate()
                 self._cards[ad["id"]] = (ad_type, ad)
                 return self._issue_card(ad_type, ad, self._gate_open)
-        self._sign_and_send(ad_type, ad)
-        return ad
+        return self._sign_and_send(ad_type, ad)
 
     def withdraw_ad(self, ad_id: str) -> None:
         """Stops reissuing a card: the last one signed lapses at its ttl, and a parts document
@@ -859,12 +1563,29 @@ class Peer:
             self._cards.pop(ad_id, None)
             self._signed_issued.pop(ad_id, None)
 
-    def _sign_and_send(self, ad_type: str, ad: dict) -> None:
+    def _sign_and_send(self, ad_type: str, ad: dict) -> dict:
+        """Signs an advertisement, caches it here and sends it on the ``ads`` stream under its id and
+        issue millisecond. A changed advertisement whose issue instant is not after the last one
+        under its id is issued a millisecond after it (SPEC v0.1.36; the core's §10.16): a cache
+        keeps only a strictly newer version, and the gossip item id is the issue millisecond, so
+        the change was otherwise lost until the next refresh. The same content keeps its instant.
+        Returns the advertisement as signed."""
         from .identity import parse_instant_millis
+        issued_ms = parse_instant_millis(ad["issued"])
+        fingerprint = hashlib.sha256(cbor.dumps({k: v for k, v in ad.items() if k != "issued"})).digest()
+        with self._ads_issue_lock:
+            last = self._ads_issued.get(ad["id"])
+            if last is not None and issued_ms <= last[0] and fingerprint != last[1]:
+                issued_ms = last[0] + 1
+                ad = {**ad, "issued": instant_iso(issued_ms)}
+            self._ads_issued[ad["id"]] = (max(issued_ms, last[0]) if last is not None else issued_ms, fingerprint)
+            while len(self._ads_issued) > AD_CACHE_MAX_ENTRIES:
+                del self._ads_issued[next(iter(self._ads_issued))]
         stored = wire.stored_ad(ad_type, ad, self.identity)
         self.accept_ad(stored)  # our own cache holds it too, as DiscoveryService.publish does
         item_id = f"{ad['id']}:{parse_instant_millis(ad['issued'])}"
         self._send("RUMOR", wire.rumor_body("ads", item_id, 6, cbor.dumps(stored)))
+        return ad
 
     def _issue_card(self, ad_type: str, card: dict, gate_open: bool) -> dict:
         """Signs a full card for the view (AppCardPublisher.issue): a strictly newer issue
@@ -1130,7 +1851,7 @@ class Peer:
         """Pulls a space unless it was pulled within ``settle_seconds`` (JS-V-02): a
         waiting take issues at most one DIGEST per settle window, and none while
         folds keep arriving. Returns whether a pull went out."""
-        now = time.monotonic()
+        now = self.time.monotonic()
         if now - self._last_pull.get(space, float("-inf")) < settle_seconds:
             return False
         self._last_pull[space] = now
@@ -1149,25 +1870,222 @@ class Peer:
         whether a fold woke the wait."""
         with self._fold_condition:
             seen = self._fold_count if since is None else since
-            return self._fold_condition.wait_for(lambda: self._fold_count != seen,
-                                                 timeout=max(0.0, max_seconds))
+            return wait_until(self.time, self._fold_condition, lambda: self._fold_count != seen,
+                              max(0.0, max_seconds))
 
     def _wake_fold_waiters(self) -> None:
         with self._fold_condition:
             self._fold_count += 1
             self._fold_condition.notify_all()
+        sweeper = self._sweeper
+        if sweeper is not None:
+            sweeper.wake()  # a state, a claim or a payload changed: the next deadline may be sooner
 
-    def pull_revocations(self) -> None:
+    def pull_revocations(self, fresh_view: bool = False) -> None:
         """Anti-entropy pull of the revocation streams alone (SPEC §5.6): sent
         once on joining, so revocations issued before this peer arrived apply
-        from its first merge."""
-        self._send("DIGEST", wire.digest_body({stream: b"" for stream in revocations.STREAMS}))
+        from its first merge.
+
+        The membership view rides along (SPEC §5.2, v0.1.17; v0.1.21: the ``view`` stream is pulled
+        by a joining client): a late joiner behind a seed learns the members whose introductions it
+        never saw from the same answer. A dial-only member refreshes its advertisement to its seed
+        alone, unforwarded, so without this pull a member that joined after it never held it.
+        ``fresh_view`` (a resume's) names only the cards that end later than VIEW_REFRESH_MARGIN_MS, as
+        ``pull_view`` does, so the seed sends again every card that lapsed or is ending."""
+        self._view_pulled_mono = self.time.monotonic()
+        view = self._fresh_view_digest() if fresh_view else self.view_digest()
+        self._send("DIGEST", wire.digest_body({**{stream: b"" for stream in revocations.STREAMS},
+                                               "view": view}))
+
+    def view_digest(self) -> bytes:
+        """``PeerNode.ViewState.digest``: one line per member whose advertisement is held, this
+        peer included, sorted."""
+        ids = sorted({peer for peer, ad in list(self.members.items()) if ad} | {self.identity.peer_id})
+        return "".join(f"{peer}\n" for peer in ids).encode("utf-8")
 
     def pull_ads(self) -> None:
         """Anti-entropy pull of the 'ads' stream (SPEC §6.2): the cards and
         capability advertisements the group holds."""
         self._pulled_ads = True
         self._send("DIGEST", wire.digest_body({"ads": b""}))
+
+    def _on_digest(self, sender, body: bytes, relayed: bool, to=None) -> bool:
+        """Answers the seed's anti-entropy round (SPEC §5.3; owner decision 2026-11-23: a dial-only
+        peer answers its seed's DIGEST). The seed's round names its text digest of each space it
+        holds; this peer answers, in one PULL_RESP addressed to the seed, the states and claims of the
+        spaces it holds that the digest does not name, as Java's ``GossipBus`` answers a pull. A
+        rumor of this peer's own that was lost on its only link (a write, a renewal, a completion,
+        a claim) is so repaired at the seed's next round, where before it was lost for good unless
+        this peer wrote the entry again.
+
+        The seed's own text round is answered whole: an unrelayed DIGEST from the seed whose body is
+        a ``Bodies.Digest`` with no field of the hashed round or of annex I.6, which a member sends
+        only toward a card advertising them, and this client advertises neither. A text round another
+        member addressed to this peer and the seed carried (a winner's targeted round, §7.4) is
+        answered only for the spaces where this peer holds a displaced claim made here, with only
+        those entries, back through the seed and under the answer bucket (``_answer_displaced``, owner
+        decision 1 of 2026-11-23). Anything else returns False, and the caller ignores and counts the
+        frame as before. Returns True when the DIGEST was answered, whether or not anything was
+        missing, or held back by the bucket."""
+        if not isinstance(sender, str) or sender == self.identity.peer_id:
+            return False
+        seeds = not relayed and sender == self.seed_peer
+        if not seeds and not (relayed and to == self.identity.peer_id):
+            return False
+        digest = records.decode(body, "Bodies.Digest")
+        if digest is None or not isinstance(digest.get("digests"), dict) \
+                or any(digest.get(field) is not None for field in DIGEST_FIELDS_NOT_SPOKEN):
+            return False
+        if not seeds:
+            return self._answer_displaced(sender, digest["digests"])
+        deltas: dict[str, bytes] = {}
+        room = MAX_PULL_RESP_DELTA_BYTES
+        for stream, remote in digest["digests"].items():
+            if room <= 0:
+                break
+            if not isinstance(stream, str) or not stream.startswith("space:") or not isinstance(remote, bytes):
+                continue  # ads, view and revocations: this peer serves none of them to its seed
+            delta = self.space_delta_for(stream[len("space:"):], remote, room)
+            if delta:
+                deltas[stream] = delta
+                room -= len(delta)
+        if deltas:
+            self.pulls_answered += 1
+            self._send("PULL_RESP", cbor.dumps({"deltas": cbor.canonical_map(deltas)}), to=sender)
+        return True
+
+    def _answer_displaced(self, sender: str, streams: dict) -> bool:
+        """Answers a member's relayed text round (owner decision 1 of 2026-11-23): only for the spaces it
+        names where this peer holds a claim made here that a better claim displaced, with or without its
+        completion (as the core's ``displacedFor``), and only those entries,
+        in one PULL_RESP addressed to the member and carried back by the seed (which drops a frame
+        addressed to anyone else). The winner whose claim displaced this peer's learns from it the
+        completion it could not authenticate under its own claim, which no other replica can give it.
+        One token of the asker's answer bucket per answer; with none left the DIGEST is held back and counted.
+        Returns False, so the frame is ignored and counted as before, when no named space holds one."""
+        named = {stream[len("space:"):]: remote for stream, remote in streams.items()
+                 if isinstance(stream, str) and stream.startswith("space:") and isinstance(remote, bytes)}
+        held = self._displaced_in(set(named))
+        if not held:
+            return False
+        mono = self.time.monotonic()
+        with self._reoffer_lock:
+            held_tokens, at = self._relayed_buckets.pop(sender, (float(RELAYED_ANSWER_BURST), mono))
+            tokens = min(float(RELAYED_ANSWER_BURST), held_tokens + (mono - at) * RELAYED_ANSWER_RATE)
+            spent = tokens >= 1.0
+            self._relayed_buckets[sender] = (tokens - 1.0 if spent else tokens, mono)
+            while len(self._relayed_buckets) > RELAYED_ANSWER_ASKERS:
+                self._relayed_buckets.popitem(last=False)
+            if not spent:
+                self.relayed_answers_paced += 1
+                return True
+        deltas: dict[str, bytes] = {}
+        room = MAX_PULL_RESP_DELTA_BYTES
+        for space in sorted(held):
+            delta = self._displaced_delta(space, held[space], named[space], room)
+            if delta:
+                deltas[f"space:{space}"] = delta
+                room -= len(delta)
+        if deltas:
+            self.displaced_digest_answers += 1
+            self.send_addressed("PULL_RESP", cbor.dumps({"deltas": cbor.canonical_map(deltas)}), sender)
+        return True
+
+    def _displaced_delta(self, space: str, displaced: dict, remote_digest: bytes, room: int) -> bytes:
+        """The ``SyncDelta`` of the displaced entries of one space the remote digest does not name: each
+        entry's held state (the completion, as its signed copy) and this peer's displaced claim, within
+        ``room`` encoded bytes; empty bytes when the remote holds them all."""
+        remote = set(remote_digest.decode("utf-8", "replace").split("\n"))
+        states: list = []
+        claims: dict = {}
+        size = 0
+        for entry_id in sorted(displaced):
+            dto = self.states.get(entry_id)
+            if dto is not None:
+                line = f"e:{entry_id}={self._state_hash(entry_id, dto)}"
+                if line not in remote and f"a:{line}" not in remote:
+                    signed = self._signed_state(entry_id, dto)
+                    cost = len(cbor.dumps(signed))
+                    if size + cost > room:
+                        break
+                    states.append(signed)
+                    size += cost
+            line = f"c:{entry_id}={digests.claim_hash(displaced[entry_id]['claim'])}"
+            if line not in remote and f"a:{line}" not in remote:
+                cost = len(entry_id) + len(cbor.dumps(displaced[entry_id]))
+                if size + cost > room:
+                    break
+                claims[entry_id] = displaced[entry_id]
+                size += cost
+        if not states and not claims:
+            return b""
+        return cbor.dumps({"states": states, "claims": cbor.canonical_map(claims)})
+
+    def space_delta_for(self, space: str, remote_digest: bytes, room: int = MAX_PULL_RESP_DELTA_BYTES) -> bytes:
+        """Java's ``ReplicatedSpace.deltaFor``: the encoded ``SyncDelta`` of the states and claims of
+        ``space`` this replica holds and the remote text digest names neither as held (``e:``/``c:``)
+        nor as acknowledged (``a:``), or empty bytes when nothing is missing. A state goes as its
+        signed copy (``_signed_state``), since a join carries no signature anyone made. Tombstones
+        this replica would collect are collected first, so it never offers one. Present states go
+        first, newest first, then the claims; states and claims past ``room`` encoded bytes together
+        are left for the next round, so the answer never passes the frame bound (an oversized frame
+        would make the seed drop the link, and every round would drop it again)."""
+        from .identity import space_id_local
+        space_id = space_id_local(f"{self.group}/{space}")
+        self._collect_if_due()
+        remote = set(remote_digest.decode("utf-8", "replace").split("\n"))
+        with self._state_lock:
+            held = [(entry_id, dto) for entry_id, dto in list(self.states.items())
+                    if (dto.get("record") or {}).get("spaceId") == space_id]
+            claims = [(entry_id, signed) for entry_id, signed in list(self.claims.items())
+                      if signed["claim"].get("spaceId") == space_id]
+        held.sort(key=lambda item: _stamp_key(item[1].get("leaseStamp")), reverse=True)
+        held.sort(key=lambda item: not present(item[1]))
+        states: list = []
+        size = 0
+        for entry_id, dto in held:
+            line = f"e:{entry_id}={self._state_hash(entry_id, dto)}"
+            if line in remote or f"a:{line}" in remote:
+                continue
+            signed = self._signed_state(entry_id, dto)
+            cost = len(cbor.dumps(signed))
+            if size + cost > room:
+                break
+            states.append(signed)
+            size += cost
+        missing: dict = {}
+        for entry_id, signed in claims:
+            line = f"c:{entry_id}={digests.claim_hash(signed['claim'])}"
+            if line not in remote and f"a:{line}" not in remote:
+                cost = len(entry_id) + len(cbor.dumps(signed))
+                if size + cost > room:
+                    break  # the claims count against the room too: the rest goes in the next round
+                missing[entry_id] = signed
+                size += cost
+        if not states and not missing:
+            return b""
+        return cbor.dumps({"states": states, "claims": cbor.canonical_map(missing)})
+
+    def _signed_state(self, entry_id: str, dto: dict) -> dict:
+        """The signed state to forward for a held state: the state itself, or, for a join neither
+        input equals, its most advanced signed input."""
+        joined = self._signed_states.get(entry_id)
+        return joined[1] if joined is not None and joined[0] is dto else dto
+
+    def _note_joined(self, entry_id: str, previous: dict, incoming: dict, merged: dict) -> None:
+        """Keeps the signed copy of a join (``_signed_state``): the incoming state when the join
+        equals it, the held state's own signed copy when the join equals that, else the more
+        advanced of the two (completed, then more removes, then the later lease stamp, then more
+        adds), as the TypeScript client keeps it. The join's fields mix two inputs, so the held
+        state's signature does not cover it."""
+        held = self._signed_state(entry_id, previous)
+        if _same_state(merged, incoming):
+            signed = incoming
+        elif _same_state(merged, previous):
+            signed = held
+        else:
+            signed = incoming if _advances_state(incoming, held) else held
+        self._signed_states[entry_id] = (merged, signed)
 
     def accept_ad(self, stored) -> dict | None:
         """Admits a StoredAd as AdCache.accept does: a type tag AdCache knows, the
@@ -1316,7 +2234,7 @@ class Peer:
 
     def want_block(self, cid: str, dto: dict | None = None) -> None:
         """Asks the entry's issuing peer (and the seed) for a block, at most once a second."""
-        now = time.monotonic()
+        now = self.time.monotonic()
         if now - self._block_asked.get(cid, float("-inf")) < 1.0:
             return
         self._block_asked[cid] = now
@@ -1398,7 +2316,12 @@ class Peer:
                     # Corrupt or hostile prefix: the stream cannot be
                     # resynchronized (ASF-016). Drop the connection.
                     raise OSError(f"bad frame length {length}")
-                self._receive(self._read_exact(length))
+                frame = self._read_exact(length)
+                self._frame_started = self.time.monotonic()
+                try:
+                    self._receive(frame)
+                finally:
+                    self._frame_done()
             except OSError:
                 # The socket closed or failed. Closed by the owner: done. Otherwise reconnect
                 # to the seed and carry on; the fleet's leases cover the gap either way.
@@ -1412,10 +2335,26 @@ class Peer:
                 if not self._running or self._seed is None or not self._reconnect():
                     return
 
+    def _frame_done(self) -> None:
+        """Ends the timing of the frame in hand: one held the reader longer than SLOW_FRAME_S is
+        counted under its kind, since every PING behind it waited as long (WD-8)."""
+        took = self.time.monotonic() - self._frame_started
+        if took > SLOW_FRAME_S:
+            kind = self._frame_kind or "?"
+            self.slow_frames[kind] = self.slow_frames.get(kind, 0) + 1
+        self._frame_started = 0.0
+        self._frame_kind = ""
+        self._frame_wedge_named = False
+
     def _receive(self, frame: bytes) -> None:
         """One frame off the connection: decoded, verified, filtered and handled, or dropped
         and counted as malformed. No frame raises out of here, so one hostile frame cannot
         kill the reader (ASF-015)."""
+        with self._link_lock:  # any frame at all shows the seed still reads and writes the link
+            asked = self._link_asked_at
+            self._heard_at, self._link_asked_at = self.time.monotonic(), None
+        if asked is not None:
+            self._link_answered()
         try:
             decoded = wire.decode_frame_detailed(frame, attested=self._attested)
             env = decoded[0] if decoded is not None else None
@@ -1424,6 +2363,7 @@ class Peer:
             elif self._accepts(env):
                 if decoded[1] == "attested":
                     self.attested_frames += 1
+                self._frame_kind = str(env.get("kind"))
                 self._handle(env)
         except Exception:  # noqa: BLE001 - one hostile frame must not kill the reader
             self.malformed_frames += 1
@@ -1445,6 +2385,7 @@ class Peer:
             chunk = sock.recv(count - len(data))
             if not chunk:
                 raise OSError("connection closed")
+            self._bytes_at = self.time.monotonic()  # the seed is writing: an asked link is answered
             data += chunk
         return data
 
@@ -1471,11 +2412,14 @@ class Peer:
                 # Over our one socket an addressed frame is the seed's own; it is the relay
                 # we declare, so members behind other seeds reach us through it (SPEC §5.4).
                 self.seed_peer = sender
+                self._via_seed = self._seed
                 self.resource_hints["relay.via"] = sender
                 self.introduce()
             if not relayed and self._seed is not None and env.get("to") == self.identity.peer_id \
                     and self.seed_peer == sender:
                 self._seed_confirmed_on = self._socket
+        if kind == "DIGEST" and self._on_digest(sender, body, relayed, env.get("to")):
+            return
         if kind not in wire.BODY_RECORDS:
             # A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are
             # never sent to it, but a misconfigured peer could), or one it does not act on (the
@@ -1490,7 +2434,16 @@ class Peer:
             self.malformed_frames += 1
             return
         if kind == "PING":
-            self._send("ACK", wire.ack_body(decoded["nonce"]))
+            # Answered at once, to the prober (SPEC v0.1.36 §5.2), as Java answers
+            # send(group, from, ACK) and the Rust peer does: addressed, and back through the seed
+            # when the PING came inside a RELAY_FRAME (a prober with a relay path to this peer).
+            # An unaddressed ACK reached only the seed, which never asked, so every such probe
+            # failed its direct stage and cost the prober an indirect round.
+            ack = wire.ack_body(decoded["nonce"])
+            if relayed and isinstance(sender, str):
+                self.send_addressed("ACK", ack, sender)
+            else:
+                self._send("ACK", ack, to=sender if isinstance(sender, str) else None)
         elif kind == "PIPE_DATA":
             if decoded["capability"] == wire.RELAY_SIGNAL_CAPABILITY:
                 signal = records.decode(decoded["payload"], "PeerNode.RelaySignal")
@@ -1549,6 +2502,18 @@ class Peer:
                 if stream in revocations.STREAMS and delta_bytes:
                     self.revocations.accept_delta(stream, delta_bytes, self._now_ms())
                     continue
+                if stream == "view" and delta_bytes:
+                    self._reprobe_held = frozenset()  # the seed answered the view: the re-probe ends
+                    # The signed advertisements of the members this peer's view digest did not
+                    # name (SPEC §5.2): each admitted as a forwarded copy on 'peers' would be.
+                    try:
+                        payloads = cbor.loads(delta_bytes)
+                    except Exception:  # noqa: BLE001 - a view delta that does not decode admits nobody
+                        payloads = None
+                    for payload in payloads if isinstance(payloads, list) else []:
+                        if isinstance(payload, (bytes, bytearray)):
+                            self._accept_peer_ad(bytes(payload))
+                    continue
                 if stream == "ads" and delta_bytes:
                     delta = records.decode(delta_bytes, "AdCache.Delta")
                     for stored in (delta["ads"] or []) if delta is not None else []:
@@ -1592,6 +2557,8 @@ class Peer:
         self._founding_ready.set()
 
     def _fold(self, dto: dict) -> None:
+        if self._displaced_own and not dto.get("completed"):
+            self._stale_offered(dto)
         if dto.get("leaseStamp") is None or dto.get("leaseValue") is None:
             # HLC round five, 2026-11-08 (decision E7): such a state decodes, but a lease
             # register holds nothing without its stamp and value, so the peer drops it before
@@ -1662,6 +2629,8 @@ class Peer:
             previous = self.states.get(entry_id)
             merged = self._join(previous, dto) if previous is not None else dto
             self.states[entry_id] = merged
+            if previous is not None:
+                self._note_joined(entry_id, previous, dto, merged)
         if self.on_state is not None:
             self.on_state(merged)
         if (self.on_withdrawn is not None and previous is not None and present(previous)
@@ -1746,6 +2715,7 @@ class Peer:
         if not self.horizon_hint:
             return False
         now = self._now_ms() if now is None else now
+        held = self._reprobe_held if self.time.monotonic() < self._reprobe_until else frozenset()
         hinted = True
         for peer_id, ad in list(self.members.items()):
             self._note_stay(peer_id, ad, now)
@@ -1753,6 +2723,8 @@ class Peer:
                 hinted = False
             elif _ad_expires_ms(ad) > now and (ad.get("resourceHints") or {}).get(HINT_HORIZON) != "1":
                 hinted = False
+            elif _ad_expires_ms(ad) <= now and peer_id in held:
+                hinted = False  # re-probed after a wake (decision 3): lacking the hint until the seed answers
         return hinted
 
     def set_horizon_engage_rounds(self, rounds: int) -> None:
@@ -1860,6 +2832,49 @@ class Peer:
                     and horizon.collectable(dto, now, max_lease, horizon.PER_ENTRY))
         return horizon.collectable(dto, now, max_lease, rule)
 
+    def next_collection_ms(self, now: int | None = None) -> int | None:
+        """When the next collection may find work (SPEC §7.3), for a sweep that waits for its
+        deadlines (SPEC v0.1.36 §9.5): the earliest collection horizon of a state held here under
+        the rule in force, the earliest lapse of a claim on an entry not held, and, while the
+        per-entry horizon is engaging, its next round or the end of its settling wait; never sooner
+        than COLLECT_PERIOD_MILLIS after the last collection. None when nothing needs collecting."""
+        now = self._now_ms() if now is None else now
+        due: list[int] = []
+        rule = horizon.PER_ENTRY if self.horizon_mode == "PER_ENTRY" else horizon.LEGACY
+        with self._state_lock:
+            states = list(self.states.values())
+            orphans = [signed for entry_id, signed in self.claims.items() if entry_id not in self.states]
+        for dto in states:
+            try:
+                max_lease = self.max_lease_of((dto.get("record") or {}).get("spaceId"))
+                at = horizon.collection_horizon(dto, max_lease, rule)
+                if rule == horizon.PER_ENTRY and horizon.kind_of(dto) == "withdrawn" \
+                        and not self._vouches_for_writers(dto, now):
+                    at = max(at, horizon.collection_horizon(dto, max_lease, horizon.LEGACY))
+                if horizon.kind_of(dto) == "present":
+                    at = max(at, horizon.lease_expiry(dto))
+            except (TypeError, ValueError):
+                continue
+            due.append(at)
+        for signed in orphans:
+            try:
+                due.append(int(signed["claim"]["expiresAtMillis"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+        if states and self.horizon_mode == "LEGACY" and self.view_advertises_horizon(now):
+            due.append(now + self.horizon_round_millis())  # a hinted view starts counting its rounds
+        elif states and self.horizon_mode in ("WAITING", "SETTLING"):
+            if self.horizon_mode == "WAITING" and self._horizon_counted_at is not None:
+                due.append(self._horizon_counted_at + self.horizon_round_millis())
+            elif self.horizon_mode == "SETTLING":
+                due.append(self._horizon_engaged_at + self._settle_millis())
+        if not due:
+            return None
+        earliest = min(due)
+        if self._collected_at is not None and now >= self._collected_at:
+            earliest = max(earliest, self._collected_at + COLLECT_PERIOD_MILLIS)
+        return earliest
+
     def _collect_if_due(self) -> None:
         now = self._now_ms()
         if self._collected_at is None or now < self._collected_at or now - self._collected_at >= COLLECT_PERIOD_MILLIS:
@@ -1887,9 +2902,12 @@ class Peer:
             for entry_id in collected:
                 dto = self.states.pop(entry_id)
                 self._state_hashes.pop(entry_id, None)
+                self._signed_states.pop(entry_id, None)
                 self.claims.pop(entry_id, None)
                 self.pending_states.pop(entry_id, None)
                 self._pending_since.pop(entry_id, None)
+                self._completed_here.pop(entry_id, None)
+                self._displaced_own.pop(entry_id, None)
                 ref = (dto.get("record") or {}).get("payloadRef")
                 if isinstance(ref, str) and ref:
                     refs.add(ref)
@@ -1949,7 +2967,7 @@ class Peer:
 
     def _expire_pending_states(self, now: float | None = None) -> None:
         """Drops pending recordless states older than ``PENDING_STATE_TTL_S`` (PD-L-02)."""
-        now = time.monotonic() if now is None else now
+        now = self.time.monotonic() if now is None else now
         for entry_id, since in list(self._pending_since.items()):
             if now - since >= PENDING_STATE_TTL_S:
                 self._pending_since.pop(entry_id, None)
@@ -1974,7 +2992,7 @@ class Peer:
                 self.pending_states.pop(oldest, None)
                 self._pending_since.pop(oldest, None)
             self.pending_states[entry_id] = dto
-            self._pending_since[entry_id] = time.monotonic()
+            self._pending_since[entry_id] = self.time.monotonic()
             return
         self._pending_since.pop(entry_id, None)
         full = dict(dto)
@@ -2165,7 +3183,11 @@ class Peer:
         if verdict == _DEFER:
             self._count_deferred(key)
             return
-        self.claims[entry_id] = wire.merge_claims(self.claims.get(entry_id), signed)
+        previous = self.claims.get(entry_id)
+        self.claims[entry_id] = wire.merge_claims(previous, signed)
+        if previous is not None:
+            merged = self.claims[entry_id]
+            self._note_displaced(entry_id, merged, signed if merged is previous or merged == previous else previous)
         self._observe_lease(claim.get("spaceId"), int(expires) - stamped)  # a hold counts as a lease (SPEC §7.3)
         if self.on_claim is not None:
             self.on_claim(entry_id, self.claims[entry_id])
@@ -2246,8 +3268,8 @@ class Peer:
         if self.revocations.refuses(holder, agent.public_raw if agent else None, None):
             return None  # a revoked agent takes nothing, even locally
         space_id = space_id_local(f"{self.group}/{space}")
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline and self._running:  # a reconnect in progress is not a reason to stop
+        deadline = self.time.monotonic() + timeout_seconds
+        while self.time.monotonic() < deadline and self._running:  # a reconnect in progress is not a reason to stop
             self.pull_space_paced(space, settle_seconds)
             seen = self.fold_count
             now_ms = self._now_ms()
@@ -2284,7 +3306,7 @@ class Peer:
                     f"space:{space}", f"c:{entry_id}:{claim['stamp']}", 6,
                     wire.claim_delta(entry_id, signed)))
                 claimed = True
-                time.sleep(settle_seconds)  # the settle window: a competing claim folds within it
+                self.time.sleep(settle_seconds)  # the settle window: a competing claim folds within it
                 self.pull_space_paced(space, settle_seconds)
                 self.await_fold(min(settle_seconds, TAKE_FOLLOW_UP_MAX_MILLIS / 1000))
                 winner = self._claim_of(entry_id)
@@ -2301,8 +3323,118 @@ class Peer:
             if not claimed:
                 # Nothing to claim: sleep until a fold (an entry, a lapsed claim's
                 # successor) or the end of this settle window, not a fixed 300 ms.
-                self.await_fold(min(settle_seconds, deadline - time.monotonic()), since=seen)
+                self.await_fold(min(settle_seconds, deadline - self.time.monotonic()), since=seen)
         return None
+
+    # ------------------------------------------------- the settle guarantee's second rule
+
+    def _note_completed(self, space: str, entry_id: str, proof: dict) -> None:
+        """Remembers that this peer completed an entry with its own work under ``proof`` (Java's
+        ``completedHere``), so a better claim that displaces it afterwards makes this peer offer
+        its claim again (SPEC v0.1.36 §7.4). Bounded at REOFFER_LINES_CAP, the oldest first."""
+        claim = proof["claim"]
+        with self._reoffer_lock:
+            self._completed_here.pop(entry_id, None)
+            self._completed_here[entry_id] = (space, str(claim["holder"]), int(claim["epoch"]))
+            while len(self._completed_here) > REOFFER_LINES_CAP:
+                del self._completed_here[next(iter(self._completed_here))]
+
+    def _note_displaced(self, entry_id: str, kept: dict, lost: dict) -> None:
+        """The losing side of the second rule (SPEC v0.1.36 §7.4; Java's ``noteDisplaced``): when a
+        better claim displaces the claim this peer completed the entry under, the holder of the
+        better claim cannot authenticate that completion, which anti-entropy now carries under the
+        better claim alone. This peer offers its displaced claim again, at once and with backoff
+        (``_offer_displaced``), so that holder pairs it with the completion and does not do the work
+        again. A renewal by the same holder displaces nobody."""
+        kept_claim, lost_claim = kept["claim"], lost["claim"]
+        if kept is lost or kept_claim.get("holder") == lost_claim.get("holder"):
+            return
+        holder = str(lost_claim.get("holder"))
+        mine = self.identity.peer_id + "/"
+        with self._reoffer_lock:
+            if holder.startswith(mine) and not str(kept_claim.get("holder")).startswith(mine) \
+                    and entry_id not in self._displaced_held:
+                # The claim made here that this peer first lost on the entry, whether or not it completed
+                # under it (Java's ``displacedHere``): what a relayed DIGEST draws (owner decision 1).
+                self._displaced_held[entry_id] = lost
+                while len(self._displaced_held) > REOFFER_LINES_CAP:
+                    del self._displaced_held[next(iter(self._displaced_held))]
+            done = self._completed_here.get(entry_id)
+            if (done is None or done[1] != holder or done[2] != int(lost_claim.get("epoch", -1))
+                    or entry_id in self._displaced_own):
+                return
+            self._displaced_own[entry_id] = [lost, 0, self.time.monotonic(), done[0]]
+            while len(self._displaced_own) > REOFFER_LINES_CAP:
+                del self._displaced_own[next(iter(self._displaced_own))]
+        self._offer_displaced()
+
+    def _stale_offered(self, dto: dict) -> None:
+        """A state that shows an entry present, received while this peer's completion of it waits
+        as displaced: the replica it came from has not heard of the completion, so the displaced
+        claim is offered again once its backoff has passed (Java's ``staleOffered``)."""
+        entry_id = (dto.get("record") or {}).get("entryId") or dto.get("entryId")
+        line = self._displaced_own.get(entry_id) if isinstance(entry_id, str) else None
+        if line is not None and self.time.monotonic() >= line[2]:
+            self._offer_displaced()
+
+    def _offer_displaced(self) -> None:
+        """Offers again each displaced claim that is due, as a claim delta, and moves its next offer
+        back: no sooner than 1 s, 2 s, 4 s and so on after the previous one, REOFFER_MAX offers in all.
+        A line goes when its offers are spent, its claim lapsed, its stamp is half the drift ceiling
+        old (past which a replica holding the better claim refuses it as a far-past contest), or
+        this replica no longer holds the entry. Each offer travels under an item id of its own, since
+        a seed that forwarded the first would drop a copy under the same id unread.
+
+        The backoff is a local period, judged on the monotonic clock (owner decision 2026-11-23), so
+        a wall step neither fires every offer at once nor holds them back; the claim's expiry and
+        stamp, which another peer wrote, stay judged on the wall clock."""
+        now = self._now_ms()
+        mono = self.time.monotonic()
+        due = []
+        with self._reoffer_lock:
+            for entry_id, line in list(self._displaced_own.items()):
+                signed, offers, next_ms, space = line
+                if offers >= REOFFER_MAX or self._displaced_gone(entry_id, signed["claim"], now):
+                    del self._displaced_own[entry_id]
+                elif mono >= next_ms:
+                    line[1] = offers + 1
+                    line[2] = mono + (REOFFER_BACKOFF_MS << offers) / 1000
+                    due.append((space, entry_id, signed, offers))
+        for space, entry_id, signed, offers in due:
+            self.displaced_reoffers += 1
+            self._send("RUMOR", wire.rumor_body(
+                f"space:{space}", f"c:{entry_id}:reoffer:{offers}:{now}", 6, wire.claim_delta(entry_id, signed)))
+
+    def _displaced_gone(self, entry_id: str, claim: dict, now: int) -> bool:
+        """Whether a displaced claim of this peer's is past use: lapsed, stamped half the drift ceiling
+        ago (past which a replica holding the better claim refuses it as a far-past contest), or for an
+        entry this replica no longer holds."""
+        try:
+            old = now - wire.hlc_physical(claim["stamp"]) > wire.MAX_HLC_SKEW_MILLIS // 2
+        except (TypeError, ValueError):
+            old = True
+        return int(claim["expiresAtMillis"]) <= now or old or entry_id not in self.states
+
+    def _displaced_in(self, spaces) -> dict:
+        """The claims made here that a better claim displaced, with or without a completion under them, that
+        still live, in ``spaces`` (names): space -> {entry id: signed claim} (Java's ``displacedFor``: each
+        ``displacedHere`` line, then each claim still offered again). Drops the lines past use."""
+        from .identity import space_id_local
+        by_id = {space_id_local(f"{self.group}/{space}"): space for space in spaces}
+        now = self._now_ms()
+        found: dict[str, dict] = {}
+        with self._reoffer_lock:
+            for entry_id, signed in list(self._displaced_held.items()):
+                if self._displaced_gone(entry_id, signed["claim"], now):
+                    del self._displaced_held[entry_id]
+            lines = dict(self._displaced_held)
+            for entry_id, line in self._displaced_own.items():
+                lines.setdefault(entry_id, line[0])
+            for entry_id, signed in lines.items():
+                space = by_id.get(signed["claim"].get("spaceId"))
+                if space is not None:
+                    found.setdefault(space, {})[entry_id] = signed
+        return found
 
     def require_held(self, entry_id: str, agent=None, holder: str | None = None, epoch: int | None = None) -> None:
         """Raises ValueError unless this replica's live claim on the entry is still the
@@ -2345,6 +3477,8 @@ class Peer:
             dto = wire.sign_state(dto, self.identity, agent, self._now_ms())
             self.states[entry_id] = dto
         proof = self.claims.get(entry_id)
+        if proof is not None:
+            self._note_completed(space, entry_id, proof)
         self._send("RUMOR", wire.rumor_body(
             f"space:{space}", f"d:{entry_id}", 6,
             cbor.dumps({"state": dto,
@@ -2511,6 +3645,35 @@ def present(dto: dict) -> bool:
     removed = {(dot.get("replica"), dot.get("counter")) for dot in dto.get("removes") or [] if isinstance(dot, dict)}
     return any((dot.get("replica"), dot.get("counter")) not in removed
                for dot in dto.get("adds") or [] if isinstance(dot, dict))
+
+
+def _dot_keys(dots) -> set:
+    return {(str(d.get("replica", "")), int(d.get("counter", 0))) for d in dots or [] if isinstance(d, dict)}
+
+
+def _same_state(a: dict, b: dict) -> bool:
+    """Whether two states of one entry hold the same CRDT content: dots, lease and completion."""
+    return (_dot_keys(a.get("adds")) == _dot_keys(b.get("adds"))
+            and _dot_keys(a.get("removes")) == _dot_keys(b.get("removes"))
+            and a.get("leaseStamp") == b.get("leaseStamp") and a.get("leaseValue") == b.get("leaseValue")
+            and bool(a.get("completed")) == bool(b.get("completed")))
+
+
+def _advances_state(a: dict, b: dict) -> bool:
+    """Whether ``a`` is at least as advanced as ``b``: completed first, then more removes, then the
+    later lease stamp, then at least as many adds (the TypeScript client's ``advancesState``)."""
+    if bool(a.get("completed")) != bool(b.get("completed")):
+        return bool(a.get("completed"))
+    removes_a, removes_b = len(_dot_keys(a.get("removes"))), len(_dot_keys(b.get("removes")))
+    if removes_a != removes_b:
+        return removes_a > removes_b
+    try:
+        stamp_a, stamp_b = wire.hlc_tuple(a.get("leaseStamp")), wire.hlc_tuple(b.get("leaseStamp"))
+    except ValueError:
+        stamp_a = stamp_b = None
+    if stamp_a != stamp_b:
+        return stamp_a > stamp_b
+    return len(_dot_keys(a.get("adds"))) >= len(_dot_keys(b.get("adds")))
 
 
 def _union_dots(a, b) -> list:

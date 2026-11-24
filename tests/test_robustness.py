@@ -156,15 +156,18 @@ def test_a_lost_socket_is_reconnected_and_the_peer_reintroduces_and_repulls():
         peer.connect("127.0.0.1", seed.port)
         peer.pull_space("work")
         deadline = time.time() + 5
-        while time.time() < deadline and len(seed.frames) < 3:
+        while time.time() < deadline and len(seed.frames) < 4:
             time.sleep(0.05)
-        assert [k for i, k in seed.frames if i == 0] == ["RUMOR", "DIGEST", "DIGEST"]
+        # A tcp link also asks its seed with a PING, whose addressed ACK names the seed for relay.via
+        # (SPEC v0.1.36 §5.2, the targeted relay); this fake seed never answers it.
+        assert [k for i, k in seed.frames if i == 0 and k != "PING"] == ["RUMOR", "DIGEST", "DIGEST"]
+        assert [k for i, k in seed.frames if i == 0].count("PING") == 1
         # The seed drops the link: a network hiccup from the peer's point of view.
         seed.connections[0].close()
         deadline = time.time() + 5
-        while time.time() < deadline and len([1 for i, _ in seed.frames if i == 1]) < 3:
+        while time.time() < deadline and len([1 for i, _ in seed.frames if i == 1]) < 4:
             time.sleep(0.05)
-        second = [k for i, k in seed.frames if i == 1]
+        second = [k for i, k in seed.frames if i == 1 and k != "PING"]
         assert second[:3] == ["RUMOR", "DIGEST", "DIGEST"], "re-introduced, revocations and the space pulled again"
         assert peer.reconnects == 1
         assert peer.connected

@@ -10,7 +10,7 @@ canonical bytes under a key hashing to its `issuer` (and requires the pinned
 exactly its canonical JSON with its signature and key in padded standard
 base64, selects the group, verifies the founding
 advertisement with the same four checks `join_by_group_id` applies, and dials
-the group's `tcp` seeds in priority order. The verified founding is kept on
+the group's `tcp` and `tls` seeds in the document's order, 250 ms apart, the first to answer winning. The verified founding is kept on
 `peer.founding` and the founder is known for revocations.
 
 ```python
@@ -33,9 +33,11 @@ When the budget runs out the call raises `BootstrapTimeout`, a `TimeoutError`
 (so an `OSError`), whose message carries the number of fetches, the seeds
 dialed and how many connected, and the last error.
 
-`connect_any(seeds)` dials `(host, port)` pairs in order until one accepts
-(a hostname is resolved to every address, each a seed) and remembers them
-all: a lost socket fails over to the next seed inside the reconnect window,
+`connect_any(seeds)` dials `(host, port)` pairs in list order, 250 ms apart
+(RFC 8305), and links to the first that answers. A refused dial starts the next
+at once, so a dead seed costs at most the 250 ms stagger, not its connect
+timeout (owner decision 2026-11-23). A dial that answers after the winner is closed. A hostname is resolved to every address,
+each a seed. It remembers them all: a lost socket fails over to another seed,
 and a bootstrapped peer re-fetches the document once when the window would
 expire with nothing reachable. `connect(host, port)` is unchanged underneath.
 

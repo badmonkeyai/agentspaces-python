@@ -854,12 +854,14 @@ def agent_card(group: str, identity: Identity, local_name: str, issued_iso: str,
                ttl_iso: str, description: str, goals: list, consumes: list,
                produces: list, cost_hints: dict, space_bindings: dict,
                agent_public_raw: bytes | None = None, actions: list | None = None,
-               agent_certificate: dict | None = None, ui: dict | None = None) -> dict:
+               agent_certificate: dict | None = None, ui: dict | None = None,
+               threads: list | None = None) -> dict:
     """An AgentCard in Java field order: id, issuer, group, issued, ttl,
     agent, description, goals, consumes, produces, costHints, spaceBindings,
     then the appended agentPublicKey, actions (v0.1.13, item 6),
-    agentCertificate (v0.1.13), and ui (v0.1.26, what the agent can show), each
-    omitted when absent so earlier cards keep their bytes. A certificate must
+    agentCertificate (v0.1.13), ui (v0.1.26, what the agent can show), and
+    threads (v0.1.38, the conversations it answers, each a ``chat_thread``), each
+    omitted when absent or empty so earlier cards keep their bytes. A certificate must
     certify ``agent_public_raw`` for this agent."""
     agent = identity.agent(local_name)
     card = {"id": f"aspace://{group}/agent/{agent}", "issuer": identity.peer_id,
@@ -879,7 +881,38 @@ def agent_card(group: str, identity: Identity, local_name: str, issued_iso: str,
         card["agentCertificate"] = agent_certificate
     if ui is not None:
         card["ui"] = ui
+    if threads:
+        card["threads"] = chat_threads(threads)
     return card
+
+
+#: The scopes of a ChatThread (SPEC §6.1, v0.1.38): ``exact`` takes the thread the key names,
+#: ``tree`` it and every ``key:<sub>`` thread under it, ``all`` every thread of the space.
+CHAT_THREAD_SCOPES = ("exact", "tree", "all")
+CHAT_THREAD_MAX_SPACE = 128
+CHAT_THREAD_MAX_KEY = 128
+#: The most threads an AgentCard names.
+AGENT_CARD_MAX_THREADS = 16
+
+
+def chat_thread(space: str, key: str = "", scope: str = "exact") -> dict:
+    """A ChatThread in Java field order (SPEC §6.1, v0.1.38): space, key, scope. The space is
+    1 to 128 characters with no white space; the key is empty exactly when the scope is
+    ``all``, otherwise 1 to 128 characters with no white space. ``ValueError`` otherwise."""
+    return _require({"space": space, "key": key, "scope": scope}, "ChatThread")
+
+
+def chat_threads(threads) -> list | None:
+    """An AgentCard's ``threads`` as the issuer writes them: at most 16, all distinct, and an
+    empty list absent so the card keeps its earlier bytes. ``ValueError`` otherwise."""
+    threads = [dict(t) for t in threads or ()]
+    if not threads:
+        return None
+    for thread in threads:
+        _require(thread, "ChatThread")
+    if not records.threads_hold(threads):
+        raise ValueError(f"a card names at most {AGENT_CARD_MAX_THREADS} threads, all distinct")
+    return threads
 
 
 def ui_declaration(components: list, reads: list | None = None, writes: list | None = None,
@@ -934,7 +967,7 @@ _APP_CARD_FIELDS = ("id", "issuer", "group", "issued", "ttl", "name", "kind", "s
                     "idpClient", "url", "pkg", "version", "views", "ui", "host", "origin", "formats", "spill")
 _AGENT_CARD_FIELDS = ("id", "issuer", "group", "issued", "ttl", "agent", "description", "goals", "consumes",
                       "produces", "costHints", "spaceBindings", "agentPublicKey", "actions", "agentCertificate",
-                      "ui", "spill")
+                      "ui", "spill", "threads")
 
 
 def _require(value: dict, record: str) -> dict:

@@ -50,6 +50,8 @@ WireCodec.Signed { envelope: Envelope, senderPublicKey: bytes, signature: bytes 
 Envelope { ver: int, group: GroupId, kind: enum Kind[PING,PING_REQ,ACK,RUMOR,DIGEST,PULL_RESP,QUERY,QUERY_HIT,BLOCK_WANT,BLOCK,PIPE_DATA,BATCH,HAVE,GRAFT,PRUNE,RELAY_FRAME,CHANNEL_HELLO,SESSION_HELLO,GROUP_AD_WANT,GROUP_AD], from: PeerId, to: PeerId, stamp: HlcTimestamp, body: bytes }
 Bodies.Ping { nonce: long, root: bytes ?null, hashes: map<String,bytes> ?null, have: list<Bodies.HaveItem> ?null }
 Bodies.Rumor { streamId: String, itemId: String, hopsRemaining: int, payload: bytes }
+Bodies.Digest { digests: map<String,bytes>, hashes: map<String,bytes> ?null, want: list<String> ?null, tree: map<String,list<Bodies.TreeNode>> ?null, ids: map<String,list<EntryId>> ?null, budget: Long ?null, sketch: map<String,bytes> ?null }
+Bodies.TreeNode { path: bytes, count: Long ?null, nodes: bytes ?null, lines: String ?null }
 Bodies.PullResp { deltas: map<String,bytes>, remainder: map<String,Long> ?null }
 Bodies.RelayFrame { target: PeerId, frame: bytes, path: list<PeerId> ?null, hop: Integer ?null }
 Bodies.HaveItem { streamId: String, hash: bytes }
@@ -62,7 +64,8 @@ SignedGroupAdvertisement { advertisement: GroupAdvertisement, founderPublicKey: 
 RevocationRegistry.SignedRevocation { adBytes: bytes, publicKey: bytes, signature: bytes }
 AdCache.StoredAd { adType: String, adBytes: bytes, publicKey: bytes, signature: bytes }
 AdCache.Delta { ads: list<AdCache.StoredAd> }
-AgentCard { id: String, issuer: PeerId, group: GroupId, issued: Instant, ttl: Duration, agent: AgentId, description: String, goals: list<String>, consumes: list<String>, produces: list<String>, costHints: map<String,String>, spaceBindings: map<String,String>, agentPublicKey: bytes ?null, actions: list<CardAction> ?null, agentCertificate: AgentCertificate ?null, ui: UiDeclaration ?null, spill: CardSpill ?null }
+AgentCard { id: String, issuer: PeerId, group: GroupId, issued: Instant, ttl: Duration, agent: AgentId, description: String, goals: list<String>, consumes: list<String>, produces: list<String>, costHints: map<String,String>, spaceBindings: map<String,String>, agentPublicKey: bytes ?null, actions: list<CardAction> ?null, agentCertificate: AgentCertificate ?null, ui: UiDeclaration ?null, spill: CardSpill ?null, threads: list<ChatThread> ?null }
+ChatThread { space: String, key: String, scope: String }
 AgentCard.Parts { actions: list<CardAction> ?null, ui: UiDeclaration ?null }
 AppCard { id: String, issuer: PeerId, group: GroupId, issued: Instant, ttl: Duration, name: String, kind: String, shape: String, owner: String, reads: list<String>, actions: list<String>, idpClient: String, url: String, pkg: String, version: String, views: list<String>, ui: AppCard.Ui ?null, host: AppCard.Host ?null, origin: AppCard.Origin ?null, formats: list<String> ?null, spill: CardSpill ?null }
 AppCard.Ui { protocol: String, version: String, catalogIds: list<String>, agent: String, transport: String, surfaces: list<String>, components: list<UiDeclaration.Component> ?empty }
@@ -417,11 +420,35 @@ def _app_card_host_holds(v: dict) -> bool:
             and v["signOn"] in wire.APP_CARD_SIGN_ONS and v["status"] in wire.APP_CARD_STATUSES)
 
 
+def _thread_text_holds(text, bound: int) -> bool:
+    """1 to ``bound`` UTF-16 code units and no code point Java's ``Character.isWhitespace`` names."""
+    return 1 <= _units(text) <= bound and not any(_java_whitespace(char) for char in text)
+
+
+def _chat_thread_holds(v: dict) -> bool:
+    """SPEC §6.1 (v0.1.38): a space of 1 to 128 characters with no white space, a closed scope,
+    and a key that is empty exactly when the scope is ``all``, else 1 to 128 characters with no
+    white space."""
+    if not _none_of(v, "space", "key", "scope") or v["scope"] not in wire.CHAT_THREAD_SCOPES:
+        return False
+    if not _thread_text_holds(v["space"], wire.CHAT_THREAD_MAX_SPACE):
+        return False
+    return v["key"] == "" if v["scope"] == "all" else _thread_text_holds(v["key"], wire.CHAT_THREAD_MAX_KEY)
+
+
+def threads_hold(threads: list) -> bool:
+    """An AgentCard's threads: 1 to 16 (an empty list is the absent field, so a card that writes
+    one re-encodes to other bytes and Java refuses it), no thread twice."""
+    distinct = {(t["space"], t["key"], t["scope"]) for t in threads}
+    return 1 <= len(threads) <= wire.AGENT_CARD_MAX_THREADS and len(distinct) == len(threads)
+
+
 def _agent_card_holds(v: dict) -> bool:
-    spill = v.get("spill")
+    spill, threads = v.get("spill"), v.get("threads")
     return _none_of(v, "id", "issuer", "group", "issued", "ttl") and (
         spill is None or (_parts_within(spill["parts"], wire.AGENT_CARD_SPILL_SET)
-                          and v.get("actions") is None and v.get("ui") is None))
+                          and v.get("actions") is None and v.get("ui") is None)) and (
+        threads is None or threads_hold(threads))
 
 
 _INVARIANTS.update({
@@ -432,6 +459,7 @@ _INVARIANTS.update({
     "AppCard.Parts": lambda v: _terms_hold(v["reads"], v["actions"], v["views"]),
     "AgentCard": _agent_card_holds,
     "CardSpill": _spill_holds,
+    "ChatThread": _chat_thread_holds,
     "UiDeclaration.Component": lambda v: v["role"] in wire.UI_ROLES,
 })
 

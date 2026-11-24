@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """The peer's bootstrap paths (SRAD DB-X-01, DB-X-07): connect_any dials seeds
-in order and fails over to the next on a lost socket; bootstrap joins through
+in list order 250 ms apart (RFC 8305) and fails over to another on a lost socket; bootstrap joins through
 a served document; join_invite derives the credential from the golden key,
 carries it under aspace:join, and verifies the founding against the
 delegation's group. The seeds are the fake seed of test_robustness."""
@@ -59,25 +59,30 @@ def _self_ad(seed: FakeSeed) -> dict:
 
 # ------------------------------------------------------------- connect_any
 
-def test_connect_any_dials_in_order_and_fails_over_to_the_next_seed():
+def test_connect_any_dials_the_seeds_staggered_and_fails_over_to_another_seed():
+    """Owner decisions 2026-11-23: the seeds are dialled in list order 250 ms apart and the first to answer
+    wins; the refusing first seed starts the next at once, so it delays nothing. A lost link then fails over
+    to another seed, the one lost tried last. (Under load either live seed may win: a loopback connect that
+    takes longer than the stagger lets the next one start.)"""
     first, second = FakeSeed(), FakeSeed()
     dead = _dead_port()
     peer = Peer(Identity.generate(), "zBootstrap")
     peer.reconnect_interval_s = 0.1
     try:
         chosen = peer.connect_any([("127.0.0.1", dead), ("127.0.0.1", first.port), ("127.0.0.1", second.port)])
-        assert chosen == ("127.0.0.1", first.port, "tcp") == peer._seed
-        assert chosen.host == "127.0.0.1" and chosen.scheme == "tcp"
-        _wait(lambda: len(first.frames) >= 2)
-        assert [k for _, k in first.frames][:2] == ["RUMOR", "DIGEST"]
-        assert second.frames == []
-        # The first seed drops the link: the peer fails over to the next, not back to the first.
-        first.connections[0].close()
-        _wait(lambda: len(second.frames) >= 2)
-        assert [k for _, k in second.frames][:2] == ["RUMOR", "DIGEST"], "re-introduced at the next seed"
-        assert peer._seed == ("127.0.0.1", second.port, "tcp")
+        assert chosen == peer._seed and chosen.host == "127.0.0.1" and chosen.scheme == "tcp"
+        won, other = (first, second) if chosen.port == first.port else (second, first)
+        assert chosen.port == won.port
+        _wait(lambda: len(won.frames) >= 2)
+        assert [k for _, k in won.frames][:2] == ["RUMOR", "DIGEST"]
+        assert other.frames == [], "the seed that answered later was closed with nothing sent"
+        # The seed linked to drops the link: the peer fails over to the other, not back to the first.
+        won.connections[0].close()
+        _wait(lambda: len(other.frames) >= 2)
+        assert [k for _, k in other.frames][:2] == ["RUMOR", "DIGEST"], "re-introduced at the other seed"
+        assert peer._seed == ("127.0.0.1", other.port, "tcp")
         assert peer.reconnects == 1
-        assert len(first.connections) == 1
+        assert len(won.connections) == 1, "the seed lost is tried last, and the other answered first"
         assert peer.connected
     finally:
         peer.close()
@@ -96,7 +101,8 @@ def test_connect_any_raises_when_no_seed_accepts_and_tries_each_once(monkeypatch
     peer = Peer(Identity.generate(), "zBootstrap")
     with pytest.raises(OSError):
         peer.connect_any([("127.0.0.1", 1), ("127.0.0.1", 2), ("127.0.0.1", 1)])
-    assert dialed == [("127.0.0.1", 1), ("127.0.0.1", 2)], "in order, duplicates folded"
+    assert dialed == [("127.0.0.1", 1), ("127.0.0.1", 2)], \
+        "each once, in list order (a refusal starts the next at once), duplicates folded"
     assert not peer.connected
     with pytest.raises(OSError):
         peer.connect_any([])

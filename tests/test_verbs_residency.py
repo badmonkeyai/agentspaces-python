@@ -53,7 +53,7 @@ class CapturingPeer(Peer):
     def _send(self, kind, body, to=None):
         self.sent.append((kind, body))
 
-    def pull_revocations(self):
+    def pull_revocations(self, fresh_view=False):
         pass
 
     def digests(self) -> int:

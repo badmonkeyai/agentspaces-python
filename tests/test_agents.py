@@ -225,7 +225,23 @@ def test_a_pull_names_the_revocation_streams_and_a_join_pulls_them_once():
         peer.close()
         server.close()
     digests = [cbor.loads(body)["digests"] for kind, body in sent if kind == "DIGEST"]
-    assert digests == [{"revocations": b"", "credential-revocations": b""}]
+    # The membership view rides along (SPEC 5.2, v0.1.21), naming the members held: this peer alone.
+    assert digests == [{"revocations": b"", "credential-revocations": b"",
+                        "view": f"{peer.identity.peer_id}\n".encode()}]
+
+
+def test_a_join_learns_from_the_view_pull_a_member_that_joined_before_it():
+    """The mixed idle run of 2026-11-23: a dial-only member that joined earlier refreshes its card
+    to its seed alone, so a later joiner holds it only from the seed's answer to the view pull."""
+    clock = Clock(T0)
+    earlier = Identity.generate()
+    receiver = _peer(clock)
+    ad = wire.peer_advertisement(GROUP, earlier, instant_iso(clock.millis), "PT10M", {})
+    resp = cbor.dumps({"deltas": {"view": cbor.dumps([wire.signed_peer_ad(ad, earlier)])}})
+    receiver._handle({"kind": "PULL_RESP", "body": resp, "from": "zSeed",
+                      "stamp": wire.hlc_now(earlier.peer_id, clock.millis)})
+    assert receiver.members.get(earlier.peer_id, {}).get("issuer") == earlier.peer_id
+    assert receiver.view_digest().decode().split() == sorted([earlier.peer_id, receiver.identity.peer_id])
 
 
 def test_a_pull_response_carrying_a_credential_revocation_applies_it():
@@ -390,3 +406,33 @@ def test_the_peer_refuses_and_counts_a_state_whose_signed_at_is_not_a_stamp_with
     # merge point refuses the verified state and counts it.
     assert receiver.states == {}
     assert receiver.stamps_logical_refused == 1
+
+
+def test_a_linked_peer_reissues_its_card_and_repulls_the_cards_ending_soon():
+    """The mixed idle run of 2026-11-23: a Java member slept 60 s dropped the dial-only members that
+    re-issued no card, and admits a member again only on a card issued after the drop; and every card
+    a dial-only peer held of a member that refreshes only over its own links lapsed at 10 minutes. A
+    linked peer re-issues its card every SELF_AD_REFRESH_S and pulls the view naming only the cards
+    that do not end within VIEW_REFRESH_MARGIN_MS, so the seed sends the current card of the rest."""
+    import threading as _threading
+    from agentspaces import peer as peer_module
+    clock = Clock(T0)
+    peer = _peer(clock)
+    sent = _capture(peer)
+    peer._socket, peer._running, peer._closed = object(), True, False
+    ending, fresh = Identity.generate(), Identity.generate()
+    old = wire.peer_advertisement(GROUP, ending, instant_iso(T0 - 500_000), "PT10M", {})
+    new = wire.peer_advertisement(GROUP, fresh, instant_iso(T0), "PT10M", {})
+    peer.members[ending.peer_id], peer.members[fresh.peer_id] = old, new
+    peer._judge_refresh()
+    for thread in _threading.enumerate():
+        if thread.name == "agentspaces-refresh":
+            thread.join(5)
+    assert [kind for kind, _ in sent] == ["RUMOR", "DIGEST"]
+    named = cbor.loads(sent[1][1])["digests"]["view"].decode().split()
+    assert named == sorted([fresh.peer_id, peer.identity.peer_id]), "the card ending soon is asked for anew"
+    assert (peer.self_ad_refreshes, peer.view_pulls) == (1, 1)
+    sent.clear()
+    peer._judge_refresh()  # neither is due again yet
+    assert sent == []
+    assert peer_module.SELF_AD_REFRESH_S == 60.0 and peer_module.VIEW_REFRESH_MARGIN_MS == 180_000

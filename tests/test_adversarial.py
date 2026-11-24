@@ -205,8 +205,9 @@ def test_hostile_certified_claims_never_enter_the_lattice(name):
 
 
 # The annex I.6 refusal vectors (SPEC v0.1.35, I.8). Java refuses each for the one form rule
-# it breaks. This client audits nothing (no wire.ae=2): it reads no DIGEST at all (RE-L-03 keeps
-# it so), and a sender writes these fields only toward a card that carries wire.ae=2, so the
+# it breaks. This client audits nothing (no wire.ae=2): it reads only its seed's text round, which
+# carries none of these fields (round 2a, 2026-11-23), and ignores every other DIGEST; a sender
+# writes these fields only toward a card that carries wire.ae=2, so the
 # verdicts below are the right ones, not a gap. Its Bodies.PullResp reads ``remainder`` since
 # phase 8, the answer to the budget it names toward a seed on wire.ae=2 (RE-L-03).
 ANNEX_I6_DIGEST_REFUSALS = [
@@ -229,8 +230,9 @@ def _from(sender: Identity, kind: str, body: bytes) -> dict:
 
 
 def test_a_peer_ignores_every_digest_whatever_its_annex_i6_body():
-    # No body record exists for DIGEST here, so a verified DIGEST frame is counted as an
-    # ignored kind before anything decodes its body, hostile or honest, and changes nothing.
+    # DIGEST has no entry in the generic body table: the peer acts only on its seed's text round
+    # (an unrelayed DIGEST from the seed with no annex I.6 field), so a verified DIGEST like these
+    # is counted as an ignored kind, hostile or honest, and changes nothing.
     assert "DIGEST" not in wire.BODY_RECORDS
     peer, sender = _peer(), Identity.generate()
     for name in ANNEX_I6_DIGEST_REFUSALS:

@@ -16,7 +16,13 @@ bind, as decorators, dataclasses, and plain functions
 (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in_`, `contains`, `is_null`,
 `not_null`, or any callable) over fields and tags; `watch` delivers
 `WRITTEN`, `TAKEN`, and `COMPLETED` once per entry; `TakeContext.current()`
-is the take a worker runs under.
+is the take a worker runs under. Its `renew()` renews only while the binder
+would: once the agent is unbound, or a wake found the take's lease lapsed
+(`taken.late`), it renews nothing and returns `False`. A take has lapsed when
+its claim is no longer this peer's (another completed or withdrew the entry
+included) or its lease has expired, and a result
+that arrives after the lapse is written nowhere and counted in
+`bound.late_takes`.
 
 ```python
 from agentspaces.space import Space, Template, entry, gte
@@ -145,7 +151,7 @@ stops signing every frame toward it, and it accepts the bare frames that
 follow from exactly the attested sender (`peer.attested_frames`); it keeps
 signing what it sends. Seeds are `Seed(host, port, scheme)` tuples
 (`agentspaces/seed.py`), and `connect_any`, `bootstrap`, and `join_invite`
-dial `tcp` and `tls` seeds in priority order. `tests/test_tls.py` pins the
+dial `tcp` and `tls` seeds in list order, 250 ms apart, the first to answer winning. `tests/test_tls.py` pins the
 binding against a Python TLS seed, and `CouncilCrossLanguageTest` runs this
 worker over `tls://` against a Java council that requires attestation. No
 session resumption and no early data, so every attestation rests on a full

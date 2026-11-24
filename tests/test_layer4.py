@@ -92,7 +92,7 @@ class NetPeer(Peer):
     def pull_space(self, space):
         pass
 
-    def pull_revocations(self):
+    def pull_revocations(self, fresh_view=False):
         pass
 
 
