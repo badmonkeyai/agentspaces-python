@@ -18,10 +18,13 @@ task space and awaiting the correlated result."""
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 from ..space import Space, Template, to_payload
+from ..timesource import SYSTEM
+
+#: How often, at most, an invoke pulls the result space while it waits: the take's settle window.
+PULL_EVERY_S = 0.6
 
 
 @dataclass(frozen=True)
@@ -79,14 +82,21 @@ def invoke(peer, action: RemoteAction, value, result_type=None, timeout_seconds:
     input_payload = to_payload(value)
     baseline = {e.entry_id for e in results.entries(template, 1_000)}
     task_space.write(value, lease=lease)
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
+    # A local period on the peer's monotonic clock, woken by each fold and pulling the result space
+    # at most once per settle window (SPEC v0.1.36 §9.5; JS-V-02), where it polled every 100 ms on
+    # the wall clock and pulled on every poll.
+    source = getattr(peer, "time", SYSTEM)
+    deadline = source.monotonic() + timeout_seconds
+    while True:
+        seen = peer.fold_count
         for e in results.entries(template, 1_000):
             if e.entry_id in baseline:
                 continue
             payload = to_payload(e.value) if not isinstance(e.value, dict) else e.value
             if shared_fields(input_payload, payload):
                 return e.value
-        peer.pull_space(results.name)
-        time.sleep(0.1)
-    return None
+        remaining = deadline - source.monotonic()
+        if remaining <= 0:
+            return None
+        peer.pull_space_paced(results.name, PULL_EVERY_S)
+        peer.await_fold(min(PULL_EVERY_S, remaining), since=seen)

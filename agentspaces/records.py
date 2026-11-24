@@ -50,6 +50,8 @@ WireCodec.Signed { envelope: Envelope, senderPublicKey: bytes, signature: bytes 
 Envelope { ver: int, group: GroupId, kind: enum Kind[PING,PING_REQ,ACK,RUMOR,DIGEST,PULL_RESP,QUERY,QUERY_HIT,BLOCK_WANT,BLOCK,PIPE_DATA,BATCH,HAVE,GRAFT,PRUNE,RELAY_FRAME,CHANNEL_HELLO,SESSION_HELLO,GROUP_AD_WANT,GROUP_AD], from: PeerId, to: PeerId, stamp: HlcTimestamp, body: bytes }
 Bodies.Ping { nonce: long, root: bytes ?null, hashes: map<String,bytes> ?null, have: list<Bodies.HaveItem> ?null }
 Bodies.Rumor { streamId: String, itemId: String, hopsRemaining: int, payload: bytes }
+Bodies.Digest { digests: map<String,bytes>, hashes: map<String,bytes> ?null, want: list<String> ?null, tree: map<String,list<Bodies.TreeNode>> ?null, ids: map<String,list<EntryId>> ?null, budget: Long ?null, sketch: map<String,bytes> ?null }
+Bodies.TreeNode { path: bytes, count: Long ?null, nodes: bytes ?null, lines: String ?null }
 Bodies.PullResp { deltas: map<String,bytes>, remainder: map<String,Long> ?null }
 Bodies.RelayFrame { target: PeerId, frame: bytes, path: list<PeerId> ?null, hop: Integer ?null }
 Bodies.HaveItem { streamId: String, hash: bytes }

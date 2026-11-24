@@ -1384,12 +1384,19 @@ class Pdt:
         self._running = True
 
         def loop():
-            while self._running and getattr(self.peer, "connected", True):
+            # Until stopped or the peer's close; a peer between links is not closed, so the loop
+            # outlives a seed's blip (before v0.1.36 a lost socket ended it for good). Paced on
+            # the peer's time source at deadlines that do not drift with the tick's own cost.
+            from ..timesource import SYSTEM
+            source = getattr(self.peer, "time", SYSTEM)
+            due = source.monotonic()
+            while self._running and not getattr(self.peer, "_closed", False):
                 try:
                     self.tick()
                 except Exception:
                     pass
-                time.sleep(interval_s)
+                due = max(due + interval_s, source.monotonic())
+                source.sleep(max(0.0, due - source.monotonic()))
 
         self._thread = threading.Thread(target=loop, name="pdt-tick", daemon=True)
         self._thread.start()

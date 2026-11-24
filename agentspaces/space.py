@@ -37,11 +37,11 @@ import dataclasses
 import re
 from decimal import Decimal
 import threading
-import time
 from typing import Any, Callable
 
 from . import cbor
 from .peer import lease_of, present
+from .timesource import SYSTEM
 
 # ----------------------------------------------------------------- durations
 
@@ -327,6 +327,14 @@ class Subscription:
     def lapsed(self, now_ms: int) -> bool:
         return self._expires_ms is not None and self._expires_ms <= now_ms
 
+    def _shift(self, step_ms: int) -> None:
+        """Moves the lease by a step of the wall clock the peer judged (SPEC v0.1.36 §9.5): a
+        subscription's lease is a local period, so a suspend or an NTP step neither lapses it at
+        once nor keeps it past its length."""
+        with self._space._lock:
+            if self._expires_ms is not None:
+                self._expires_ms += int(step_ms)
+
     def on_close(self, listener: Callable[[str], None]) -> None:
         """Calls ``listener(reason)`` once, when the subscription closes."""
         self._on_close.append(listener)
@@ -366,6 +374,28 @@ class Taken:
         self.holder = space.agent.agent_id if space.agent is not None else space.peer.identity.agent(space.agent_name)
         claim = space.peer._claim_of(entry_id) or {}
         self.epoch = int(claim["epoch"]) if claim.get("holder") == self.holder and "epoch" in claim else None
+        # The binder's end (the core's I-05 fix, DRIFT-FROM-PHASE6 item 11): a binder running a handler
+        # under this take sets whether it would still renew it (its agent still bound), so a handler or a
+        # library renewing from inside it (a model stream's keepalive) cannot hold the entry past the
+        # unbind. None: no binder, always renewable.
+        self._renewable: Callable[[], bool] | None = None
+        #: Set when a wake or a wall step found the take's wall-time lease lapsed (owner decision C05,
+        #: 2026-11-23): another worker may hold the entry now, so the take renews no more and its
+        #: completion is refused as late, whatever the wall clock says after (a step back included).
+        self.late = False
+
+    def recheck(self) -> bool:
+        """Judges the hold again on the wall clock, as a wake or a wall step asks (owner decision C05):
+        a take whose lease lapsed, or that a better claim displaced, is marked ``late``. Returns
+        whether the take still holds."""
+        if self.late:
+            return False
+        try:
+            self.space.peer.require_held(self.entry_id, agent=self.space.agent, holder=self.holder,
+                                         epoch=self.epoch)
+        except ValueError:
+            self.late = True
+        return not self.late
 
     def complete(self, result=None, lease="1h", tags: dict | None = None, result_space: "Space | None" = None) -> str | None:
         """Completes the take, writing ``result`` first (into the take space,
@@ -373,7 +403,10 @@ class Taken:
         completion. Returns the result's entry id. Raises ValueError, writing
         nothing, when the take no longer holds the entry: its lease lapsed, or a
         better claim that reached this replica after the settle window displaced
-        it, or the entry completed meanwhile (SPEC §7.4, the settle guarantee)."""
+        it, or the entry completed meanwhile (SPEC §7.4, the settle guarantee), or a wake found
+        its lease lapsed (``late``)."""
+        if self.late:
+            raise ValueError(f"{self.entry_id} is not held here: its take lease lapsed while this peer slept")
         self.space.peer.require_held(self.entry_id, agent=self.space.agent, holder=self.holder, epoch=self.epoch)
         if not present(self.space.peer.states.get(self.entry_id) or {}):
             raise ValueError(f"{self.entry_id} is not held here: it is completed or withdrawn")
@@ -390,7 +423,13 @@ class Taken:
         (SPEC §7.2 and §7.4, v0.1.35; matrix P19): the hold runs at least ``lease`` from now
         (the take's lease again when none is given) and never shorter. Raises ValueError when
         the take no longer holds the entry; returns whether the hold moved. To give the entry
-        back sooner, let the take lapse; nothing here shortens it."""
+        back sooner, let the take lapse; nothing here shortens it.
+
+        Under a binder, renews only while the binder would (its agent still bound), as Java's
+        ``TakeContext.renew``: past the unbind, or once a wake found the lease lapsed (``late``), it
+        renews nothing and returns False, so the entry lapses to another taker."""
+        if self.late or (self._renewable is not None and not self._renewable()):
+            return False
         millis = self.lease_millis if lease is None else duration_millis(lease)
         return self.space.peer.renew_take(self.space.name, self.entry_id, millis, agent=self.space.agent,
                                           holder=self.holder, epoch=self.epoch)
@@ -458,6 +497,124 @@ class TakeContext:
         _current_take.reset(token)
 
 
+# ----------------------------------------------------------------- the sweep
+
+#: The longest the sweep waits with nothing due, so a deadline no change announced is still judged
+#: (the backstop of the core's node loop).
+SWEEP_BACKSTOP_S = 30.0
+#: While a WRITTEN waits for its payload, the sweep looks again this often: a payload that lands on
+#: the content swarm announces nothing to the spaces.
+AWAITING_RECHECK_S = 1.0
+#: After a run a change asked for, the sweep runs again no sooner than this: a pull that folds
+#: thousands of states wakes it at most this often, the old tick's pace, never once per fold.
+#: A deadline is never held back by it.
+CHANGE_GAP_S = 0.25
+
+
+class _Sweeper:
+    """The sweep of the spaces over one peer, as due work (SPEC v0.1.36 §9.5, EL-P-08): one thread
+    that runs the tombstone collection (SPEC §7.3) and each space's lapse events (EXPIRED,
+    REAPPEARED, a leased subscription's lapse, a WRITTEN that waited for its payload), then sleeps
+    on the peer's time source until the earliest of those deadlines or a change (a fold, a claim,
+    a payload, a new watch, a wall step), never on a fixed tick. Before v0.1.36 it woke every
+    250 ms. It runs until the peer is closed, through any reconnect gap, and the process watchdog
+    starts it again if it ever dies."""
+
+    def __init__(self, peer):
+        self.peer = peer
+        self._cond = threading.Condition()
+        self._asked = False
+        self._thread: threading.Thread | None = None
+        self.runs = 0
+        self.restarts = 0
+
+    def wake(self) -> None:
+        """A change: the next run comes at once and judges its deadlines again."""
+        with self._cond:
+            self._asked = True
+            self._cond.notify_all()
+
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="agentspaces-sweep", daemon=True)
+        self._thread.start()
+
+    def ensure_alive(self) -> None:
+        if not self.alive() and not getattr(self.peer, "_closed", False):
+            self.restarts += 1
+            self.start()
+
+    def _closed(self) -> bool:
+        return bool(getattr(self.peer, "_closed", False))
+
+    def _loop(self) -> None:
+        source = getattr(self.peer, "time", SYSTEM)
+        while not self._closed():
+            with self._cond:
+                self._asked = False
+            ran = source.monotonic()
+            self.run_once()
+            token = source.token()
+            wait = self.next_wait()
+            armed = source.monotonic() + wait  # the deadline this wait is for
+            if source.token() != token:
+                continue  # a virtual clock moved while the deadline was judged: judge it again
+            with self._cond:
+                # A wait returns on a change, at the deadline, or when a virtual clock moves; only the
+                # first two end it, so moving the clock wakes nothing that is not due.
+                while not self._asked and not self._closed():
+                    token = source.token()
+                    remaining = armed - source.monotonic()
+                    if remaining <= 0:
+                        break
+                    source.wait(self._cond, remaining, token)
+                changed = self._asked
+            if changed:
+                # coalesces a burst of folds; the deadline armed above is not held back
+                pause = min(ran + CHANGE_GAP_S, armed) - source.monotonic()
+                if pause > 0 and not self._closed():
+                    source.sleep(pause)
+
+    def run_once(self) -> None:
+        """One sweep: the collection, then every space's lapses. A fault in one never stops the rest."""
+        self.runs += 1
+        peer = self.peer
+        try:
+            peer._collect_if_due()  # the tombstone collection of SPEC §7.3 rides on the sweep
+        except Exception:  # noqa: BLE001
+            pass
+        for space in list(getattr(peer, "_agentspaces_spaces", ())):
+            try:
+                space._sweep()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def next_wait(self) -> float:
+        """Seconds until the earliest deadline: a space's lapse, the next collection, the payload
+        recheck, or the backstop."""
+        peer = self.peer
+        now_ms = peer._now_ms()
+        due = [SWEEP_BACKSTOP_S]
+        for space in list(getattr(peer, "_agentspaces_spaces", ())):
+            try:
+                if space._awaiting:
+                    due.append(AWAITING_RECHECK_S)
+                at = space._next_due(now_ms)
+            except Exception:  # noqa: BLE001
+                at = None
+            if at is not None:
+                due.append(at)
+        try:
+            collection = peer.next_collection_ms(now_ms) if hasattr(peer, "next_collection_ms") else None
+        except Exception:  # noqa: BLE001
+            collection = None
+        if collection is not None:
+            due.append(max(0.0, (collection - now_ms) / 1000))
+        return max(0.0, min(due))
+
+
 # ----------------------------------------------------------------- the space
 
 class Space:
@@ -511,22 +668,17 @@ class Space:
 
             peer.on_state, peer.on_claim, peer.on_withdrawn = on_state, on_claim, on_withdrawn
 
-            def sweep():
-                # EXPIRED and REAPPEARED are judged by the clock, not by a fold.
-                while getattr(peer, "_running", True):
-                    time.sleep(0.25)
-                    try:
-                        peer._collect_if_due()  # the tombstone collection of SPEC §7.3 rides on this timer
-                    except Exception:
-                        pass
-                    for s in list(peer._agentspaces_spaces):
-                        try:
-                            s._sweep()
-                        except Exception:
-                            pass
-
-            threading.Thread(target=sweep, name="agentspaces-sweep", daemon=True).start()
+            sweeper = _Sweeper(peer)
+            peer._sweeper = sweeper
+            listeners = getattr(peer, "_wall_step_listeners", None)
+            if listeners is not None:
+                listeners.append(lambda step: [sub._shift(step) for sp in list(peer._agentspaces_spaces)
+                                               for *_, sub in list(sp._watchers.values())])
+            sweeper.start()
         peer._agentspaces_spaces.append(self)
+        sweeper = getattr(peer, "_sweeper", None)
+        if sweeper is not None:
+            sweeper.wake()
 
     def _space_id(self) -> str:
         from .identity import space_id_local
@@ -576,13 +728,14 @@ class Space:
         """The first match, waiting up to ``timeout`` for one: the space is pulled
         at most once per ``settle`` window and the wait wakes on a fold (JS-V-02)."""
         settle_seconds = duration_millis(settle) / 1000
-        deadline = time.monotonic() + (duration_millis(timeout) / 1000 if timeout else 0)
+        source = getattr(self.peer, "time", SYSTEM)
+        deadline = source.monotonic() + (duration_millis(timeout) / 1000 if timeout else 0)
         while True:
             seen = self.peer.fold_count
             found = self.entries(template, 1)
             if found:
                 return found[0].value
-            remaining = deadline - time.monotonic()
+            remaining = deadline - source.monotonic()
             if remaining <= 0:
                 return None
             self.peer.pull_space_paced(self.name, settle_seconds)
@@ -628,7 +781,13 @@ class Space:
             self._next_key += 1
             subscription = Subscription(self, key)
             self._watchers[key] = (template, callback, set(), subscription)
+        self._wake_sweep()
         return subscription
+
+    def _wake_sweep(self) -> None:
+        sweeper = getattr(self.peer, "_sweeper", None)
+        if sweeper is not None:
+            sweeper.wake()
 
     def notify(self, template: Template, callback: Callable[[Event], None], lease="1h") -> Subscription:
         """The leased push subscription of the Java space (JS-V-01): events reach
@@ -637,6 +796,7 @@ class Space:
         leaks: the lease ends it."""
         subscription = self.watch(template, callback)
         subscription.renew(lease)
+        self._wake_sweep()  # its lapse is a deadline now
         return subscription
 
     # ---------------------------------------------------------------- events
@@ -651,6 +811,7 @@ class Space:
         if not readable:
             return False  # a referenced payload not here yet, or one outside the encoding
         tags = record.get("tags") or {}
+        self._judge_wall_step()
         now_ms = self.peer._now_ms()
         # one mark for every watch: a watch's mark must not depend on the watches before it
         # (core cancel events, 2026-11-09)
@@ -739,6 +900,35 @@ class Space:
             else:
                 self._written(dto)
 
+    def _judge_wall_step(self) -> None:
+        """A step of the wall clock is judged before any lease is: the subscriptions move with it."""
+        judge = getattr(self.peer, "_judge_wall_step", None)
+        if judge is not None:
+            judge()
+
+    def _next_due(self, now_ms: int) -> float | None:
+        """Seconds until this space's next lapse the sweep raises an event for: an entry's write lease,
+        a claim's, a leased subscription's; 0 for a WRITTEN waiting on its payload (looked at again
+        on the sweep's recheck); None when nothing here is due."""
+        if not self._watchers:
+            return None
+        due = []
+        for _, _, _, subscription in list(self._watchers.values()):
+            if subscription._expires_ms is not None:
+                due.append(subscription._expires_ms)
+        for entry_id, dto in list(self.peer.states.items()):
+            if not self._mine(dto) or not present(dto):
+                continue
+            expiry = int(lease_of(dto).get("expiresAtMillis", 0))
+            if expiry > now_ms:
+                due.append(expiry)
+            claim = self.peer._claim_of(entry_id)
+            if claim and int(claim.get("expiresAtMillis", 0)) > now_ms:
+                due.append(int(claim["expiresAtMillis"]))
+        if not due:
+            return None
+        return max(0.0, (min(due) - now_ms) / 1000)
+
     def _sweep(self) -> None:
         """Closes every leased subscription whose lease lapsed (JS-V-01), then
         delivers EXPIRED once per entry whose write lease lapsed while open,
@@ -746,6 +936,7 @@ class Space:
         if not self._watchers:
             self._awaiting.clear()
             return
+        self._judge_wall_step()
         now = self.peer._now_ms()
         for _, _, _, subscription in list(self._watchers.values()):
             if subscription.lapsed(now):

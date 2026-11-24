@@ -27,6 +27,7 @@ from agentspaces.pdt import tree as tree_module
 from agentspaces.pdt.refs import pref_record
 from agentspaces.peer import Peer
 from agentspaces.space import Space
+from agentspaces.timesource import VirtualTime
 from fleet import Network, NetPeer
 
 GROUP = "zPythonSwarmRetries"
@@ -102,28 +103,36 @@ def test_a_late_head_is_counted_late_and_fetched_again_by_the_tick(monkeypatch):
     assert b.map_ref("late").deref().root() == later.root()
 
 
-def test_reconnect_rounds_back_off_and_go_on_past_the_window():
-    """E5: rounds of seed dials back off from the interval to six times it with a spread, and go on past the old
-    window until the owner closes the peer."""
-    peer = Peer(Identity.generate(), GROUP)
-    peer.reconnect_interval_s = 0.02
-    peer.reconnect_window_s = 0.1
+def test_reconnect_rounds_follow_the_redial_table_and_go_on_past_the_window():
+    """E5, as the owner decided on 2026-11-23: rounds of seed dials wait 5, 10, 20 and 30 s, then 5 s again
+    (the redial table, scaled to reconnect_interval_s), each with a spread of +/-10%, and go on past the old
+    window until the owner closes the peer. On virtual time: no wait is sat out."""
+    vt = VirtualTime()
+    peer = Peer(Identity.generate(), GROUP, time_source=vt)
+    peer.reconnect_window_s = 60.0
     peer._seed = ("127.0.0.1", 9, "tcp")
     peer._running = True
-    dials = []
+    peer._link_since = vt.monotonic() - 600  # a link that held: the first round dials at once
+    dials, waits = [], []
 
     def refused(seed, timeout):
-        dials.append(time.monotonic())
-        if len(dials) >= 8:
+        dials.append(vt.monotonic())
+        if len(dials) >= 9:
             peer._running = False  # the owner closes the peer
         raise OSError("refused")
 
+    def pause(seconds):
+        waits.append(seconds)
+        vt.advance(seconds)
+        return False
+
     peer._dial = refused
+    peer._pause_redial = pause
     assert peer._reconnect() is False
-    assert len(dials) == 8, "the dials went on past the window"
+    assert len(dials) == 9, "the dials went on past the window"
     gaps = [b - a for a, b in zip(dials, dials[1:])]
-    assert gaps[0] >= 0.02 and gaps[2] >= 0.08, gaps
-    assert all(g <= 0.12 * 1.25 + 0.05 for g in gaps), gaps
+    for gap, step in zip(gaps, [5, 10, 20, 30, 5, 10, 20, 30]):
+        assert 0.9 * step - 1e-9 <= gap <= 1.1 * step + 1e-9, gaps
     assert dials[-1] - dials[0] > peer.reconnect_window_s
 
 
@@ -156,6 +165,7 @@ def test_a_seed_that_drops_each_link_at_once_gets_the_backoff_and_no_dial_loop()
     finally:
         peer.close()
         server.close()
+    # the redial table scaled to 0.1 s: 0.1, 0.2, 0.4, 0.6, then 0.1 again, each +/-10%
     assert 2 <= len(dials) <= 8, f"{len(dials)} dials in 1.5 s"
     gaps = [b - a for a, b in zip(dials, dials[1:])]
-    assert all(g >= 0.09 for g in gaps), gaps
+    assert all(g >= 0.085 for g in gaps), gaps

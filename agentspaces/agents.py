@@ -61,13 +61,14 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import threading
-import time
 import typing
 from typing import Any, Callable
 
 from . import vote as votes
 from . import wire
 from .identity import instant_iso
+from .timesource import SYSTEM
+from .ttl import TtlFloor
 from .space import (COMPLETED, Contribution, Event, Motion, Space, TakeContext, Tagged, Template, WRITTEN,
                     duration_millis, from_payload, schema_of, to_payload)
 
@@ -98,6 +99,20 @@ _META = "__agentspaces_binding__"
 # How many held proposals a vote binding reads when it binds (Binder._start_ballot): far past
 # any vote space in practice, and a bound on the work a bind does.
 _BIND_SWEEP_LIMIT = 10_000
+
+# The registered defaults of the TTLs and leases the binder checks against the 60 s floor
+# (agentspaces.ttl): a value equal to its default passes silently; these are the decorators'.
+_CARD_TTL_DEFAULT_MS = 600_000
+_HOUR_MS = 3_600_000
+_TTL_DEFAULTS = {
+    "take": {"lease": 600_000, "result_lease": _HOUR_MS},
+    "notify": {"lease": _HOUR_MS, "result_lease": _HOUR_MS},
+    "ballot": {"lease": _HOUR_MS},
+    "decision": {"result_lease": _HOUR_MS},
+    "propose": {"lease": _HOUR_MS},
+    "join": {"result_lease": _HOUR_MS},
+    "estimate": {"result_lease": _HOUR_MS},
+}
 
 
 def _mark(fn, verb: str, **attrs):
@@ -270,14 +285,28 @@ def propose(space: str, vote: str, options: list, quorum: int, prefix: str = "",
                             description=description, filters=list(filters))
 
 
-def on_estimate(epochs: str = "", ticks: int = 0, tolerance: float = 0.0, result_space: str | None = None,
-                result_lease="1h"):
+#: The span an ``@on_estimate`` with no rule waits, as Java's ``@OnEstimate`` default (``settle = ""``):
+#: eight gossip rounds of one second. ``settle="0s"`` opts into firing on the first estimate.
+ESTIMATE_SETTLE_DEFAULT = "8s"
+
+
+def on_estimate(epochs: str = "", ticks: int | None = None, tolerance: float = 0.0, result_space: str | None = None,
+                result_lease="1h", settle=None):
     """Reacts once per aggregate epoch (by prefix, or every epoch) when its
     estimate has settled under the rule, as ``@OnEstimate`` does; the method
     receives an ``Estimate`` and may return an entry for ``result_space``.
-    Needs a ``Binder(..., aggregate=Aggregate)``."""
+    Needs a ``Binder(..., aggregate=Aggregate)``.
+
+    ``settle`` is how long the estimate must stay unchanged, a duration (``"PT40S"``, ``"40s"``,
+    or seconds), counted in gossip rounds of one second (``ROUND_PERIOD``), as Java's
+    ``@OnEstimate(settle = "PT40S")`` (SPEC v0.1.36 §8). ``ticks`` is the older form, read as that
+    many rounds of one second: ``ticks=40`` and ``settle="40s"`` are the same rule. Name one, or
+    neither for the default of 8 s, as Java's ``settle = ""``; ``settle="0s"`` (or ``ticks=0``)
+    fires on the first estimate present."""
+    if settle is not None and ticks is not None:
+        raise ValueError("@on_estimate names both settle and ticks; choose one")
     return lambda fn: _mark(fn, "estimate", epochs=epochs, ticks=ticks, tolerance=tolerance,
-                            result_space=result_space, result_lease=result_lease)
+                            result_space=result_space, result_lease=result_lease, settle=settle)
 
 
 # ------------------------------------------------------------------ binder
@@ -346,10 +375,70 @@ class Bound:
         self._subscriptions = []
         self._running = True
         self._stopped = threading.Event()  # set on close: a renewal sleeping on it wakes at once
+        # A renewal's wait (``_pause``) also ends on a nudge: the peer's resume after a suspend asks
+        # every renewal of a lease another peer reads to run at once (WD-4 of the core's watchdog).
+        self._cond = threading.Condition()
+        self._nudges = 0
+        # The takes a handler of this agent holds now (``@space_take``), judged again on every wall
+        # step, a wake's included (owner decision C05, 2026-11-23); and the takes found lapsed then.
+        self._held: set = set()
+        self._held_lock = threading.Lock()
+        #: Takes a wake or a wall step found lapsed: their renewals stopped and their results were
+        #: treated as late (not written, not completed).
+        self.late_takes = 0
+
+    def recheck_holds(self, step_ms: int = 0) -> None:
+        """Judges every take a handler holds against its wall-time lease at once, as a wake or a
+        wall step asks (owner decision C05): the hold limit of a Java binder stays on the monotonic
+        clock, since a sleep is no hung handler, but the lease is wall time another peer reads, so a
+        take that lapsed while this peer slept stops renewing and its result is late."""
+        with self._held_lock:
+            held = list(self._held)
+        for taken in held:
+            if not taken.late and not taken.recheck():
+                with self._held_lock:
+                    self.late_takes += 1
+
+    def _hold(self, taken) -> None:
+        with self._held_lock:
+            self._held.add(taken)
+
+    def _release(self, taken) -> None:
+        with self._held_lock:
+            self._held.discard(taken)
+
+    def nudge(self) -> None:
+        """Ends every renewal's current wait, so it renews now."""
+        with self._cond:
+            self._nudges += 1
+            self._cond.notify_all()
+
+    def _pause(self, seconds: float) -> bool:
+        """Waits ``seconds`` on the peer's time source, or until the unbind or a nudge; returns
+        whether the agent was unbound."""
+        source = getattr(self.binder.peer, "time", SYSTEM)
+        with self._cond:
+            seen = self._nudges
+            deadline = source.monotonic() + max(0.0, seconds)
+            while not self._stopped.is_set() and self._nudges == seen:
+                token = source.token()
+                remaining = deadline - source.monotonic()
+                if remaining <= 0:
+                    break
+                source.wait(self._cond, remaining, token)
+        return self._stopped.is_set()
 
     def close(self) -> None:
         self._running = False
         self._stopped.set()
+        with self._cond:
+            self._cond.notify_all()
+        listeners = getattr(self.binder.peer, "_resume_listeners", None)
+        if listeners is not None and self.nudge in listeners:
+            listeners.remove(self.nudge)
+        steps = getattr(self.binder.peer, "_wall_step_listeners", None)
+        if steps is not None and self.recheck_holds in steps:
+            steps.remove(self.recheck_holds)
         for s in self._subscriptions:
             s.close()
         for t in self._threads:
@@ -374,7 +463,8 @@ class Binder:
 
     def __init__(self, peer, agent=None, agent_name: str = "python", publish_card: bool = True,
                  card_ttl: str = "PT10M", aggregate=None, vote_space: str | None = None,
-                 data_use_type: str | None = None, data_use_space: str = DATA_USE_SPACE):
+                 data_use_type: str | None = None, data_use_space: str = DATA_USE_SPACE,
+                 ttl_floor: TtlFloor | None = None):
         self.peer = peer
         self.agent = agent
         self.agent_name = agent_name
@@ -386,6 +476,25 @@ class Binder:
         self.data_use_space = data_use_space
         self._spaces: dict[str, Space] = {}
         self._bids: dict[str, Callable] = {}
+        # SPEC v0.1.36 §9.5 (EL-E-03): the TTLs and leases this binder is configured with, against the
+        # 60 s floor; warns by default, refuses under TtlFloor(strict=True).
+        self.ttl_floor = ttl_floor if ttl_floor is not None else TtlFloor()
+        self.ttl_floor.check("binder.card-ttl", duration_millis(card_ttl), _CARD_TTL_DEFAULT_MS)
+
+    @property
+    def _time(self):
+        return getattr(self.peer, "time", SYSTEM)
+
+    def _running(self, bound: "Bound") -> bool:
+        """Whether a binding's loop goes on: while it is bound and its peer is not closed. A peer
+        between links (a reconnect in progress) is not closed, so a worker outlives a seed's blip
+        (before v0.1.36 a lost socket ended every take loop and aggregate round for good)."""
+        return bound._running and not getattr(self.peer, "_closed", False)
+
+    def _check_ttls(self, owner: str, method_name: str, meta: dict) -> None:
+        for member, default in _TTL_DEFAULTS.get(meta["verb"], {}).items():
+            if meta.get(member) is not None:
+                self.ttl_floor.check(f"binder.{owner}.{method_name}.{member}", duration_millis(meta[member]), default)
 
     def space(self, name: str) -> Space:
         if name not in self._spaces:
@@ -397,6 +506,12 @@ class Binder:
             "name": type(obj).__name__[:1].lower() + type(obj).__name__[1:], "description": "", "goals": []}
         name = spec["name"]
         bound = Bound(self, name, None)
+        listeners = getattr(self.peer, "_resume_listeners", None)
+        if listeners is not None:
+            listeners.append(bound.nudge)  # after a suspend, the renewals run at once
+        steps = getattr(self.peer, "_wall_step_listeners", None)
+        if steps is not None:
+            steps.append(bound.recheck_holds)  # a wake or a wall step judges the held takes at once
         methods = [(n, m) for n, m in inspect.getmembers(obj, callable) if getattr(m, _META, None)]
         consumes, produces, bindings, actions = [], [], {}, []
         # Bids first, so AUCTION spaces are priced before any take runs.
@@ -408,6 +523,7 @@ class Binder:
         for mname, method in methods:
             meta = getattr(method, _META)
             verb = meta["verb"]
+            self._check_ttls(type(obj).__name__, mname, meta)
             if verb == "bid":
                 continue
             if verb == "estimate":
@@ -482,7 +598,7 @@ class Binder:
 
         def renew():
             while bound._running:
-                if bound._stopped.wait(half_seconds):
+                if bound._pause(half_seconds):
                     return
                 for index, entry_id in enumerate(ids):
                     if not bound._running:
@@ -573,7 +689,7 @@ class Binder:
 
         def renew():
             while bound._running and subscription.open:
-                if bound._stopped.wait(half_seconds):
+                if bound._pause(half_seconds):
                     return
                 if bound._running and subscription.open:
                     subscription.renew()
@@ -589,14 +705,20 @@ class Binder:
         lease, poll = meta["lease"], meta["poll_timeout"]
 
         def loop():
-            while bound._running and self.peer.connected:
+            while self._running(bound):
+                if not getattr(self.peer, "_running", True):
+                    bound._pause(0.5)  # not connected yet: wait for the link, or for the unbind
+                    continue
                 try:
                     taken = space.take(template, lease=lease, timeout=poll)
                 except Exception:
-                    time.sleep(0.5)
+                    bound._pause(0.5)
                     continue
                 if taken is None:
                     continue
+                # A renewal from inside the handler obeys the binder's end (the core's I-05 fix).
+                taken._renewable = lambda: self._running(bound)
+                bound._hold(taken)
                 token = TakeContext.bind(taken)
                 try:
                     result = method(taken.value)
@@ -605,6 +727,9 @@ class Binder:
                     continue
                 finally:
                     TakeContext.unbind(token)
+                    bound._release(taken)
+                if taken.late:
+                    continue  # a wake found the lease lapsed: the result is late, written nowhere
                 try:
                     if result is None or isinstance(result, (Motion, Contribution, list, tuple)) or meta.get("result_space"):
                         # The take is finished first: a failed open or fork cannot
@@ -728,9 +853,14 @@ class Binder:
             except Exception:
                 pass
 
-        closer = self.aggregate.on_estimate(lambda e: e.startswith(prefix),
-                                            Settle.after(int(meta.get("ticks", 0)), float(meta.get("tolerance", 0.0))),
-                                            react)
+        tolerance = float(meta.get("tolerance", 0.0))
+        if meta.get("settle") is not None:
+            rule = Settle.after(meta["settle"], tolerance)
+        elif meta.get("ticks") is not None:
+            rule = Settle.after(int(meta["ticks"]), tolerance)
+        else:
+            rule = Settle.after(ESTIMATE_SETTLE_DEFAULT, tolerance)  # Java's settle = "": 8 s
+        closer = self.aggregate.on_estimate(lambda e: e.startswith(prefix), rule, react)
         bound._subscriptions.append(type("Closer", (), {"close": staticmethod(closer)})())
 
     # --------------------------------------------------------------- propose
@@ -791,8 +921,8 @@ class Binder:
     def _start_join(self, bound: Bound, obj, method, meta) -> None:
         join_space = self.space(meta["space"])
         parts: list[Part] = meta["parts"]
-        within_ms = duration_millis(meta["within"])
-        state: dict[str, dict] = {}   # key -> {"parts": {cls: [values]}, "seen": set(entry ids), "since": ms}
+        within_s = duration_millis(meta["within"]) / 1000
+        state: dict[str, dict] = {}   # key -> {"parts": {cls: [values]}, "seen": set(entry ids), "since": monotonic s}
         fired: set[str] = set()
         lock = threading.Lock()
         max_open = int(meta.get("max_open", 10_000))
@@ -830,12 +960,12 @@ class Binder:
                 key = key_of(part, event.entry.value, event.entry.tags)
                 if key is None:
                     return
-                now = self.peer._now_ms()
+                now = self._time.monotonic()  # a local period: judged on monotonic time (SPEC v0.1.36 §9.5)
                 with lock:
                     if key in fired:
                         return
                     # Forget keys that never completed within the window.
-                    for stale in [k for k, st in state.items() if now - st["since"] > within_ms]:
+                    for stale in [k for k, st in state.items() if now - st["since"] > within_s]:
                         state.pop(stale, None)
                     st = state.get(key)
                     if st is None:
