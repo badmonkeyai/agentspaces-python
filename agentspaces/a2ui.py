@@ -30,7 +30,7 @@ from .space import entry
 
 NAMESPACE = "https://badmonkey.ai/agentspaces/a2ui/v1/"
 HINT = "a2ui.records"
-HINT_VALUE = "2"
+HINT_VALUE = "3"   # the newest version of the records this client reads (3: the chat's confirm block)
 TASK_STATES = ("submitted", "working", "input-required", "completed", "failed", "canceled")
 PLAIN = "text/plain"
 MARKDOWN = "text/markdown"
@@ -53,6 +53,84 @@ def writes_v2(reader_hints) -> bool:
 def version_for(reader_hints) -> int:
     """The version a writer writes for these readers: 2 when every one reads it, else 1."""
     return 2 if writes_v2(reader_hints) else 1
+
+
+def latest(record_type: str) -> int:
+    """The newest version of a record by its simple name or IRI: 3 for ChatMessage, 2 for SharedFile, 1 for the rest."""
+    simple = record_type[record_type.rfind("/") + 1:]
+    return 3 if simple == "ChatMessage" else 2 if simple == "SharedFile" else 1
+
+
+def version_at(reader_hints, newest: int) -> int:
+    """The version a writer writes of a record whose newest is ``newest``: the lowest level its readers
+    advertise (1 for none or a level that does not read), never above ``newest``."""
+    v = newest
+    for hints in reader_hints:
+        h = hints.get(HINT)
+        level = int(h) if h is not None and h.isascii() and h.isdigit() and len(h) <= 9 else 1
+        v = min(v, max(1, level))
+    return v
+
+
+CONFIRM_KINDS = ("approval", "confirm", "review", "choice", "input")
+CONFIRM_OPTIONS = ("approve", "reject", "amend")
+CONFIRM_REASONS = ("none", "optional", "required")
+CONFIRM_VERDICTS = ("approved", "rejected", "amended", "expired", "cancelled")
+MAX_CONFIRM_TEXT = 2000
+
+
+def confirm(invocationId, question, desk="", kind="", action="", arguments="", summary="", deadline=None, options=None, reasons="",
+            code="", state="", verdict="", by=None, reason="", approvals=0, quorum=1) -> dict:
+    """A desk's request as a chat shows it (ChatMessage version 3, SPEC §6.1a.7), checked as the Java record checks
+    it, its keys in Java's declared order; a null deadline is left out, as Java leaves it out."""
+    if not invocationId or not str(invocationId).strip():
+        raise ValueError("a confirm names the request it is for")
+    kind = kind or "approval"
+    if kind not in CONFIRM_KINDS:
+        raise ValueError(f"a confirm's kind is one of {', '.join(CONFIRM_KINDS)}: {kind}")
+    question = question or ""
+    if not question.strip():
+        raise ValueError("a confirm carries the question a person answers")
+    summary = summary or ""
+    if utf16_units(question) > MAX_CONFIRM_TEXT or utf16_units(summary) > MAX_CONFIRM_TEXT:
+        raise ValueError("a confirm's question and summary are at most 2000 characters each")
+    options = list(options) if options else ["approve", "reject"]
+    for o in options:
+        if o not in CONFIRM_OPTIONS:
+            raise ValueError(f"a confirm's options are approve, reject and amend: {o}")
+    reasons = reasons or "optional"
+    if reasons not in CONFIRM_REASONS:
+        raise ValueError(f"a confirm's reasons is none, optional or required: {reasons}")
+    state = state or "pending"
+    if state not in ("pending", "decided"):
+        raise ValueError(f"a confirm's state is pending or decided: {state}")
+    verdict = verdict or ""
+    if (state == "decided") != (verdict in CONFIRM_VERDICTS):
+        raise ValueError(f"a decided confirm carries its verdict, a pending one none: {verdict}")
+    if approvals < 0:
+        raise ValueError("a confirm's approvals are not negative")
+    c = {"invocationId": invocationId, "desk": desk or "", "kind": kind, "question": question, "action": action or "",
+         "arguments": arguments if arguments and arguments.strip() else "{}", "summary": summary}
+    if deadline is not None:
+        c["deadline"] = deadline
+    c.update({"options": options, "reasons": reasons, "code": code or "", "state": state, "verdict": verdict, "by": list(by or []),
+              "reason": reason or "", "approvals": approvals, "quorum": max(1, quorum)})
+    return c
+
+
+def answer(invocationId, verdict, reason="", amendedArguments="") -> dict:
+    """A person's answer to a confirm (ChatMessage version 3), checked as the Java record checks it."""
+    if not invocationId or not str(invocationId).strip():
+        raise ValueError("an answer names the request it answers")
+    if verdict not in CONFIRM_OPTIONS:
+        raise ValueError(f"an answer's verdict is approve, reject or amend: {verdict}")
+    reason = reason or ""
+    if utf16_units(reason) > MAX_CONFIRM_TEXT:
+        raise ValueError("an answer's reason is at most 2000 characters")
+    amendedArguments = amendedArguments or ""
+    if amendedArguments and verdict != "amend":
+        raise ValueError("only an amend carries amended arguments")
+    return {"invocationId": invocationId, "verdict": verdict, "reason": reason, "amendedArguments": amendedArguments}
 
 
 def valid_path(path: str) -> bool:
@@ -87,9 +165,9 @@ def _version(v: int, record: str) -> int:
 @entry(NAMESPACE + "ChatMessage")
 @dataclass
 class ChatMessage:
-    """One line of a thread in ``conversations``; version 2 adds ``format`` and ``cites``."""
+    """One line of a thread in ``conversations``; version 2 adds ``format`` and ``cites``, version 3 ``confirm`` and ``answer``."""
     __agentspaces_wire_names__ = {"from_": "from"}
-    __agentspaces_omit_none__ = ("format", "cites")
+    __agentspaces_omit_none__ = ("format", "cites", "confirm", "answer")
     schemaVersion: int = 1
     id: str = ""
     key: str = ""
@@ -100,11 +178,20 @@ class ChatMessage:
     at: str = ""
     format: str | None = None
     cites: list | None = None
+    confirm: dict | None = None
+    answer: dict | None = None
 
 
-def chat_message(id, key, at, schemaVersion=1, text="", attachments=None, inReplyTo="", format=None, cites=None, **kw) -> ChatMessage:
-    """A line, checked as the Java record checks it; ``from`` (or ``from_``) is the author's kind, name and peer."""
-    v = _version(schemaVersion, "ChatMessage")
+def chat_message(id, key, at, schemaVersion=1, text="", attachments=None, inReplyTo="", format=None, cites=None, confirm=None, answer=None, **kw) -> ChatMessage:
+    """A line, checked as the Java record checks it; ``from`` (or ``from_``) is the author's kind, name and peer.
+    A version 3 line may carry a ``confirm`` or an ``answer`` (dicts of their fields), never both."""
+    if schemaVersion not in (1, 2, 3):
+        raise ValueError(f"a ChatMessage has schemaVersion 1, 2 or 3: {schemaVersion}")
+    v = schemaVersion
+    if v < 3 and (confirm is not None or answer is not None):
+        raise ValueError(f"a version {v} ChatMessage carries no confirm and no answer; write version 3 for them")
+    if confirm is not None and answer is not None:
+        raise ValueError("a ChatMessage carries a confirm or an answer, not both")
     who = kw.get("from", kw.get("from_")) or {}
     kind = who.get("kind") or "person"
     if kind not in ("person", "agent"):
@@ -125,6 +212,10 @@ def chat_message(id, key, at, schemaVersion=1, text="", attachments=None, inRepl
     if len(out) > MAX_CITES:
         raise ValueError(f"a ChatMessage cites at most 16 files: {len(out)}")
     m.cites = out
+    if confirm is not None:
+        m.confirm = globals()["confirm"](**confirm)
+    if answer is not None:
+        m.answer = globals()["answer"](**answer)
     return m
 
 

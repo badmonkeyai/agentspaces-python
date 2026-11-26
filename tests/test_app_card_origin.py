@@ -93,13 +93,13 @@ def test_the_agent_card_stub_with_actions_written_is_undecodable():
 
 def test_the_kinds_are_closed_and_no_kind_is_tied_to_an_origin():
     card = _card()
-    for kind in ("peer", "fed", "gateway", "assembled"):
+    for kind in ("peer", "fed", "gateway", "assembled", "dynamic"):
         assert _decodes({**card, "kind": kind}), kind
     assert not _decodes({**card, "kind": "realm"})
     assert not _decodes({**card, "kind": ""})
     console = {**card, "origin": wire.app_card_origin("console", "example-console/board")}
     assert _decodes({**console, "kind": "assembled"}) and _decodes({**console, "kind": "fed"})
-    assert wire.APP_CARD_KINDS == ("peer", "fed", "gateway", "assembled")
+    assert wire.APP_CARD_KINDS == ("peer", "fed", "gateway", "assembled", "dynamic")
 
 
 def test_the_other_closed_values_are_checked_at_decode():
@@ -214,3 +214,12 @@ def test_the_builder_writes_the_golden_cards_byte_for_byte():
     assert cbor.dumps(rebuilt) == _hex("app_card_host_cbor")
     with pytest.raises(ValueError):
         wire.app_card("zApps", peer, "x", card["issued"], kind="realm")
+
+
+def test_the_dynamic_card_decodes_and_re_encodes_byte_for_byte():
+    """SPEC v0.1.38: an app whose agent composes its surfaces per person and moment from its ui's catalogs."""
+    raw = _hex("app_card_dynamic_cbor")
+    card = cbor.loads(raw)
+    assert card["kind"] == "dynamic"
+    assert card["ui"]["catalogIds"] == ["https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"]
+    assert cbor.dumps(card) == raw

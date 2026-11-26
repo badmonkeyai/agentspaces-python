@@ -33,6 +33,7 @@ def vector(name):
 
 @pytest.mark.parametrize("name,make", [
     ("chat_message_v1", a2ui.chat_message), ("chat_message_v2", a2ui.chat_message),
+    ("chat_message_v3_confirm", a2ui.chat_message), ("chat_message_v3_answer", a2ui.chat_message),
     ("shared_file_v1", a2ui.shared_file), ("shared_file_v2", a2ui.shared_file),
     ("working_on_v1", a2ui.working_on), ("chat_progress_v1", a2ui.chat_progress),
 ])
@@ -170,3 +171,40 @@ def test_the_builders_hold_a_component_to_a2ui_one_point_zero():
         a2ui.chat("chat", "a", "main", {"suggestions": {"path": "/followups"}})
     with pytest.raises(ValueError, match="list of strings or one binding"):
         a2ui.chat("chat", "a", "main", {"suggestions": {"@path": "/followups", "extra": 1}})
+
+
+def test_version_three_carries_a_request_or_an_answer_and_older_versions_neither():
+    """srad/cards.md §8.7 slice 6.4: the chat's confirm block."""
+    at = "2026-11-10T09:00:00Z"
+    ask = {"invocationId": "inv-7", "question": "Refund 250?"}
+    line = a2ui.chat_message(schemaVersion=3, id="m", key="leads", at=at, confirm=ask)
+    assert line.confirm["options"] == ["approve", "reject"]
+    assert line.confirm["reasons"] == "optional" and line.confirm["quorum"] == 1
+    assert "deadline" not in line.confirm
+    assert "answer" not in to_payload(line)
+    assert "confirm" not in to_payload(a2ui.chat_message(schemaVersion=3, id="m", key="k", at=at))
+    with pytest.raises(ValueError, match="version 3"):
+        a2ui.chat_message(schemaVersion=2, id="m", key="k", at=at, confirm=ask)
+    with pytest.raises(ValueError, match="not both"):
+        a2ui.chat_message(schemaVersion=3, id="m", key="k", at=at, confirm=ask, answer={"invocationId": "inv-7", "verdict": "approve"})
+    with pytest.raises(ValueError, match="schemaVersion 1, 2 or 3"):
+        a2ui.chat_message(schemaVersion=4, id="m", key="k", at=at)
+    for bad, words in [({"invocationId": "", "question": "Go?"}, "request"), ({"invocationId": "i", "question": " "}, "question"),
+                       ({"invocationId": "i", "question": "Go?", "kind": "vote"}, "kind"), ({"invocationId": "i", "question": "Go?", "options": ["maybe"]}, "options"),
+                       ({"invocationId": "i", "question": "Go?", "reasons": "always"}, "reasons"), ({"invocationId": "i", "question": "Go?", "state": "decided"}, "verdict"),
+                       ({"invocationId": "i", "question": "Go?", "verdict": "approved"}, "verdict"), ({"invocationId": "i", "question": "x" * 2001}, "2000")]:
+        with pytest.raises(ValueError, match=words):
+            a2ui.confirm(**bad)
+    with pytest.raises(ValueError, match="verdict"):
+        a2ui.answer("inv-7", "yes")
+    with pytest.raises(ValueError, match="amend"):
+        a2ui.answer("inv-7", "approve", amendedArguments="{}")
+
+
+def test_a_writer_writes_the_lowest_level_its_readers_read():
+    assert a2ui.HINT_VALUE == "3"
+    assert a2ui.version_at([{"a2ui.records": "3"}], a2ui.latest("ChatMessage")) == 3
+    assert a2ui.version_at([{"a2ui.records": "3"}, {"a2ui.records": "2"}], a2ui.latest(a2ui.NAMESPACE + "ChatMessage")) == 2
+    assert a2ui.version_at([{"a2ui.records": "3"}], a2ui.latest("SharedFile")) == 2
+    assert a2ui.version_at([{"a2ui.records": "3"}, {}], 3) == 1
+    assert a2ui.version_at([], 3) == 3

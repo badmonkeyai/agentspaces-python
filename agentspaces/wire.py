@@ -935,7 +935,7 @@ def ui_declaration(components: list, reads: list | None = None, writes: list | N
 #: How an app connects: ``peer``, the app is a member; ``fed``, an agent of the group feeds it;
 #: ``gateway``, it sits behind the A2A gateway; ``assembled``, a static app its publisher
 #: assembled from extracted data and serves as is, reading nothing live.
-APP_CARD_KINDS = ("peer", "fed", "gateway", "assembled")
+APP_CARD_KINDS = ("peer", "fed", "gateway", "assembled", "dynamic")   # v0.1.38 adds dynamic
 APP_CARD_SHAPES = ("web", "desktop", "static", "a2ui")
 APP_CARD_TRANSPORTS = ("views", "a2a")
 #: ``idp``, the identity provider of whoever runs the host, enforced at its door (the default), or ``none``.

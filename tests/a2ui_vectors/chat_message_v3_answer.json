@@ -1,0 +1,1 @@
+{"schemaVersion":3,"id":"m-ada-2","key":"leads","from":{"kind":"person","name":"ada","peer":""},"text":"approve K7Q2 within policy","attachments":[],"inReplyTo":"m-desk-1","at":"2026-11-10T09:01:00Z","format":"text/plain","cites":[],"answer":{"invocationId":"inv-7","verdict":"approve","reason":"within policy","amendedArguments":""}}
