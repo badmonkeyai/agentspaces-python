@@ -2,9 +2,9 @@
 
 What changed in the Python client, newest first. The Java core's history is in `docs/dvit/CHANGELOG.md` of the AgentSpaces workspace.
 
-## Unreleased: 0.7.0
+## 0.7.0 (2026-11-28, with AgentSpaces 0.7.0)
 
-Work since the 0.6.0 release, for 0.7.0 (SPEC v0.1.34 to v0.1.38, still wire version 3). Nothing is bumped or published: `pyproject.toml` still reads 0.6.0 until the release bump.
+Work since the 0.6.0 release, for 0.7.0 (SPEC v0.1.34 to v0.1.38, still wire version 3). The client goes with the AgentSpaces 0.7.0 release of 2026-11-28 and installs from a clone; nothing is on PyPI, and `pyproject.toml` still reads 0.6.0.
 
 - **AgentCard `threads` (SPEC v0.1.38).** `bind(obj, threads=...)` names the conversations an agent answers, built with `chat_thread` and `chat_threads` (scopes `exact`, `tree` and `all`). The reader checks `threads` (at most 16, all distinct). The AppCard kind `dynamic` is accepted (in the working tree). A reader before v0.1.38 drops a card that carries either, so this is a flag day.
 - **The peer runs on deadlines, two clocks and a process watchdog (SPEC v0.1.36 and v0.1.37).**
